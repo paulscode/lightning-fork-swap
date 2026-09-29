@@ -48,7 +48,9 @@ nginx)
 	ln -sf /etc/nginx/sites-available/lightningfork.conf /etc/nginx/sites-enabled/lightningfork.conf
 	rm -f /etc/nginx/sites-enabled/default
 	nginx -t
-	systemctl reload nginx
+	# A restart, not a reload: a reload that fails at runtime (a changed
+	# limit_req zone, say) passes nginx -t and silently keeps the old config.
+	systemctl restart nginx
 	;;
 *)
 	echo "usage: $0 firewall|firewall-confirm|tls|nginx" >&2

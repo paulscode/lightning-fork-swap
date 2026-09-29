@@ -41,6 +41,9 @@ const API = process.env.API ?? 'http://127.0.0.1:19001';
 const COMPOSE_DIR = join(dirname(fileURLToPath(import.meta.url)), '..', 'deploy', 'regtest');
 
 // A regtest invoice from a stock lnd on the SHA256 chain: no feature bit 512.
+// deploy/regtest/boltz.conf: requiredConfirmations
+const LOCKUP_CONFIRMATIONS = 2;
+
 const SHA256_CHAIN_INVOICE =
   'lnbcrt12340n1p4tkt6jpp59qm9ghv5e3302uk3z4l5c7mz7cg8x6zpmz7uyc2yt92ttf8qtd8sdqqcqzzsxqyz5vqsp5vt9hhkrtnlhewm00wt0m6curu4ak5k5ky66zwh99urdfata77xfs9qxpqysgqxfq2taljltqeky5nhy34l3ak7mmrvzsgd8m5y93v4m4str6wsw63rhvqaqfgu42uw0j9hfwq0r25njxktpy2eq2alxja2y7ngdhvz8gq4hwatk';
 
@@ -218,6 +221,11 @@ const submarine = scenario('submarine', async () => {
   const { swap, keys } = await createSubmarine(invoice);
   lockUp(swap);
   mine(1);
+  // One confirmation is not enough to be paid.
+  await sleep(4000);
+  const early = (await status(swap.id)).status;
+  if (early !== 'transaction.confirmed') throw new Error(`after one confirmation the swap is ${early}`);
+  mine(LOCKUP_CONFIRMATIONS - 1);
 
   await waitStatus(swap.id, ['transaction.claim.pending', 'invoice.paid', 'transaction.claimed']);
   const inv = lncli('lnd-user', 'lookupinvoice', bolt11.decode(invoice).tags.find((t) => t.tagName === 'payment_hash').data);
@@ -272,7 +280,7 @@ const findLockup = async (swap, keys, lockupTxId) => {
 const cooperativeRefund = scenario('cooperative-refund', async () => {
   const { swap, keys } = await refundSetup(40_000);
   const lockupTxId = lockUp(swap);
-  mine(1);
+  mine(LOCKUP_CONFIRMATIONS);
   await waitStatus(swap.id, 'invoice.failedToPay', { timeoutMs: 180_000 });
 
   const { lockupTx, swapOutput, musig, boltzPublicKey } = await findLockup(swap, keys, lockupTxId);
@@ -386,6 +394,76 @@ const rdtsActive = scenario('rdts-rules-in-force', async () => {
   return `OP_IF in tapscript refused: ${accept['reject-reason']}`;
 });
 
+// A miner pays a swap's lockup address from their coinbase. The service must
+// not pay the invoice: it could not claim the coin before the swap times out.
+const coinbaseLockup = scenario('coinbase-lockup-refused', async () => {
+  const amount = 12_000;
+  const invoice = lncli('lnd-user', 'addinvoice', '--amt', String(amount)).payment_request;
+  const { swap } = await createSubmarine(invoice);
+  // The regtest subsidy is spent by now; a high-fee transaction in the same
+  // block makes the coinbase large enough to cover the lockup.
+  const feeTx = knots('-rpcwallet=boltz', '-named', 'sendtoaddress',
+    `address=${knots('-rpcwallet=boltz', 'getnewaddress')}`, 'amount=0.001', 'fee_rate=500');
+  const minedBlock = JSON.parse(knots('generateblock', swap.address, JSON.stringify([feeTx]))).hash;
+  const coinbase = JSON.parse(knots('getblock', minedBlock, '2')).tx[0];
+  const paid = coinbase.vout.find((o) => o.scriptPubKey.address === swap.address)?.value ?? 0;
+  if (Math.round(paid * 1e8) < swap.expectedAmount) {
+    throw new Error(`the coinbase paid ${paid} BTC, less than the ${swap.expectedAmount} sat expected: the test is not testing anything`);
+  }
+  const s = await waitStatus(swap.id, ['transaction.lockupFailed', 'invoice.pending', 'invoice.paid', 'transaction.claimed'], { timeoutMs: 60_000 });
+  const hash = bolt11.decode(invoice).tags.find((t) => t.tagName === 'payment_hash').data;
+  const state = lncli('lnd-user', 'lookupinvoice', hash).state;
+  if (s !== 'transaction.lockupFailed' || state === 'SETTLED') {
+    throw new Error(`coinbase lockup of ${Math.round(paid * 1e8)} sat: swap ${s}, invoice ${state}`);
+  }
+  const reason = (await status(swap.id)).failureReason;
+  return `coinbase paying ${Math.round(paid * 1e8)} sat refused (${reason}); invoice ${state}`;
+});
+
+// Probe for the security review's C1: does lnd cancel a paid hold invoice
+// while the lockup can still be claimed with the preimage? Not part of the
+// default run: it passes when the service is safe.
+const lateCancel = scenario('late-cancel-probe', async () => {
+  const preimage = randomBytes(32);
+  const keys = ECPair.makeRandom();
+  const swap = (
+    await axios.post(`${API}/v2/swap/reverse`, {
+      invoiceAmount: 40_000, from: 'BTC', to: 'BTC',
+      claimPublicKey: keys.publicKey.toString('hex'),
+      preimageHash: crypto.sha256(preimage).toString('hex'),
+    })
+  ).data;
+  const created = height();
+  const payer = spawn('docker', ['compose', 'exec', '-T', 'lnd-user', 'lncli', '--network=regtest',
+    'payinvoice', '--force', '--timeout', '600s', swap.invoice], { cwd: COMPOSE_DIR, stdio: 'ignore' });
+  await waitStatus(swap.id, ['transaction.mempool', 'transaction.confirmed']);
+  const lockup = Transaction.fromHex((await axios.get(`${API}/v2/swap/reverse/${swap.id}/transaction`)).data.hex);
+  const hash = crypto.sha256(preimage).toString('hex');
+  const htlcExpiry = Math.min(...lncli('lnd-swap', 'lookupinvoice', hash).htlcs.map((h) => Number(h.expiry_height)));
+  let cancelledAt;
+  for (let h = height(); h < swap.timeoutBlockHeight + 5; h = height()) {
+    mine(1);
+    await sleep(1200);
+    const state = lncli('lnd-swap', 'lookupinvoice', hash).state;
+    if (state === 'CANCELED') { cancelledAt = height(); break; }
+  }
+  payer.kill();
+  const report = `created ${created}, lockup timeout ${swap.timeoutBlockHeight}, HTLC expiry ${htlcExpiry}, invoice cancelled at ${cancelledAt ?? 'never (by timeout+5)'}`;
+  if (cancelledAt === undefined || cancelledAt >= swap.timeoutBlockHeight) return report + ': cancel not before the timeout';
+
+  // Cancelled while the lockup is still claimable: try the script path.
+  const boltzPublicKey = Buffer.from(swap.refundPublicKey, 'hex');
+  const musig = new Musig(zkp, keys, randomBytes(32), [boltzPublicKey, keys.publicKey]);
+  const tree = SwapTreeSerializer.deserializeSwapTree(swap.swapTree);
+  const swapOutput = detectSwap(TaprootUtils.tweakMusig(musig, tree.tree), lockup);
+  const destination = lncli('lnd-user', 'newaddress', 'p2tr').address;
+  const claimTx = targetFee(2, (fee) => constructClaimTransaction(
+    [{ ...swapOutput, keys, preimage, cooperative: false, type: OutputType.Taproot, txHash: lockup.getHash(), swapTree: tree, internalKey: musig.getAggregatedPublicKey() }],
+    address.toOutputScript(destination, network), fee));
+  const accept = JSON.parse(knots('testmempoolaccept', JSON.stringify([claimTx.toHex()])))[0];
+  throw new Error(`${report}; claim by script path after the cancel: ${accept.allowed ? 'ACCEPTED — the attack works' : 'refused: ' + accept['reject-reason']}`);
+});
+
 // --- run -------------------------------------------------------------------
 
 // The two nodes' channels are private, so after a restart neither knows
@@ -404,9 +482,10 @@ const ensureChannels = async () => {
 };
 await ensureChannels();
 
-const all = [rdtsActive, reverse, submarine, refusesSha256Invoice, cooperativeRefund, timeoutRefund, rescan];
+const all = [rdtsActive, coinbaseLockup, reverse, submarine, refusesSha256Invoice, cooperativeRefund, timeoutRefund, rescan];
 const wanted = process.argv.slice(2);
-const chosen = wanted.length ? all.filter((s) => wanted.includes(s.name)) : all;
+const probes = [lateCancel];
+const chosen = wanted.length ? [...all, ...probes].filter((s) => wanted.includes(s.name)) : all;
 
 for (const s of chosen) {
   const started = Date.now();
