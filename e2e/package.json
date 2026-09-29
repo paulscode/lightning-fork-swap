@@ -1,0 +1,19 @@
+{
+  "name": "lightning-fork-swap-e2e",
+  "private": true,
+  "type": "module",
+  "description": "End-to-end swaps against the regtest service in deploy/regtest",
+  "scripts": {
+    "test": "node run.mjs"
+  },
+  "dependencies": {
+    "@vulpemventures/secp256k1-zkp": "^3.2.1",
+    "axios": "^1.20.0",
+    "bitcoinjs-lib": "^6.1.8",
+    "bolt11": "^1.4.1",
+    "boltz-core": "^2.2.2",
+    "ecpair": "^2.1.0",
+    "tiny-secp256k1": "^2.2.4",
+    "ws": "^8.22.0"
+  }
+}

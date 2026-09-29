@@ -88,6 +88,8 @@ func (n *fakeNode) handle(req rpcRequest) map[string]any {
 	switch req.Method {
 	case "getblockchaininfo":
 		return ok(map[string]any{"blocks": len(n.chain) - 1, "pruned": n.pruneHeight > 0, "pruneheight": n.pruneHeight})
+	case "getbestblockhash":
+		return ok(n.chain[len(n.chain)-1])
 	case "getblockhash":
 		h := int(params[0].(float64))
 		if h >= len(n.chain) {
@@ -398,5 +400,35 @@ func TestParseForwards(t *testing.T) {
 	}
 	if _, err := parseForwards("nonsense"); err == nil {
 		t.Fatal("accepted a bad spec")
+	}
+}
+
+func TestLookupCatchesUpOnAMiss(t *testing.T) {
+	h := newHarness(t, 30, 10)
+	h.sync(t)
+	// Wire the proxy to catch up, as main does.
+	h.shim.Close()
+	h.shim = httptest.NewServer(&proxy{upstream: h.nodeS.URL, ix: h.ix, http: &http.Client{Timeout: 10 * time.Second}, catchUp: h.idx.catchUp})
+
+	// A block the poll loop has not seen yet.
+	h.node.mu.Lock()
+	h.node.addBlock("a", 30)
+	h.node.mu.Unlock()
+
+	status, out := h.post(t, `{"id":1,"method":"getrawtransaction","params":["`+hash32("ca", 30)+`"]}`)
+	if status != http.StatusOK || !strings.Contains(out, "block:"+hash32("ba", 30)) {
+		t.Fatalf("%d %s", status, out)
+	}
+}
+
+func TestCatchUpIsOneCallWhenCurrent(t *testing.T) {
+	h := newHarness(t, 30, 10)
+	h.sync(t)
+	before := len(h.node.calls)
+	if err := h.idx.catchUp(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if got := h.node.calls[before:]; len(got) != 1 || !strings.HasPrefix(got[0], "getbestblockhash") {
+		t.Fatalf("calls when current: %v", got)
 	}
 }

@@ -42,7 +42,7 @@ func main() {
 	cookie := flag.String("rpccookiefile", env("SHIM_RPCCOOKIEFILE", ""), "cookie file, instead of user and password")
 	dbPath := flag.String("db", env("SHIM_DB", "/data/txindex.db"), "index database")
 	flag.Int64Var(&window, "window", window, "number of recent blocks to index")
-	poll := flag.Duration("poll", 2*time.Second, "how often to look for new blocks")
+	poll := flag.Duration("poll", time.Second, "how often to look for new blocks")
 	forwardSpec := flag.String("forward", env("SHIM_FORWARD", ""), "TCP ports to relay, e.g. 28332=knots:28332,28333=knots:28333")
 	flag.Parse()
 
@@ -96,7 +96,7 @@ func main() {
 	}()
 
 	mux := http.NewServeMux()
-	mux.Handle("/", &proxy{upstream: *upstream, ix: ix, http: &http.Client{Timeout: 5 * time.Minute}})
+	mux.Handle("/", &proxy{upstream: *upstream, ix: ix, http: &http.Client{Timeout: 5 * time.Minute}, catchUp: idx.catchUp})
 	mux.HandleFunc("/healthz", func(w http.ResponseWriter, _ *http.Request) {
 		tip, _ := ix.tip()
 		n, _ := ix.count()

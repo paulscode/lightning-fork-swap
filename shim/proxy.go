@@ -2,6 +2,7 @@ package main
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
 	"io"
 	"log"
@@ -16,6 +17,11 @@ type proxy struct {
 	upstream string
 	ix       *index
 	http     *http.Client
+
+	// catchUp, when set, brings the index to the node's tip. A lookup that
+	// misses runs it once and looks again: a block can arrive between two
+	// polls, and a caller reacting to that block asks at once.
+	catchUp func(context.Context) error
 }
 
 type rpcRequest struct {
@@ -53,7 +59,7 @@ func (p *proxy) forward(r *http.Request, body []byte) (int, []byte, error) {
 // withBlockHash returns req rewritten to name the block that confirmed its
 // transaction, when req is a getrawtransaction that names none and the index
 // knows the block. ok is false otherwise.
-func (p *proxy) withBlockHash(req rpcRequest) (rpcRequest, bool) {
+func (p *proxy) withBlockHash(ctx context.Context, req rpcRequest) (rpcRequest, bool) {
 	if req.Method != "getrawtransaction" || len(req.Params) == 0 {
 		return req, false
 	}
@@ -92,6 +98,12 @@ func (p *proxy) withBlockHash(req rpcRequest) (rpcRequest, bool) {
 	}
 
 	blockHash, err := p.ix.lookup(txid)
+	if err == nil && blockHash == "" && p.catchUp != nil {
+		if err := p.catchUp(ctx); err != nil {
+			log.Printf("catching up for %s: %v", txid, err)
+		}
+		blockHash, err = p.ix.lookup(txid)
+	}
 	if err != nil {
 		log.Printf("index lookup %s: %v", txid, err)
 		return req, false
@@ -112,7 +124,7 @@ func (p *proxy) withBlockHash(req rpcRequest) (rpcRequest, bool) {
 // block hash added, and returns the node's answer to that. ok is false when
 // there is nothing better to answer with.
 func (p *proxy) retry(r *http.Request, req rpcRequest) (json.RawMessage, bool) {
-	rewritten, ok := p.withBlockHash(req)
+	rewritten, ok := p.withBlockHash(r.Context(), req)
 	if !ok {
 		return nil, false
 	}

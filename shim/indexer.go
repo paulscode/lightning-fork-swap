@@ -3,6 +3,7 @@ package main
 import (
 	"context"
 	"log"
+	"sync"
 )
 
 type blockchainInfo struct {
@@ -15,12 +16,37 @@ type indexer struct {
 	rpc    *rpcClient
 	ix     *index
 	window int64
+
+	// mu serialises syncs: the poll loop and lookups that missed both run
+	// them.
+	mu sync.Mutex
+}
+
+// catchUp syncs when the node's best block is not the index's tip. It costs
+// one RPC when there is nothing new, so lookups for transactions nobody has
+// do not each become a sync.
+func (i *indexer) catchUp(ctx context.Context) error {
+	var best string
+	if err := i.rpc.call(ctx, "getbestblockhash", nil, &best); err != nil {
+		return err
+	}
+	tip, err := i.ix.tip()
+	if err != nil {
+		return err
+	}
+	if stored, err := i.ix.blockAt(tip); err == nil && stored == best {
+		return nil
+	}
+	return i.sync(ctx)
 }
 
 // sync brings the index to the node's tip: undoes any blocks the node no
 // longer has in its active chain, indexes new ones, and drops what has left
 // the window.
 func (i *indexer) sync(ctx context.Context) error {
+	i.mu.Lock()
+	defer i.mu.Unlock()
+
 	var info blockchainInfo
 	if err := i.rpc.call(ctx, "getblockchaininfo", nil, &info); err != nil {
 		return err

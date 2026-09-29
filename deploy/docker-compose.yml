@@ -36,7 +36,8 @@ services:
       SHIM_RPCUSER: shim
       SHIM_RPCPASSWORD: ${SHIM_RPCPASSWORD:?run scripts/setup.sh}
       SHIM_DB: /data/txindex.db
-      SHIM_WINDOW: "4032"
+      # 60 days; the pruned node keeps about 19,000 blocks at prune=5000.
+      SHIM_WINDOW: "8640"
       # The backend connects to ZMQ at its RPC host, which is this shim.
       SHIM_FORWARD: 28332=knots:28332,28333=knots:28333
     volumes:

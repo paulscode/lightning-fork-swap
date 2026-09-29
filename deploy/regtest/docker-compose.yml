@@ -1,0 +1,102 @@
+# The whole service on regtest, for end-to-end tests: the same images as
+# production, with Knots in regtest mode, the BLAKE2b fork (164-byte headers,
+# BLAKE2b block ids, the temporary data rules) from height 20, and a second
+# Lightning Fork node playing the user.
+name: lfswap-regtest
+
+x-lnd: &lnd
+  image: paulscode/lightning-fork:0.21.3-beta-blake2b.13@sha256:93ebb298742baf99de9f04799eb3bed9781b02c68766078c3285fafa88680b81
+  restart: unless-stopped
+  depends_on: [knots]
+
+services:
+  knots:
+    image: lfswap/knots:29.4.2
+    restart: unless-stopped
+    command:
+      - -regtest
+      - -server
+      - -prune=550
+      - -testactivationheight=blake2b@20
+      - -blake2b_headline=Lightning Fork Swap regtest
+      # The temporary data rules, in force until 2027-09-01 as on mainnet.
+      - -rdtsexpiry=1819843200
+      - -rpcbind=0.0.0.0
+      - -rpcallowip=0.0.0.0/0
+      - -rpcuser=lab
+      - -rpcpassword=lab
+      - -zmqpubrawblock=tcp://0.0.0.0:28332
+      - -zmqpubrawtx=tcp://0.0.0.0:28333
+      - -fallbackfee=0.0002
+      - -disablewallet=0
+    ports: ["127.0.0.1:28443:18443"]
+    volumes: [knots:/data]
+
+  shim:
+    image: lfswap/txindex-shim:dev
+    restart: unless-stopped
+    depends_on: [knots]
+    environment:
+      SHIM_UPSTREAM: http://knots:18443/
+      SHIM_RPCUSER: lab
+      SHIM_RPCPASSWORD: lab
+      SHIM_DB: /data/txindex.db
+      SHIM_FORWARD: 28332=knots:28332,28333=knots:28333
+    volumes: [shim:/data]
+
+  lnd-swap:
+    <<: *lnd
+    command: &lnd-args
+      - --noseedbackup
+      - --bitcoin.regtest
+      - --bitcoin.node=bitcoind
+      - --bitcoin.blake2b-activation-height=20
+      - --bitcoind.rpchost=knots:18443
+      - --bitcoind.rpcuser=lab
+      - --bitcoind.rpcpass=lab
+      - --bitcoind.zmqpubrawblock=tcp://knots:28332
+      - --bitcoind.zmqpubrawtx=tcp://knots:28333
+      - --rpclisten=0.0.0.0:10009
+      - --restlisten=0.0.0.0:8080
+      - --listen=0.0.0.0:9735
+      - --protocol.wumbo-channels
+      - --tlsextradomain=lnd-swap
+      - --tlsextradomain=lnd-user
+      - --alias=lfswap-regtest
+    volumes: [lnd-swap:/root/.lnd]
+
+  lnd-user:
+    <<: *lnd
+    command: *lnd-args
+    volumes: [lnd-user:/root/.lnd]
+
+  postgres:
+    image: postgres:18-alpine
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: boltz
+      POSTGRES_USER: boltz
+      POSTGRES_PASSWORD: boltz
+    volumes: [postgres:/var/lib/postgresql]
+
+  boltz:
+    image: lfswap/boltz:dev
+    restart: unless-stopped
+    depends_on: [postgres, shim, lnd-swap]
+    command: ["--configpath", "/config/boltz.conf", "--datadir", "/boltz"]
+    ports:
+      - "127.0.0.1:19001:9001"
+      - "127.0.0.1:19004:9004"
+      - "127.0.0.1:19005:9005"
+    volumes:
+      - ./boltz.conf:/config/boltz.conf:ro
+      - boltz:/boltz
+      - lnd-swap:/lnd:ro
+
+volumes:
+  knots:
+  shim:
+  lnd-swap:
+  lnd-user:
+  postgres:
+  boltz:
