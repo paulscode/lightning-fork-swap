@@ -223,8 +223,14 @@ const submarine = scenario('submarine', async () => {
   mine(1);
   // One confirmation is not enough to be paid.
   await sleep(4000);
+  // The public status can still read transaction.mempool here; what matters
+  // is that nothing has been paid.
   const early = (await status(swap.id)).status;
-  if (early !== 'transaction.confirmed') throw new Error(`after one confirmation the swap is ${early}`);
+  if (['invoice.pending', 'invoice.paid', 'transaction.claim.pending', 'transaction.claimed'].includes(early)) {
+    throw new Error(`paid at one confirmation: ${early}`);
+  }
+  const earlyHash = bolt11.decode(invoice).tags.find((t) => t.tagName === 'payment_hash').data;
+  if (lncli('lnd-user', 'lookupinvoice', earlyHash).state === 'SETTLED') throw new Error('invoice settled at one confirmation');
   mine(LOCKUP_CONFIRMATIONS - 1);
 
   await waitStatus(swap.id, ['transaction.claim.pending', 'invoice.paid', 'transaction.claimed']);
@@ -404,7 +410,10 @@ const coinbaseLockup = scenario('coinbase-lockup-refused', async () => {
   // block makes the coinbase large enough to cover the lockup.
   const feeTx = knots('-rpcwallet=boltz', '-named', 'sendtoaddress',
     `address=${knots('-rpcwallet=boltz', 'getnewaddress')}`, 'amount=0.001', 'fee_rate=500');
-  const minedBlock = JSON.parse(knots('generateblock', swap.address, JSON.stringify([feeTx]))).hash;
+  // generatetoaddress mines the mempool with the fees in the coinbase (this
+  // node's generateblock leaves them out).
+  if (!JSON.parse(knots('getrawmempool')).includes(feeTx)) throw new Error('fee transaction not in the mempool');
+  const minedBlock = JSON.parse(knots('generatetoaddress', '1', swap.address))[0];
   const coinbase = JSON.parse(knots('getblock', minedBlock, '2')).tx[0];
   const paid = coinbase.vout.find((o) => o.scriptPubKey.address === swap.address)?.value ?? 0;
   if (Math.round(paid * 1e8) < swap.expectedAmount) {
