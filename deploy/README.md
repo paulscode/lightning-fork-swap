@@ -125,6 +125,94 @@ user `preview`). To open it, remove the two `auth_basic` lines from
 The code is AGPL-3.0: publish the backend, web app and this repository before
 the site is open to others.
 
+## Moving to another host
+
+The service can move to a new host with its channels, swaps in progress and
+wallets intact, in under a minute of downtime once the chain has been copied
+ahead of time. The scripts are in `scripts/migrate/`. They are ordered around
+one rule: **lnd must never run on two hosts with the same channel
+database**. The old host is stopped and retired before the archive exists,
+and it cannot start lnd again (a tombstone, and a `guard` service in the
+compose file that lnd, Knots and the backend depend on).
+
+On the **new host** (Debian 12):
+
+```sh
+# a fresh Debian has no rsync: copy the repository with tar
+tar -czf - -C /path/to/lightning-fork-swap --exclude=.git . | ssh root@NEW 'mkdir -p /opt/lfswap && tar -xzf - -C /opt/lfswap'
+ssh root@NEW /opt/lfswap/deploy/scripts/provision-host.sh     # prints an age public key
+ssh root@NEW /opt/lfswap/deploy/scripts/install-host.sh firewall   # confirm from a 2nd session
+docker save lfswap/boltz:dev | gzip | ssh root@NEW 'gunzip | docker load'
+```
+
+Days ahead: lower the DNS TTL to 300 s, and from the **old host** copy the
+chain while it runs (the old host needs SSH access to the new one):
+
+```sh
+scripts/migrate/copy-chain.sh --pre root@NEW
+```
+
+The move, from the **old host**:
+
+```sh
+scripts/migrate/maintenance.sh on          # new swaps refused; others carry on
+scripts/migrate/export.sh --check          # nothing times out within ~6 hours?
+scripts/migrate/export.sh --recipient AGE_KEY_OF_NEW_HOST
+scripts/migrate/copy-chain.sh --final root@NEW
+scp /srv/lfswap/migration/lfswap-*.tar.gz.age* root@NEW:/srv/lfswap/migration/
+```
+
+and on the **new host**:
+
+```sh
+scripts/migrate/import.sh /srv/lfswap/migration/lfswap-ID.tar.gz.age --public-ip NEW_IP
+```
+
+`import.sh` checks the archive, puts the state in place (with the TLS
+certificate, so HTTPS works as soon as DNS points here), starts everything in
+order and compares the result with a snapshot taken before the export: lnd
+identity, balances, channels, the Knots wallet, the backend seed and every
+swap. Then switch the DNS A records and run `maintenance.sh off` on the new
+host. Peers find the node's new address through gossip.
+
+The archive is encrypted to the new host's age key: only that host can open
+it. Keep the old host (stopped) for a couple of weeks, then destroy it.
+
+To go back, move again in the other direction: export on the new host to the
+old host's key, and import there with `--returning`. Never restart the old
+copy: the new host's lnd may have moved the channels on since.
+
+## Backups and disaster recovery
+
+`scripts/backup-offsite.sh` makes a backup without stopping anything:
+Postgres, the backend seed, the Knots wallet (as a wallet file), lnd's
+`channel.backup`, the seeds, `.env` and the certificate. It is encrypted to
+`BACKUP_AGE_RECIPIENT` (your age public key; keep the private key offline) and
+copied to `BACKUP_DEST`. Run it daily from cron:
+
+```sh
+echo "40 3 * * * root /opt/lfswap/deploy/scripts/backup-offsite.sh" > /etc/cron.d/lfswap-offsite
+```
+
+If the host is lost: provision a new one, copy a pruned chain to it from a
+node you trust (or let it sync, slowly), then
+
+```sh
+scripts/migrate/restore.sh BACKUP --identity YOUR_AGE_KEY --public-ip NEW_IP
+```
+
+The node comes back with the same identity and wallets and every swap up to
+the backup. Its channels cannot be resumed safely without the live database:
+their peers close them, and the funds return on chain after each channel's
+delay. Open new channels afterwards.
+
+## Rehearsing
+
+`rehearsal/rehearse.sh` runs all of the above on three throwaway KVM VMs on a
+workstation, in regtest: a migration with a reverse swap and a submarine swap
+in flight, a move back, and a lost host restored from backup with its channel
+funds recovered. It never touches production.
+
 ## Using a remote node over Tor instead
 
 If the host cannot run the node, point the shim at a remote Knots node that

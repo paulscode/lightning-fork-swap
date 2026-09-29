@@ -11,7 +11,8 @@ ROOT=${LFSWAP_ROOT:-/srv/lfswap}
 S=$ROOT/secrets
 umask 077
 
-scb=$ROOT/lnd/data/chain/bitcoin/mainnet/channel.backup
+NETWORK=$(sed -n 's/^NETWORK=//p' /opt/lfswap/deploy/.env 2>/dev/null)
+scb=$ROOT/lnd/data/chain/bitcoin/${NETWORK:-mainnet}/channel.backup
 if [ -f "$scb" ] && ! cmp -s "$scb" "$S/channel.backup"; then
 	cp "$scb" "$S/channel.backup"
 	cp "$scb" "$S/channel.backup.$(date -u +%Y%m%dT%H%M%SZ)"

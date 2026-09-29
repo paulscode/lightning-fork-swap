@@ -26,6 +26,37 @@ set -a
 . ./.env
 set +a
 ROOT=${LFSWAP_ROOT:-/srv/lfswap}
+NETWORK=${NETWORK:-mainnet}
+
+# What differs between networks.
+case "$NETWORK" in
+mainnet)
+	KNOTS_CHAIN_LINE=""
+	KNOTS_SECTION=main
+	KNOTS_NETWORK_EXTRA=""
+	LND_NETWORK_EXTRA=""
+	BOLTZ_CURRENCY_NETWORK=bitcoinMainnet
+	;;
+regtest)
+	KNOTS_CHAIN_LINE="chain=regtest"
+	KNOTS_SECTION=regtest
+	KNOTS_NETWORK_EXTRA="testactivationheight=blake2b@20
+blake2b_headline=Lightning Fork Swap regtest
+rdtsexpiry=1819843200"
+	LND_NETWORK_EXTRA="bitcoin.blake2b-activation-height=20"
+	BOLTZ_CURRENCY_NETWORK=bitcoinRegtest
+	;;
+*)
+	echo "NETWORK must be mainnet or regtest, not $NETWORK" >&2
+	exit 1
+	;;
+esac
+# A peer to connect to (staging and rehearsals: the node that mines).
+if [ -n "${KNOTS_ADDNODE:-}" ]; then
+	KNOTS_NETWORK_EXTRA="${KNOTS_NETWORK_EXTRA:+$KNOTS_NETWORK_EXTRA
+}addnode=$KNOTS_ADDNODE"
+fi
+export NETWORK KNOTS_CHAIN_LINE KNOTS_SECTION KNOTS_NETWORK_EXTRA LND_NETWORK_EXTRA BOLTZ_CURRENCY_NETWORK
 
 mkdir -p "$ROOT"/{knots/data,shim,tor/data,lnd,postgres,boltz,secrets,webapp}
 chmod 700 "$ROOT/secrets"

@@ -35,7 +35,7 @@ if [ ! -f "$ROOT/lnd/wallet-password" ]; then
 	cp "$ROOT/lnd/wallet-password" "$S/lnd-wallet-password.txt"
 fi
 docker compose up -d tor lnd >/dev/null
-if [ ! -f "$ROOT/lnd/data/chain/bitcoin/mainnet/wallet.db" ]; then
+if [ ! -f "$ROOT/lnd/data/chain/bitcoin/${NETWORK:-mainnet}/wallet.db" ]; then
 	echo "waiting for lnd to ask for a wallet"
 	for _ in $(seq 1 60); do
 		curl -sk https://127.0.0.1:8080/v1/genseed >/dev/null 2>&1 && break

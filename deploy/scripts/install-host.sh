@@ -44,6 +44,7 @@ nginx)
 		chmod 600 /srv/lfswap/secrets/preview-password.txt
 		echo "preview password written to /srv/lfswap/secrets/preview-password.txt"
 	fi
+	touch /etc/nginx/lfswap-maintenance.conf
 	install -m 0644 nginx/lightningfork.conf /etc/nginx/sites-available/lightningfork.conf
 	ln -sf /etc/nginx/sites-available/lightningfork.conf /etc/nginx/sites-enabled/lightningfork.conf
 	rm -f /etc/nginx/sites-enabled/default

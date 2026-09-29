@@ -16,10 +16,22 @@ x-logging: &logging
     max-file: "3"
 
 services:
+  # Fails when this host's state has been migrated to another host
+  # (scripts/migrate/export.sh leaves a tombstone), so that nothing, lnd
+  # above all, starts here again by accident.
+  guard:
+    image: lfswap/knots:29.4.2
+    entrypoint: ["sh", "-c", "if [ -f /srv/MIGRATED ]; then echo 'this host was migrated away:'; cat /srv/MIGRATED; exit 1; fi"]
+    volumes:
+      - ${LFSWAP_ROOT:-/srv/lfswap}:/srv:ro
+    restart: "no"
+
   knots:
     image: lfswap/knots:29.4.2
     build: ./knots
     restart: unless-stopped
+    depends_on:
+      guard: {condition: service_completed_successfully}
     stop_grace_period: 5m
     volumes:
       - ${LFSWAP_ROOT:-/srv/lfswap}/knots/data:/data
@@ -59,7 +71,10 @@ services:
     image: paulscode/lightning-fork:0.21.3-beta-blake2b.13@sha256:93ebb298742baf99de9f04799eb3bed9781b02c68766078c3285fafa88680b81
     restart: unless-stopped
     stop_grace_period: 2m
-    depends_on: [knots, tor]
+    depends_on:
+      guard: {condition: service_completed_successfully}
+      knots: {condition: service_started}
+      tor: {condition: service_started}
     ports:
       - "9735:9735"
       - "127.0.0.1:10009:10009"
@@ -86,7 +101,11 @@ services:
     image: lfswap/boltz:dev
     restart: unless-stopped
     stop_grace_period: 1m
-    depends_on: [postgres, shim, lnd]
+    depends_on:
+      guard: {condition: service_completed_successfully}
+      postgres: {condition: service_started}
+      shim: {condition: service_started}
+      lnd: {condition: service_started}
     environment:
       NODE_OPTIONS: --max-old-space-size=384
     command: ["--configpath", "/boltz/boltz.conf", "--datadir", "/boltz"]
@@ -97,6 +116,6 @@ services:
     volumes:
       - ${LFSWAP_ROOT:-/srv/lfswap}/boltz:/boltz
       - ${LFSWAP_ROOT:-/srv/lfswap}/lnd/tls.cert:/lnd/tls.cert:ro
-      - ${LFSWAP_ROOT:-/srv/lfswap}/lnd/data/chain/bitcoin/mainnet/admin.macaroon:/lnd/admin.macaroon:ro
+      - ${LFSWAP_ROOT:-/srv/lfswap}/lnd/data/chain/bitcoin/${NETWORK:-mainnet}/admin.macaroon:/lnd/admin.macaroon:ro
     logging: *logging
     mem_limit: 700m

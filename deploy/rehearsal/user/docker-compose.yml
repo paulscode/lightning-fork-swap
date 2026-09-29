@@ -1,0 +1,52 @@
+# The world outside the service, for migration rehearsals: a regtest Knots
+# that mines (the service's Knots peers with it), and the user's Lightning
+# Fork node. Runs on its own VM, so it carries on while the service moves.
+name: lfswap-user
+
+services:
+  knots:
+    image: lfswap/knots:29.4.2
+    restart: unless-stopped
+    command:
+      - -regtest
+      - -server
+      - -testactivationheight=blake2b@20
+      - -blake2b_headline=Lightning Fork Swap regtest
+      - -rdtsexpiry=1819843200
+      - -rpcbind=0.0.0.0
+      - -rpcallowip=0.0.0.0/0
+      - -rpcuser=lab
+      - -rpcpassword=lab
+      - -bind=0.0.0.0:18444
+      - -whitelist=0.0.0.0/0
+      - -zmqpubrawblock=tcp://0.0.0.0:28332
+      - -zmqpubrawtx=tcp://0.0.0.0:28333
+      - -fallbackfee=0.0002
+      - -txindex=1
+    ports: ["18444:18444"]
+    volumes: [knots:/data]
+
+  lnd-user:
+    image: paulscode/lightning-fork:0.21.3-beta-blake2b.13@sha256:93ebb298742baf99de9f04799eb3bed9781b02c68766078c3285fafa88680b81
+    restart: unless-stopped
+    depends_on: [knots]
+    command:
+      - --noseedbackup
+      - --bitcoin.regtest
+      - --bitcoin.node=bitcoind
+      - --bitcoin.blake2b-activation-height=20
+      - --bitcoind.rpchost=knots:18443
+      - --bitcoind.rpcuser=lab
+      - --bitcoind.rpcpass=lab
+      - --bitcoind.zmqpubrawblock=tcp://knots:28332
+      - --bitcoind.zmqpubrawtx=tcp://knots:28333
+      - --rpclisten=0.0.0.0:10009
+      - --listen=0.0.0.0:9735
+      - --protocol.wumbo-channels
+      - --alias=rehearsal-user
+    ports: ["9735:9735"]
+    volumes: [lnd:/root/.lnd]
+
+volumes:
+  knots:
+  lnd:
