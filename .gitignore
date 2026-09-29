@@ -1,0 +1,28 @@
+# Private working material: never published.
+references/
+internal_docs/
+
+# The backend and web app forks are their own repositories, cloned here.
+backend/
+webapp/
+
+# Secrets and machine-local configuration.
+secrets/
+*.env
+.env*
+!.env.example
+*.macaroon
+*.pem
+*.key
+seed.dat
+*.seed
+
+# Build output and runtime state.
+node_modules/
+dist/
+target/
+build/
+data/
+*.log
+*.tar
+*.tar.gz

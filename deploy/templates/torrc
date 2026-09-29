@@ -1,0 +1,8 @@
+# Rendered by scripts/setup.sh.
+SocksPort 0.0.0.0:9050
+SocksPolicy accept 172.16.0.0/12
+SocksPolicy reject *
+ControlPort 0.0.0.0:9051
+HashedControlPassword ${TOR_CONTROL_HASH}
+DataDirectory /var/lib/tor
+Log notice stdout

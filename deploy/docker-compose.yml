@@ -1,0 +1,101 @@
+# Lightning Fork Swap on one small VPS.
+#
+# Everything but nginx (on the host, with certbot) runs here, on one private
+# network. Nothing is published to the internet except Lightning's 9735; the
+# API ports are bound to 127.0.0.1 for the host's nginx.
+#
+# State lives under ${LFSWAP_ROOT} (default /srv/lfswap); secrets under
+# ${LFSWAP_ROOT}/secrets. scripts/setup.sh renders the config files.
+
+name: lfswap
+
+x-logging: &logging
+  driver: json-file
+  options:
+    max-size: "20m"
+    max-file: "3"
+
+services:
+  knots:
+    image: lfswap/knots:29.4.2
+    build: ./knots
+    restart: unless-stopped
+    stop_grace_period: 5m
+    volumes:
+      - ${LFSWAP_ROOT:-/srv/lfswap}/knots/data:/data
+    logging: *logging
+    mem_limit: 900m
+
+  shim:
+    image: lfswap/txindex-shim:dev
+    build: ../shim
+    restart: unless-stopped
+    depends_on: [knots]
+    environment:
+      SHIM_UPSTREAM: http://knots:8332/
+      SHIM_RPCUSER: shim
+      SHIM_RPCPASSWORD: ${SHIM_RPCPASSWORD:?run scripts/setup.sh}
+      SHIM_DB: /data/txindex.db
+      SHIM_WINDOW: "4032"
+      # The backend connects to ZMQ at its RPC host, which is this shim.
+      SHIM_FORWARD: 28332=knots:28332,28333=knots:28333
+    volumes:
+      - ${LFSWAP_ROOT:-/srv/lfswap}/shim:/data
+    logging: *logging
+    mem_limit: 128m
+
+  tor:
+    image: lfswap/tor:dev
+    build: ./tor
+    restart: unless-stopped
+    volumes:
+      - ${LFSWAP_ROOT:-/srv/lfswap}/tor/torrc:/etc/tor/torrc:ro
+      - ${LFSWAP_ROOT:-/srv/lfswap}/tor/data:/var/lib/tor
+    logging: *logging
+    mem_limit: 128m
+
+  lnd:
+    image: paulscode/lightning-fork:0.21.3-beta-blake2b.13@sha256:93ebb298742baf99de9f04799eb3bed9781b02c68766078c3285fafa88680b81
+    restart: unless-stopped
+    stop_grace_period: 2m
+    depends_on: [knots, tor]
+    ports:
+      - "9735:9735"
+      - "127.0.0.1:10009:10009"
+      - "127.0.0.1:8080:8080"
+    volumes:
+      - ${LFSWAP_ROOT:-/srv/lfswap}/lnd:/root/.lnd
+    logging: *logging
+    mem_limit: 512m
+
+  postgres:
+    image: postgres:18-alpine
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: boltz
+      POSTGRES_USER: boltz
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?run scripts/setup.sh}
+    command: ["postgres", "-c", "shared_buffers=64MB", "-c", "max_connections=40"]
+    volumes:
+      - ${LFSWAP_ROOT:-/srv/lfswap}/postgres:/var/lib/postgresql
+    logging: *logging
+    mem_limit: 256m
+
+  boltz:
+    image: lfswap/boltz:dev
+    restart: unless-stopped
+    stop_grace_period: 1m
+    depends_on: [postgres, shim, lnd]
+    environment:
+      NODE_OPTIONS: --max-old-space-size=384
+    command: ["--configpath", "/boltz/boltz.conf", "--datadir", "/boltz"]
+    ports:
+      - "127.0.0.1:9001:9001"  # boltzd REST API
+      - "127.0.0.1:9004:9004"  # sidecar WebSocket
+      - "127.0.0.1:9005:9005"  # sidecar REST API
+    volumes:
+      - ${LFSWAP_ROOT:-/srv/lfswap}/boltz:/boltz
+      - ${LFSWAP_ROOT:-/srv/lfswap}/lnd/tls.cert:/lnd/tls.cert:ro
+      - ${LFSWAP_ROOT:-/srv/lfswap}/lnd/data/chain/bitcoin/mainnet/admin.macaroon:/lnd/admin.macaroon:ro
+    logging: *logging
+    mem_limit: 700m
