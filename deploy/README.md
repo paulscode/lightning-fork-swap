@@ -138,15 +138,22 @@ compose file that lnd, Knots and the backend depend on).
 On the **new host** (Debian 12):
 
 ```sh
-# a fresh Debian has no rsync: copy the repository with tar
-tar -czf - -C /path/to/lightning-fork-swap --exclude=.git . | ssh root@NEW 'mkdir -p /opt/lfswap && tar -xzf - -C /opt/lfswap'
+# a fresh Debian has no rsync: copy the repository with tar, without the
+# private notes and the source trees the host does not need
+tar -czf - -C /path/to/lightning-fork-swap --exclude=.git --exclude=internal_docs \
+    --exclude=references --exclude=backend --exclude=webapp --exclude=e2e . \
+  | ssh root@NEW 'mkdir -p /opt/lfswap && tar -xzf - -C /opt/lfswap'
 ssh root@NEW /opt/lfswap/deploy/scripts/provision-host.sh     # prints an age public key
 ssh root@NEW /opt/lfswap/deploy/scripts/install-host.sh firewall   # confirm from a 2nd session
 docker save lfswap/boltz:dev | gzip | ssh root@NEW 'gunzip | docker load'
 ```
 
+The **old host** needs `age` (`apt-get install age`, or run
+`provision-host.sh` there, which is safe on a running host) and root SSH
+access to the new one for the move (remove it afterwards).
+
 Days ahead: lower the DNS TTL to 300 s, and from the **old host** copy the
-chain while it runs (the old host needs SSH access to the new one):
+chain while it runs:
 
 ```sh
 scripts/migrate/copy-chain.sh --pre root@NEW
@@ -172,8 +179,11 @@ scripts/migrate/import.sh /srv/lfswap/migration/lfswap-ID.tar.gz.age --public-ip
 certificate, so HTTPS works as soon as DNS points here), starts everything in
 order and compares the result with a snapshot taken before the export: lnd
 identity, balances, channels, the Knots wallet, the backend seed and every
-swap. Then switch the DNS A records and run `maintenance.sh off` on the new
-host. Peers find the node's new address through gossip.
+swap. It also installs the backup cron jobs (export removed them from the old
+host). Then switch the DNS A records; maintenance is off on the new host
+already. Peers find the node's new address through gossip; one without a
+public address of its own has to connect to the node again itself
+(`lncli connect <pubkey>@NEW_IP:9735`).
 
 The archive is encrypted to the new host's age key: only that host can open
 it. Keep the old host (stopped) for a couple of weeks, then destroy it.
