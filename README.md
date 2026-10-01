@@ -12,7 +12,9 @@ This repository holds what runs the service:
 | `shim/` | `txindex-shim`: a JSON-RPC proxy that lets the swap backend run against a pruned Bitcoin Knots node (see below) |
 | `deploy/` | Docker Compose file, config templates, nginx site, firewall and setup scripts for one Debian host |
 
-The backend and the web app are forks kept in their own repositories:
+The backend and the web app are forks kept in their own repositories, each
+describing its changes from upstream (`LIGHTNING-FORK.md` in the backend, the
+CHANGES section of the web app's README):
 `lightning-fork-swap-backend` (from `BoltzExchange/boltz-backend` by way of
 `SwapMarket/boltz-backend`) and `lightning-fork-swap-webapp` (from
 `BoltzExchange/boltz-web-app`).
