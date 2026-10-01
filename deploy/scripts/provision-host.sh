@@ -42,10 +42,13 @@ if ! command -v docker >/dev/null; then
 	apt-get update -q
 	apt-get install -y -q docker-ce docker-ce-cli containerd.io docker-compose-plugin >/dev/null
 fi
-cat > /etc/docker/daemon.json <<'J'
-{ "log-driver": "json-file", "log-opts": { "max-size": "20m", "max-file": "3" } }
-J
-systemctl restart docker
+# Restart Docker only if its configuration changes: on a host that already
+# runs the service, a restart would restart every container.
+DAEMON_JSON='{ "log-driver": "json-file", "log-opts": { "max-size": "20m", "max-file": "3" } }'
+if [ "$(jq -cS . /etc/docker/daemon.json 2>/dev/null)" != "$(echo "$DAEMON_JSON" | jq -cS .)" ]; then
+	echo "$DAEMON_JSON" > /etc/docker/daemon.json
+	systemctl restart docker
+fi
 
 if [ "$SWAP_GB" -gt 0 ] && ! swapon --show=NAME --noheadings | grep -q /swapfile-lfswap; then
 	echo "== ${SWAP_GB} GB swap"

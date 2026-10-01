@@ -99,6 +99,8 @@ log "starting Postgres and the backend"
 dc up -d postgres boltz
 wait_for "the backend" 60 curl -sf http://127.0.0.1:9001/version
 
+install_crons
+
 log "comparing with the snapshot taken before the export"
 if "$(dirname "$0")/verify.sh" compare "$MIGRATION/snapshot-$ID-source.json"; then
 	log "import $ID complete: switch DNS to this host, then maintenance.sh off"

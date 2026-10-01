@@ -83,6 +83,7 @@ wait_for "lnd" 120 sh -c "docker compose exec -T lnd lncli --network=$NETWORK ge
 log "the backend"
 dc up -d boltz
 wait_for "the backend" 60 curl -sf http://127.0.0.1:9001/version
+install_crons
 
 cat <<MSG
 

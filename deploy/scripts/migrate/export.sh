@@ -129,6 +129,7 @@ mv "$ROOT/lnd" "$ROOT/boltz" "$ROOT/postgres" "$RETIRED/"
 mv "$ROOT/$KNOTS_NET/wallets" "$RETIRED/knots/wallets"
 printf 'id=%s\nat=%s\narchive=%s\nretired_state=%s\n' "$ID" "$(date -u +%FT%TZ)" "$ARCHIVE" "$RETIRED" > "$TOMBSTONE"
 dc down >/dev/null 2>&1 || true
+remove_crons
 
 cat <<MSG
 
