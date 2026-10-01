@@ -122,8 +122,18 @@ After changing them: `./scripts/setup.sh && docker compose restart boltz`.
 The site starts behind a password (`/srv/lfswap/secrets/preview-password.txt`,
 user `preview`). To open it, remove the two `auth_basic` lines from
 `/etc/nginx/sites-available/lightningfork.conf` and `systemctl reload nginx`.
-The code is AGPL-3.0: publish the backend, web app and this repository before
-the site is open to others.
+The code is AGPL-3.0, so users of the site must be able to download its
+source. The site serves it at `/source/` (the app's footer and Terms page
+link there). After every deployment of a new backend or web app build,
+rebuild the archives from the workstation, with the deployed commits checked
+out:
+
+```sh
+deploy/scripts/build-source-bundle.sh "" --upload root@lightningfork.com
+```
+
+It refuses to run with uncommitted changes, so the archives always match a
+commit. Publishing the repositories on GitHub as well is optional.
 
 ## Moving to another host
 
