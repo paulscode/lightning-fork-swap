@@ -63,6 +63,9 @@ fi
 if [ -f "$STAGE/etc/letsencrypt.tar" ]; then
 	tar -C /etc --numeric-owner -xf "$STAGE/etc/letsencrypt.tar"
 fi
+if [ -f "$STAGE/etc/lfswap-preview.conf" ]; then
+	install -m 644 "$STAGE/etc/lfswap-preview.conf" /etc/nginx/lfswap-preview.conf
+fi
 if [ -f "$STAGE/etc/lfswap.htpasswd" ]; then
 	install -o root -g www-data -m 640 "$STAGE/etc/lfswap.htpasswd" /etc/nginx/lfswap.htpasswd
 fi

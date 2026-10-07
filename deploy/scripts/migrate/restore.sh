@@ -51,6 +51,7 @@ cp -a "$STAGE/secrets/." "$ROOT/secrets/"
 install -m 600 "$ROOT/secrets/lnd-wallet-password.txt" "$ROOT/lnd/wallet-password"
 [ -f "$STAGE/letsencrypt.tar" ] && tar -C /etc -xf "$STAGE/letsencrypt.tar"
 [ -f "$STAGE/lfswap.htpasswd" ] && install -o root -g www-data -m 640 "$STAGE/lfswap.htpasswd" /etc/nginx/lfswap.htpasswd
+[ -f "$STAGE/lfswap-preview.conf" ] && install -m 644 "$STAGE/lfswap-preview.conf" /etc/nginx/lfswap-preview.conf
 "$DEPLOY/scripts/setup.sh" >/dev/null
 set -a; . "$DEPLOY/.env"; set +a
 

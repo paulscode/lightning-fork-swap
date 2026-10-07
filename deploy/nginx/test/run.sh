@@ -30,6 +30,7 @@ openssl req -x509 -newkey rsa:2048 -nodes -days 2 -subj "/CN=mempool.guide" \
 openssl req -x509 -newkey rsa:2048 -nodes -days 2 -subj "/CN=lightningfork.com" \
 	-keyout site.key -out site.crt 2>/dev/null
 printf 'preview:%s\n' "$(openssl passwd -apr1 test)" > htpasswd
+printf 'auth_basic "preview";\nauth_basic_user_file /t/htpasswd;\n' > preview.conf
 mkdir -p webapp source
 echo '<!doctype html><title>app</title>' > webapp/index.html
 : > maintenance.conf
@@ -40,7 +41,7 @@ render() {
 	local explorer_port=$1
 	sed -e "s#/etc/letsencrypt/live/lightningfork.com/fullchain.pem#/t/site.crt#" \
 		-e "s#/etc/letsencrypt/live/lightningfork.com/privkey.pem#/t/site.key#" \
-		-e "s#/etc/nginx/lfswap.htpasswd#/t/htpasswd#" \
+		-e "s#/etc/nginx/lfswap-preview.conf#/t/preview.conf#" \
 		-e "s#/etc/nginx/lfswap-maintenance.conf#/t/maintenance.conf#" \
 		-e "s#/etc/ssl/certs/ca-certificates.crt#/t/ca.crt#" \
 		-e "s#root /srv/lfswap/webapp;#root /t/webapp;#" \

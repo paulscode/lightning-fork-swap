@@ -119,6 +119,8 @@ tar -C "$ROOT" --numeric-owner --exclude='boltz/*.log' --exclude='boltz/sidecar/
 cp -a "$DEPLOY/.env" "$PAYLOAD/deploy/.env"
 if [ -d /etc/letsencrypt ]; then tar -C /etc --numeric-owner -cf "$PAYLOAD/etc/letsencrypt.tar" letsencrypt; fi
 if [ -f /etc/nginx/lfswap.htpasswd ]; then cp -a /etc/nginx/lfswap.htpasswd "$PAYLOAD/etc/"; fi
+# Whether the site is still behind the preview password (empty once public)
+if [ -f /etc/nginx/lfswap-preview.conf ]; then cp -a /etc/nginx/lfswap-preview.conf "$PAYLOAD/etc/"; fi
 cp "$STAGE/manifest.json" "$STAGE/snapshot.json" "$STAGE/postgres.sql" "$PAYLOAD/"
 (cd "$PAYLOAD" && find . -type f ! -name SHA256SUMS -print0 | sort -z | xargs -0 sha256sum > SHA256SUMS)
 

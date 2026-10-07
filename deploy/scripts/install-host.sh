@@ -45,6 +45,12 @@ nginx)
 		echo "preview password written to /srv/lfswap/secrets/preview-password.txt"
 	fi
 	touch /etc/nginx/lfswap-maintenance.conf
+	# Created once, with the password on; going public empties it, and a
+	# later run leaves it as it is
+	if [ ! -e /etc/nginx/lfswap-preview.conf ]; then
+		printf 'auth_basic "Lightning Fork Swap preview";\nauth_basic_user_file /etc/nginx/lfswap.htpasswd;\n' \
+			> /etc/nginx/lfswap-preview.conf
+	fi
 	install -m 0644 nginx/lightningfork.conf /etc/nginx/sites-available/lightningfork.conf
 	ln -sf /etc/nginx/sites-available/lightningfork.conf /etc/nginx/sites-enabled/lightningfork.conf
 	rm -f /etc/nginx/sites-enabled/default

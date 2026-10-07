@@ -147,8 +147,8 @@ After changing them: `./scripts/setup.sh && docker compose restart boltz`.
 ## Going public
 
 The site starts behind a password (`/srv/lfswap/secrets/preview-password.txt`,
-user `preview`). To open it, remove the two `auth_basic` lines from
-`/etc/nginx/sites-available/lightningfork.conf` and `systemctl reload nginx`.
+user `preview`). To open it: `: > /etc/nginx/lfswap-preview.conf && systemctl
+reload nginx` (installing a new nginx config later keeps it open).
 The code is AGPL-3.0, so users of the site must be able to download its
 source. The site serves it at `/source/` (the app's footer and Terms page
 link there). After every deployment of a new backend or web app build,

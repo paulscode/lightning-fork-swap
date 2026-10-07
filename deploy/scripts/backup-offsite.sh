@@ -50,6 +50,7 @@ mkdir -p "$P/secrets" && cp -a "$ROOT/secrets/." "$P/secrets/"
 cp "$DEPLOY/.env" "$P/env"
 [ -d /etc/letsencrypt ] && tar -C /etc -cf "$P/letsencrypt.tar" letsencrypt
 [ -f /etc/nginx/lfswap.htpasswd ] && cp /etc/nginx/lfswap.htpasswd "$P/"
+[ -f /etc/nginx/lfswap-preview.conf ] && cp /etc/nginx/lfswap-preview.conf "$P/"
 jq -n --arg at "$(date -u +%FT%TZ)" --arg host "$(hostname)" --arg network "$NETWORK" \
 	--arg pubkey "$(lncli getinfo | jq -r .identity_pubkey)" \
 	--argjson submarine "$SUBMARINE" --argjson reverse "$REVERSE" \

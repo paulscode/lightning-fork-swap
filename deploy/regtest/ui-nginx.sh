@@ -22,10 +22,11 @@ up)
 	openssl req -x509 -newkey rsa:2048 -nodes -days 2 -subj "/CN=localhost" \
 		-keyout "$state/site.key" -out "$state/site.crt" 2>/dev/null
 	: > "$state/maintenance.conf"
+	: > "$state/preview.conf"
 	sed -e "s#/etc/letsencrypt/live/lightningfork.com/fullchain.pem#/t/site.crt#" \
 		-e "s#/etc/letsencrypt/live/lightningfork.com/privkey.pem#/t/site.key#" \
 		-e "s#/etc/nginx/lfswap-maintenance.conf#/t/maintenance.conf#" \
-		-e "/auth_basic/d" \
+		-e "s#/etc/nginx/lfswap-preview.conf#/t/preview.conf#" \
 		-e "s#root /srv/lfswap/webapp;#root /dist;#" \
 		-e "s#server 127.0.0.1:9001#server 127.0.0.1:19001#" \
 		-e "s#server 127.0.0.1:9004#server 127.0.0.1:19004#" \
