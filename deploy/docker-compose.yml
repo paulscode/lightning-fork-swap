@@ -37,6 +37,8 @@ services:
       - ${LFSWAP_ROOT:-/srv/lfswap}/knots/data:/data
     logging: *logging
     mem_limit: 900m
+    # If the host runs out of memory, the kernel picks something else first
+    oom_score_adj: -300
 
   shim:
     image: lfswap/txindex-shim:dev
@@ -83,6 +85,8 @@ services:
       - ${LFSWAP_ROOT:-/srv/lfswap}/lnd:/root/.lnd
     logging: *logging
     mem_limit: 512m
+    # lnd last of all: killed mid-update it can need a force close
+    oom_score_adj: -500
 
   postgres:
     # By digest: a move copies the data directory, which needs the same major

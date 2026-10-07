@@ -36,6 +36,10 @@ trap 'rm -rf "$STAGE"' EXIT
 mkdir -p "$STAGE/payload"
 P=$STAGE/payload
 
+# Counted before the dump, so the dump holds at least these; restore.sh
+# checks what it restored against them
+SUBMARINE=$(psql_q 'select count(*) from swaps')
+REVERSE=$(psql_q 'select count(*) from "reverseSwaps"')
 dc exec -T postgres pg_dumpall -U boltz > "$P/postgres.sql" </dev/null
 cp "$ROOT/boltz/seed.dat" "$P/boltz-seed.dat"
 knots -rpcwallet=boltz backupwallet /data/lfswap-wallet-backup.dat
@@ -48,11 +52,16 @@ cp "$DEPLOY/.env" "$P/env"
 [ -f /etc/nginx/lfswap.htpasswd ] && cp /etc/nginx/lfswap.htpasswd "$P/"
 jq -n --arg at "$(date -u +%FT%TZ)" --arg host "$(hostname)" --arg network "$NETWORK" \
 	--arg pubkey "$(lncli getinfo | jq -r .identity_pubkey)" \
-	'{kind: "backup", at: $at, host: $host, network: $network, lnd_pubkey: $pubkey}' > "$P/manifest.json"
+	--argjson submarine "$SUBMARINE" --argjson reverse "$REVERSE" \
+	'{kind: "backup", at: $at, host: $host, network: $network, lnd_pubkey: $pubkey,
+	  submarine_swaps: $submarine, reverse_swaps: $reverse}' > "$P/manifest.json"
 (cd "$P" && find . -type f ! -name SHA256SUMS -print0 | sort -z | xargs -0 sha256sum > SHA256SUMS)
 
 FILE=$OUT/lfswap-backup-$STAMP.tar.gz.age
-tar -C "$P" -cf - . | gzip -6 | age -r "$BACKUP_AGE_RECIPIENT" -o "$FILE"
+# Written aside and renamed once whole: a failed run leaves no file that
+# looks like a backup
+tar -C "$P" -cf - . | gzip -6 | age -r "$BACKUP_AGE_RECIPIENT" -o "$FILE.tmp"
+mv "$FILE.tmp" "$FILE"
 sha256sum "$FILE" | cut -d' ' -f1 > "$FILE.sha256"
 log "backup $FILE ($(du -h "$FILE" | cut -f1))"
 
@@ -60,7 +69,7 @@ find "$OUT" -name 'lfswap-backup-*' -mtime +30 -delete
 
 if [ -n "$DEST" ]; then
 	case "$DEST" in
-	*:*) scp -q "$FILE" "$FILE.sha256" "$DEST/" ;;
+	*:*) scp -q -o BatchMode=yes "$FILE" "$FILE.sha256" "$DEST/" ;;
 	*) mkdir -p "$DEST" && cp "$FILE" "$FILE.sha256" "$DEST/" ;;
 	esac
 	log "copied to $DEST"

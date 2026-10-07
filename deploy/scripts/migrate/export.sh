@@ -89,6 +89,11 @@ log "snapshot of the running service"
 log "stopping the backend, then lnd"
 dc stop -t 60 boltz
 dc stop -t 180 lnd
+# From here on lnd must not start on this host again, even if this script
+# stops half way: the tombstone goes down now (and is completed below). To
+# abort a move before the archive reaches the new host, remove it by hand.
+printf 'id=%s\nat=%s\nstate=export in progress; if it stopped, the move was not finished\n' \
+	"$ID" "$(date -u +%FT%TZ)" > "$TOMBSTONE"
 log "dumping and stopping Postgres"
 dc exec -T postgres pg_dumpall -U boltz > "$STAGE/postgres.sql" </dev/null
 dc stop -t 60 postgres
@@ -118,7 +123,8 @@ cp "$STAGE/manifest.json" "$STAGE/snapshot.json" "$STAGE/postgres.sql" "$PAYLOAD
 (cd "$PAYLOAD" && find . -type f ! -name SHA256SUMS -print0 | sort -z | xargs -0 sha256sum > SHA256SUMS)
 
 ARCHIVE=$MIGRATION/lfswap-$ID.tar.gz.age
-tar -C "$PAYLOAD" -cf - . | gzip -1 | age -r "$RECIPIENT" -o "$ARCHIVE"
+tar -C "$PAYLOAD" -cf - . | gzip -1 | age -r "$RECIPIENT" -o "$ARCHIVE.tmp"
+mv "$ARCHIVE.tmp" "$ARCHIVE"
 rm -rf "$PAYLOAD" "$STAGE/postgres.sql"
 sha256sum "$ARCHIVE" | cut -d' ' -f1 > "$ARCHIVE.sha256"
 

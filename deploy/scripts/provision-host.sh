@@ -42,12 +42,26 @@ if ! command -v docker >/dev/null; then
 	apt-get update -q
 	apt-get install -y -q docker-ce docker-ce-cli containerd.io docker-compose-plugin >/dev/null
 fi
-# Restart Docker only if its configuration changes: on a host that already
-# runs the service, a restart would restart every container.
-DAEMON_JSON='{ "log-driver": "json-file", "log-opts": { "max-size": "20m", "max-file": "3" } }'
+# On shutdown Docker gives containers 15 s and systemd gives Docker 90 s;
+# Knots needs up to 5 minutes to stop cleanly (stop_grace_period), and a
+# pruned node stopped hard may have to download the chain again.
+mkdir -p /etc/systemd/system/docker.service.d
+DROPIN=/etc/systemd/system/docker.service.d/lfswap-stop.conf
+if [ "$(cat "$DROPIN" 2>/dev/null)" != "$(printf '[Service]\nTimeoutStopSec=7min')" ]; then
+	printf '[Service]\nTimeoutStopSec=7min\n' > "$DROPIN"
+	systemctl daemon-reload
+fi
+# Change Docker's configuration without restarting it where containers run:
+# a restart would restart every one of them (shutdown-timeout is reloadable;
+# the log options apply to containers created afterwards).
+DAEMON_JSON='{ "log-driver": "json-file", "log-opts": { "max-size": "20m", "max-file": "3" }, "shutdown-timeout": 300 }'
 if [ "$(jq -cS . /etc/docker/daemon.json 2>/dev/null)" != "$(echo "$DAEMON_JSON" | jq -cS .)" ]; then
 	echo "$DAEMON_JSON" > /etc/docker/daemon.json
-	systemctl restart docker
+	if [ -n "$(docker ps -q 2>/dev/null)" ]; then
+		systemctl reload docker
+	else
+		systemctl restart docker
+	fi
 fi
 
 if [ "$SWAP_GB" -gt 0 ] && ! swapon --show=NAME --noheadings | grep -q /swapfile-lfswap; then

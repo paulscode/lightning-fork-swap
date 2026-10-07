@@ -24,8 +24,12 @@ if ! knots listwallets | grep -q '"boltz"'; then
 		echo "created Knots wallet boltz"
 	fi
 fi
-if [ ! -f "$S/knots-boltz-descriptors.json" ]; then
-	knots -rpcwallet=boltz listdescriptors true > "$S/knots-boltz-descriptors.json"
+if [ ! -s "$S/knots-boltz-descriptors.json" ]; then
+	# Through a temporary file: a failed call must not leave an empty file
+	# that a rerun would then take for the backup
+	knots -rpcwallet=boltz listdescriptors true > "$S/knots-boltz-descriptors.json.tmp"
+	jq -e '.descriptors | length > 0' "$S/knots-boltz-descriptors.json.tmp" >/dev/null
+	mv "$S/knots-boltz-descriptors.json.tmp" "$S/knots-boltz-descriptors.json"
 	echo "wrote $S/knots-boltz-descriptors.json (private descriptors)"
 fi
 
@@ -41,13 +45,21 @@ if [ ! -f "$ROOT/lnd/data/chain/bitcoin/${NETWORK:-mainnet}/wallet.db" ]; then
 		curl -sk https://127.0.0.1:8080/v1/genseed >/dev/null 2>&1 && break
 		sleep 2
 	done
-	seed=$(curl -sk https://127.0.0.1:8080/v1/genseed)
+	seed=$(curl -skf https://127.0.0.1:8080/v1/genseed)
 	mnemonic=$(echo "$seed" | jq -c .cipher_seed_mnemonic)
-	[ "$mnemonic" != null ] || { echo "genseed failed: $seed" >&2; exit 1; }
+	[ "$(echo "$mnemonic" | jq 'length')" = 24 ] || { echo "genseed failed" >&2; exit 1; }
+	# The seed is on disk, whole, before any wallet uses it: a wallet whose
+	# seed was never written down cannot be recovered
+	echo "$seed" | jq -r '.cipher_seed_mnemonic | to_entries | map("\(.key + 1). \(.value)") | .[]' > "$S/lnd-seed.txt.tmp"
+	[ "$(wc -l < "$S/lnd-seed.txt.tmp")" = 24 ] || { echo "could not write the seed" >&2; exit 1; }
+	sync "$S/lnd-seed.txt.tmp"
+	mv "$S/lnd-seed.txt.tmp" "$S/lnd-seed.txt"
 	pw=$(base64 -w0 < "$ROOT/lnd/wallet-password")
-	curl -sk -X POST https://127.0.0.1:8080/v1/initwallet \
-		-d "{\"wallet_password\":\"$pw\",\"cipher_seed_mnemonic\":$mnemonic}" >/dev/null
-	echo "$seed" | jq -r '.cipher_seed_mnemonic | to_entries | map("\(.key + 1). \(.value)") | .[]' > "$S/lnd-seed.txt"
+	# On stdin, not the command line, where other users of the host see it
+	jq -cn --arg pw "$pw" --argjson mnemonic "$mnemonic" \
+		'{wallet_password: $pw, cipher_seed_mnemonic: $mnemonic}' |
+		curl -skf -X POST https://127.0.0.1:8080/v1/initwallet --data-binary @- >/dev/null ||
+		{ echo "initwallet failed; the seed in $S/lnd-seed.txt was not used, run again" >&2; exit 1; }
 	echo "created the lnd wallet; its 24-word seed is in $S/lnd-seed.txt (no passphrase)"
 fi
 ls -l "$S"

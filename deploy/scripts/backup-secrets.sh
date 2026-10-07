@@ -13,12 +13,16 @@ umask 077
 
 NETWORK=$(sed -n 's/^NETWORK=//p' /opt/lfswap/deploy/.env 2>/dev/null)
 scb=$ROOT/lnd/data/chain/bitcoin/${NETWORK:-mainnet}/channel.backup
+# Copied aside and renamed, so a full disk never leaves a cut-off copy in
+# place of a good one
 if [ -f "$scb" ] && ! cmp -s "$scb" "$S/channel.backup"; then
-	cp "$scb" "$S/channel.backup"
-	cp "$scb" "$S/channel.backup.$(date -u +%Y%m%dT%H%M%SZ)"
+	cp "$scb" "$S/.channel.backup.tmp"
+	cp "$S/.channel.backup.tmp" "$S/channel.backup.$(date -u +%Y%m%dT%H%M%SZ)"
+	mv "$S/.channel.backup.tmp" "$S/channel.backup"
 	# keep the last 20 versions
 	ls -1t "$S"/channel.backup.2* 2>/dev/null | tail -n +21 | xargs -r rm -f
 fi
 if [ -f "$ROOT/boltz/seed.dat" ] && ! cmp -s "$ROOT/boltz/seed.dat" "$S/boltz-seed.dat"; then
-	cp "$ROOT/boltz/seed.dat" "$S/boltz-seed.dat"
+	cp "$ROOT/boltz/seed.dat" "$S/.boltz-seed.dat.tmp"
+	mv "$S/.boltz-seed.dat.tmp" "$S/boltz-seed.dat"
 fi

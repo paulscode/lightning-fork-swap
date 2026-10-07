@@ -64,8 +64,22 @@ rm -f "$ROOT/knots/data/lfswap-restore-wallet.dat"
 log "Postgres, from the dump"
 dc up -d postgres
 wait_for "Postgres" 60 sh -c "docker compose exec -T postgres pg_isready -U boltz </dev/null"
-dc exec -T postgres psql -q -U boltz -d postgres -v ON_ERROR_STOP=0 < "$STAGE/postgres.sql" >/dev/null 2>&1 || true
-log "restored $(psql_q 'select count(*) from swaps') submarine and $(psql_q 'select count(*) from "reverseSwaps"') reverse swaps"
+# The dump recreates the role and the database the container already has,
+# so some statements fail by design: judge the restore by what it restored
+dc exec -T postgres psql -q -U boltz -d postgres -v ON_ERROR_STOP=0 < "$STAGE/postgres.sql" > "$STAGE/postgres-restore.log" 2>&1 || true
+SUBMARINE=$(psql_q 'select count(*) from swaps')
+REVERSE=$(psql_q 'select count(*) from "reverseSwaps"')
+log "restored $SUBMARINE submarine and $REVERSE reverse swaps"
+if jq -e 'has("submarine_swaps")' "$STAGE/manifest.json" >/dev/null; then
+	[ "$SUBMARINE" -ge "$(jq .submarine_swaps "$STAGE/manifest.json")" ] &&
+		[ "$REVERSE" -ge "$(jq .reverse_swaps "$STAGE/manifest.json")" ] ||
+		die "the backup holds $(jq -r '"\(.submarine_swaps) submarine and \(.reverse_swaps) reverse"' "$STAGE/manifest.json") swaps; see $STAGE/postgres-restore.log"
+else
+	log "this backup predates swap counts in its manifest: check the numbers above"
+fi
+# Swaps made after the backup used key indexes the restored database does
+# not know; new swaps must not use them again
+psql_q 'update keys set "highestUsedIndex" = "highestUsedIndex" + 1000' >/dev/null
 
 log "lnd, from its seed and channel.backup"
 dc up -d shim tor lnd
