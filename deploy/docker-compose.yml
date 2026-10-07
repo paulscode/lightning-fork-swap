@@ -68,7 +68,7 @@ services:
     mem_limit: 128m
 
   lnd:
-    image: paulscode/lightning-fork:0.21.3-beta-blake2b.13@sha256:93ebb298742baf99de9f04799eb3bed9781b02c68766078c3285fafa88680b81
+    image: paulscode/lightning-fork:0.21.3-beta-blake2b.17@sha256:1922383540d5545d67f0089149254eb0a23360e73c9d754b85f061a6485596f6
     restart: unless-stopped
     stop_grace_period: 2m
     depends_on:
@@ -85,7 +85,9 @@ services:
     mem_limit: 512m
 
   postgres:
-    image: postgres:18-alpine
+    # By digest: a move copies the data directory, which needs the same major
+    # version on both hosts.
+    image: postgres:18-alpine@sha256:77f585114c32fbca283dc835b0596f4e52b51b4c6662d7810b2f4084f60a1873
     restart: unless-stopped
     environment:
       POSTGRES_DB: boltz
