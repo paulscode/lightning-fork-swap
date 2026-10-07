@@ -112,11 +112,9 @@ const sweep = () =>
 const results = [];
 const scenario = (name, fn) => ({ name, fn });
 
-const reverse = scenario('reverse', async () => {
-  const amount = 50_000;
+const createReverse = async (amount) => {
   const preimage = randomBytes(32);
   const keys = ECPair.makeRandom();
-
   const swap = (
     await axios.post(`${API}/v2/swap/reverse`, {
       invoiceAmount: amount,
@@ -126,13 +124,18 @@ const reverse = scenario('reverse', async () => {
       preimageHash: crypto.sha256(preimage).toString('hex'),
     })
   ).data;
-  if (!hasBlake2bBit(swap.invoice)) throw new Error('the hold invoice lacks feature bit 512');
+  return { swap, keys, preimage };
+};
 
-  // The hold invoice settles only once we claim, so pay it in the background.
-  const payer = spawn('docker', ['compose', 'exec', '-T', 'lnd-user', 'lncli', '--network=regtest',
-    'payinvoice', '--force', '--timeout', '300s', swap.invoice], { cwd: COMPOSE_DIR, stdio: 'ignore' });
+// The hold invoice settles only once we claim, so it is paid in the
+// background
+const payInBackground = (invoice) =>
+  spawn('docker', ['compose', 'exec', '-T', 'lnd-user', 'lncli', '--network=regtest',
+    'payinvoice', '--force', '--timeout', '300s', invoice], { cwd: COMPOSE_DIR, stdio: 'ignore' });
 
-  await waitStatus(swap.id, ['transaction.mempool', 'transaction.confirmed']);
+// Claims a reverse swap's lockup with the service's signature; returns the
+// claim's id and the amount claimed
+const claimReverse = async ({ swap, keys, preimage }) => {
   const lockup = (await axios.get(`${API}/v2/swap/reverse/${swap.id}/transaction`)).data;
   const lockupTx = Transaction.fromHex(lockup.hex);
 
@@ -173,14 +176,96 @@ const reverse = scenario('reverse', async () => {
   const { id: claimTxId } = (await axios.post(`${API}/v2/chain/BTC/transaction`, { hex: claimTx.toHex() })).data;
   mine(1);
   await waitStatus(swap.id, 'invoice.settled');
+  return { claimTxId, value: swapOutput.value };
+};
+
+const reverse = scenario('reverse', async () => {
+  const created = await createReverse(50_000);
+  if (!hasBlake2bBit(created.swap.invoice)) throw new Error('the hold invoice lacks feature bit 512');
+
+  const payer = payInBackground(created.swap.invoice);
+  await waitStatus(created.swap.id, ['transaction.mempool', 'transaction.confirmed']);
+  const { claimTxId, value } = await claimReverse(created);
   payer.kill();
 
   // Looked up by id alone: the node is pruned without -txindex, so this
   // answer comes by way of the shim's index.
   const tx = (await axios.get(`${API}/v2/chain/BTC/transaction/${claimTxId}`)).data;
   if (!tx.hex) throw new Error('claim transaction not found by id');
-  return `claimed ${swapOutput.value} sat in ${claimTxId.slice(0, 16)}…, invoice settled`;
+  return `claimed ${value} sat in ${claimTxId.slice(0, 16)}…, invoice settled`;
 });
+
+// --- a lockup sent but not recorded ----------------------------------------
+
+const psql = (sql) =>
+  compose('exec', '-T', 'postgres', 'psql', '-U', 'boltz', '-d', 'boltz', '-v', 'ON_ERROR_STOP=1', '-Atc', sql);
+
+// Makes the database refuse to record the server lockup of one reverse swap,
+// as if the write failed after the coins were sent
+const refuseLockupWrite = (id) => {
+  psql(`CREATE OR REPLACE FUNCTION e2e_refuse_lockup() RETURNS trigger AS $$
+    BEGIN
+      IF NEW.id = '${id}' AND NEW."transactionId" IS NOT NULL AND OLD."transactionId" IS NULL THEN
+        RAISE EXCEPTION 'e2e: the lockup write is refused';
+      END IF;
+      RETURN NEW;
+    END $$ LANGUAGE plpgsql`);
+  psql('DROP TRIGGER IF EXISTS e2e_refuse_lockup ON "reverseSwaps"');
+  psql('CREATE TRIGGER e2e_refuse_lockup BEFORE UPDATE ON "reverseSwaps" FOR EACH ROW EXECUTE FUNCTION e2e_refuse_lockup()');
+};
+const allowLockupWrite = () => {
+  psql('DROP TRIGGER IF EXISTS e2e_refuse_lockup ON "reverseSwaps"');
+  psql('DROP FUNCTION IF EXISTS e2e_refuse_lockup()');
+};
+
+// What the service's wallet sent to an address
+const walletSendsTo = (target) =>
+  JSON.parse(knots('-rpcwallet=boltz', 'listtransactions', '*', '500'))
+    .filter((t) => t.category === 'send' && t.address === target);
+
+const lockupSentButNotRecorded = async (restart) => {
+  const created = await createReverse(40_000);
+  const { swap } = created;
+  refuseLockupWrite(swap.id);
+  let payer;
+  try {
+    payer = payInBackground(swap.invoice);
+    await waitFor('the lockup to be sent', () => walletSendsTo(swap.lockupAddress).length > 0);
+    // The write fails right after the send; the swap must not have moved on
+    await sleep(3000);
+    const after = (await status(swap.id)).status;
+    if (after !== 'swap.created') throw new Error(`swap is ${after} after the failed write`);
+  } finally {
+    allowLockupWrite();
+  }
+
+  if (restart) {
+    // On start the backend sees the held invoice again, and would lock up
+    // a second time if it did not ask the wallet first
+    compose('restart', 'boltz');
+    await waitFor('the API after restart', async () => {
+      try {
+        await axios.get(`${API}/version`);
+        return true;
+      } catch {
+        return false;
+      }
+    });
+  } else {
+    // Asked about at the next block
+    mine(1);
+  }
+  await waitStatus(swap.id, ['transaction.mempool', 'transaction.confirmed'], { timeoutMs: 120_000, mineEvery: restart ? 0 : 5000 });
+  const sends = walletSendsTo(swap.lockupAddress);
+  if (sends.length !== 1) throw new Error(`the wallet sent ${sends.length} lockups to ${swap.lockupAddress}`);
+
+  const { value } = await claimReverse(created);
+  payer.kill();
+  return `one lockup (${sends[0].txid.slice(0, 16)}…) recorded ${restart ? 'after a restart' : 'at the next block'}; claimed ${value} sat, invoice settled`;
+};
+
+const unrecordedLockupRestart = scenario('unrecorded-lockup-restart', () => lockupSentButNotRecorded(true));
+const unrecordedLockupBlock = scenario('unrecorded-lockup-block', () => lockupSentButNotRecorded(false));
 
 const createSubmarine = async (invoice) => {
   const keys = ECPair.makeRandom();
@@ -491,7 +576,7 @@ const ensureChannels = async () => {
 };
 await ensureChannels();
 
-const all = [rdtsActive, coinbaseLockup, reverse, submarine, refusesSha256Invoice, cooperativeRefund, timeoutRefund, rescan];
+const all = [rdtsActive, coinbaseLockup, reverse, submarine, refusesSha256Invoice, cooperativeRefund, timeoutRefund, rescan, unrecordedLockupRestart, unrecordedLockupBlock];
 const wanted = process.argv.slice(2);
 const probes = [lateCancel];
 const chosen = wanted.length ? [...all, ...probes].filter((s) => wanted.includes(s.name)) : all;
