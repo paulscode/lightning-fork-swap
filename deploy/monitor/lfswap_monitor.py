@@ -45,6 +45,8 @@ LOG_PATTERNS = [
     r"may have been broadcast before this error",
     r"Not locking up .* could not check whether",
     r"was already locked up in .* recording it",
+    r"which the wallet sent without it being recorded",
+    r"Not expiring Reverse Swap .* yet",
     # Reverse swaps: an HTLC that would not outlast the lockup, a late lockup
     r"Cancelling hold invoice of Reverse Swap .* its HTLC expires",
     r"Not acting on confirmed server lockup transaction .* because it is",
