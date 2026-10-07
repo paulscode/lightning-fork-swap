@@ -488,13 +488,18 @@ const rdtsActive = scenario('rdts-rules-in-force', async () => {
 // A miner pays a swap's lockup address from their coinbase. The service must
 // not pay the invoice: it could not claim the coin before the swap times out.
 const coinbaseLockup = scenario('coinbase-lockup-refused', async () => {
-  const amount = 12_000;
+  // The service's minimum follows the fee estimate, which a busy regtest
+  // chain drives up
+  const pairs = (await axios.get(`${API}/v2/swap/submarine`)).data;
+  const amount = Math.max(12_000, pairs.BTC.BTC.limits.minimal);
   const invoice = lncli('lnd-user', 'addinvoice', '--amt', String(amount)).payment_request;
   const { swap } = await createSubmarine(invoice);
   // The regtest subsidy is spent by now; a high-fee transaction in the same
-  // block makes the coinbase large enough to cover the lockup.
+  // block makes the coinbase large enough to cover the lockup (it is about
+  // 140 vbytes).
+  const feeRate = Math.max(500, Math.ceil((swap.expectedAmount + 10_000) / 140));
   const feeTx = knots('-rpcwallet=boltz', '-named', 'sendtoaddress',
-    `address=${knots('-rpcwallet=boltz', 'getnewaddress')}`, 'amount=0.001', 'fee_rate=500');
+    `address=${knots('-rpcwallet=boltz', 'getnewaddress')}`, 'amount=0.001', `fee_rate=${feeRate}`);
   // generatetoaddress mines the mempool with the fees in the coinbase (this
   // node's generateblock leaves them out).
   if (!JSON.parse(knots('getrawmempool')).includes(feeTx)) throw new Error('fee transaction not in the mempool');
