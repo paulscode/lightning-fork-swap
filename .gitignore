@@ -27,3 +27,4 @@ data/
 *.log
 *.tar
 *.tar.gz
+__pycache__/
