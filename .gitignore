@@ -1,6 +1,7 @@
 # Private working material: never published.
 references/
 internal_docs/
+CLAUDE.md
 
 # The backend and web app forks are their own repositories, cloned here.
 backend/
