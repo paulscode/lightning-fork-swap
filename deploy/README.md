@@ -260,6 +260,24 @@ workstation, in regtest: a migration with a reverse swap and a submarine swap
 in flight, a move back, and a lost host restored from backup with its channel
 funds recovered. It never touches production.
 
+## Tests
+
+On a workstation with Docker, none of them touching production:
+
+```sh
+deploy/nginx/test/run.sh                    # the nginx config, in the host's nginx 1.22.1
+python3 -m unittest discover -s deploy/monitor
+(cd shim && go test -race ./...)
+deploy/regtest/bootstrap.sh                 # the service on regtest
+(cd e2e && node run.mjs)                    # swaps, refunds and failures through the API
+# the web app through the production nginx config, in Chrome:
+(cd webapp && bun run regtest && VITE_API_URL=https://localhost:18443 \
+  npx vite build --outDir /tmp/lfs-ui-dist)
+deploy/regtest/ui-nginx.sh up /tmp/lfs-ui-dist
+(cd e2e && node ui.mjs)
+deploy/rehearsal/rehearse.sh                # a move, a rollback and a restore, on VMs
+```
+
 ## Using a remote node over Tor instead
 
 If the host cannot run the node, point the shim at a remote Knots node that
