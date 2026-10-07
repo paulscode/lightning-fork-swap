@@ -50,8 +50,9 @@ about 1 GB between them once running.
    creates its own seed (`/srv/lfswap/boltz/seed.dat`) at first start.
 7. Put the web app's `dist/` (built with `bun run mainnet && bun run build`)
    in `/srv/lfswap/webapp`.
-8. `echo "17 * * * * root /opt/lfswap/deploy/scripts/backup-secrets.sh" >
-   /etc/cron.d/lfswap-backup`.
+8. `./scripts/install-crons.sh`: the hourly copy of the recovery files, the
+   alert monitor every five minutes and, once `BACKUP_AGE_RECIPIENT` is set,
+   the daily offsite backup.
 
 ## Backups
 
@@ -89,6 +90,32 @@ $B wallet get-balance
 $B swap pending-sweeps
 $B swap sweep          # claim deferred submarine swaps now instead of at the next batch
 ```
+
+## Alerts
+
+`monitor/lfswap_monitor.py` runs every five minutes from
+`/etc/cron.d/lfswap-monitor` and reports what needs a person: a container
+down; no block for two hours, the node behind, or a lost branch of two or
+more blocks; lnd unsynced, without peers, or holding an HTLC within 24 blocks
+of its expiry; a reverse swap within 30 blocks of its timeout that the user
+has not claimed; a submarine swap paying for over an hour, waiting for its
+claim, or paid while recorded as failed; backend log lines such as a lockup
+that may have been broadcast before an error; the wallet below
+`MONITOR_MIN_WALLET_SAT`; the disk over 90 %, the host stalling on IO or
+memory; a `channel.backup` the hourly copy missed; the TLS certificate close
+to expiry. It also says once a day that it runs, so silence means it does not.
+
+Set `ALERT_WEBHOOK_URL` and `ALERT_WEBHOOK_KIND` in `.env` (see
+`.env.example`), then check delivery:
+
+```sh
+python3 monitor/lfswap_monitor.py --test       # one test message
+python3 monitor/lfswap_monitor.py --dry-run    # what it would report now
+tail /srv/lfswap/monitor/monitor.log
+```
+
+An alert is sent when it appears, repeated every six hours while it holds,
+and reported once more when it clears. A log line is reported once.
 
 ## Liquidity
 

@@ -43,17 +43,23 @@ refuse_if_migrated() {
 # moves: install them wherever the service now runs.
 install_crons() {
 	echo "17 * * * * root $DEPLOY/scripts/backup-secrets.sh" > /etc/cron.d/lfswap-backup
+	mkdir -p "$ROOT/monitor"
+	chmod 700 "$ROOT/monitor"
+	echo "*/5 * * * * root /usr/bin/python3 $DEPLOY/monitor/lfswap_monitor.py >> $ROOT/monitor/monitor.log 2>&1" > /etc/cron.d/lfswap-monitor
+	if [ -z "${ALERT_WEBHOOK_URL:-}" ]; then
+		log "no ALERT_WEBHOOK_URL in .env: alerts are only written to $ROOT/monitor/monitor.log"
+	fi
 	if [ -n "${BACKUP_AGE_RECIPIENT:-}" ]; then
 		echo "40 3 * * * root $DEPLOY/scripts/backup-offsite.sh" > /etc/cron.d/lfswap-offsite
 	else
 		rm -f /etc/cron.d/lfswap-offsite
 		log "no BACKUP_AGE_RECIPIENT in .env: daily offsite backups are not scheduled"
 	fi
-	chmod 644 /etc/cron.d/lfswap-backup /etc/cron.d/lfswap-offsite 2>/dev/null || true
+	chmod 644 /etc/cron.d/lfswap-backup /etc/cron.d/lfswap-offsite /etc/cron.d/lfswap-monitor 2>/dev/null || true
 }
 
 remove_crons() {
-	rm -f /etc/cron.d/lfswap-backup /etc/cron.d/lfswap-offsite
+	rm -f /etc/cron.d/lfswap-backup /etc/cron.d/lfswap-offsite /etc/cron.d/lfswap-monitor
 }
 
 wait_for() {
