@@ -25,6 +25,9 @@ import (
 	"time"
 )
 
+// A sync older than this means the index is falling behind the node
+const staleAfter = 5 * time.Minute
+
 func env(name, def string) string {
 	if v := os.Getenv(name); v != "" {
 		return v
@@ -33,7 +36,10 @@ func env(name, def string) string {
 }
 
 func main() {
-	window, _ := strconv.ParseInt(env("SHIM_WINDOW", "4032"), 10, 64)
+	window, err := strconv.ParseInt(env("SHIM_WINDOW", "4032"), 10, 64)
+	if err != nil {
+		log.Fatalf("SHIM_WINDOW: %v", err)
+	}
 
 	listen := flag.String("listen", env("SHIM_LISTEN", ":8332"), "address to serve JSON-RPC on")
 	upstream := flag.String("upstream", env("SHIM_UPSTREAM", "http://127.0.0.1:8332/"), "the node's JSON-RPC URL")
@@ -45,6 +51,10 @@ func main() {
 	poll := flag.Duration("poll", time.Second, "how often to look for new blocks")
 	forwardSpec := flag.String("forward", env("SHIM_FORWARD", ""), "TCP ports to relay, e.g. 28332=knots:28332,28333=knots:28333")
 	flag.Parse()
+	if window < 1 {
+		// 0 would index nothing and empty the index
+		log.Fatalf("the window must be at least one block, not %d", window)
+	}
 
 	if *cookie != "" {
 		raw, err := os.ReadFile(*cookie)
@@ -83,9 +93,21 @@ func main() {
 	}
 
 	go func() {
+		start := time.Now()
+		var warned time.Time
 		for {
 			if err := idx.sync(ctx); err != nil && ctx.Err() == nil {
 				log.Printf("sync: %v", err)
+			}
+			// Said again every ten minutes while it lasts; the operator's
+			// monitor looks for it
+			last := idx.lastSynced.get()
+			if last.IsZero() {
+				last = start
+			}
+			if time.Since(last) > staleAfter && time.Since(warned) > 10*time.Minute {
+				log.Printf("index has not synced for %s: lookups may miss new blocks", time.Since(last).Round(time.Second))
+				warned = time.Now()
 			}
 			select {
 			case <-ctx.Done():
@@ -96,12 +118,21 @@ func main() {
 	}()
 
 	mux := http.NewServeMux()
-	mux.Handle("/", &proxy{upstream: *upstream, ix: ix, http: &http.Client{Timeout: 5 * time.Minute}, catchUp: idx.catchUp})
+	mux.Handle("/", &proxy{
+		upstream: *upstream, ix: ix, http: &http.Client{Timeout: 5 * time.Minute},
+		catchUp: idx.catchUp, inActiveChain: idx.inActiveChain,
+	})
 	mux.HandleFunc("/healthz", func(w http.ResponseWriter, _ *http.Request) {
 		tip, _ := ix.tip()
 		n, _ := ix.count()
+		last := idx.lastSynced.get()
 		w.Header().Set("Content-Type", "application/json")
-		_ = json.NewEncoder(w).Encode(map[string]int64{"tip": tip, "transactions": int64(n), "window": window})
+		if last.IsZero() || time.Since(last) > staleAfter {
+			w.WriteHeader(http.StatusServiceUnavailable)
+		}
+		_ = json.NewEncoder(w).Encode(map[string]any{
+			"tip": tip, "transactions": n, "window": window, "lastSynced": last.UTC().Format(time.RFC3339),
+		})
 	})
 
 	srv := &http.Server{Addr: *listen, Handler: mux, ReadHeaderTimeout: 10 * time.Second}

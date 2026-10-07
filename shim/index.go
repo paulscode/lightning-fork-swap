@@ -5,6 +5,7 @@ import (
 	"encoding/hex"
 	"errors"
 	"fmt"
+	"time"
 
 	bolt "go.etcd.io/bbolt"
 )
@@ -23,7 +24,8 @@ type index struct {
 }
 
 func openIndex(path string) (*index, error) {
-	db, err := bolt.Open(path, 0o600, nil)
+	// A second shim on the same file would otherwise wait forever
+	db, err := bolt.Open(path, 0o600, &bolt.Options{Timeout: 10 * time.Second})
 	if err != nil {
 		return nil, err
 	}

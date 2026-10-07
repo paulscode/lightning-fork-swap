@@ -4,10 +4,17 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"io"
 	"log"
 	"net/http"
+	"net/url"
+	"strings"
 )
+
+// The largest request body forwarded; Knots' own limit is far larger, but
+// nothing the backend sends comes close.
+const maxBody = 32 << 20
 
 // Bitcoin Core's "No such mempool or blockchain transaction", returned by
 // getrawtransaction without -txindex for anything outside the mempool.
@@ -22,6 +29,11 @@ type proxy struct {
 	// misses runs it once and looks again: a block can arrive between two
 	// polls, and a caller reacting to that block asks at once.
 	catchUp func(context.Context) error
+
+	// inActiveChain, when set, says whether a block is still in the node's
+	// active chain. An index entry whose block left it (a reorganisation
+	// the index has not caught up with) is not used.
+	inActiveChain func(ctx context.Context, blockHash string) (bool, error)
 }
 
 type rpcRequest struct {
@@ -37,8 +49,25 @@ type rawResponse struct {
 	ID     json.RawMessage `json:"id"`
 }
 
+// target is the upstream URL with the caller's path and query: wallet calls
+// go to /wallet/<name>, and must reach that wallet.
+func (p *proxy) target(r *http.Request) (string, error) {
+	u, err := url.Parse(p.upstream)
+	if err != nil {
+		return "", err
+	}
+	u.Path = strings.TrimSuffix(u.Path, "/") + r.URL.Path
+	u.RawPath = ""
+	u.RawQuery = r.URL.RawQuery
+	return u.String(), nil
+}
+
 func (p *proxy) forward(r *http.Request, body []byte) (int, []byte, error) {
-	req, err := http.NewRequestWithContext(r.Context(), http.MethodPost, p.upstream, bytes.NewReader(body))
+	target, err := p.target(r)
+	if err != nil {
+		return 0, nil, err
+	}
+	req, err := http.NewRequestWithContext(r.Context(), http.MethodPost, target, bytes.NewReader(body))
 	if err != nil {
 		return 0, nil, err
 	}
@@ -97,12 +126,12 @@ func (p *proxy) withBlockHash(ctx context.Context, req rpcRequest) (rpcRequest, 
 		return req, false
 	}
 
-	blockHash, err := p.ix.lookup(txid)
+	blockHash, err := p.lookupActive(ctx, txid)
 	if err == nil && blockHash == "" && p.catchUp != nil {
 		if err := p.catchUp(ctx); err != nil {
 			log.Printf("catching up for %s: %v", txid, err)
 		}
-		blockHash, err = p.ix.lookup(txid)
+		blockHash, err = p.lookupActive(ctx, txid)
 	}
 	if err != nil {
 		log.Printf("index lookup %s: %v", txid, err)
@@ -118,6 +147,41 @@ func (p *proxy) withBlockHash(ctx context.Context, req rpcRequest) (rpcRequest, 
 	}
 	req.Params = params
 	return req, true
+}
+
+// lookupActive is the index's block for txid, if that block is still in the
+// node's active chain.
+func (p *proxy) lookupActive(ctx context.Context, txid string) (string, error) {
+	blockHash, err := p.ix.lookup(txid)
+	if err != nil || blockHash == "" || p.inActiveChain == nil {
+		return blockHash, err
+	}
+	active, err := p.inActiveChain(ctx, blockHash)
+	if err != nil {
+		return "", err
+	}
+	if !active {
+		log.Printf("index has %s in block %s, which left the active chain", txid, blockHash)
+		return "", nil
+	}
+	return blockHash, nil
+}
+
+// parseRequest reads one JSON-RPC request with the keys spelt exactly as the
+// node reads them: Go's decoder would match "Method" or "METHOD" too, and
+// the shim must not act on a method the node did not run.
+func parseRequest(raw []byte) (rpcRequest, error) {
+	var fields map[string]json.RawMessage
+	if err := json.Unmarshal(raw, &fields); err != nil {
+		return rpcRequest{}, err
+	}
+	var req rpcRequest
+	if err := json.Unmarshal(fields["method"], &req.Method); err != nil {
+		return rpcRequest{}, errors.New("no method")
+	}
+	req.ID = fields["id"]
+	req.Params = fields["params"]
+	return req, nil
 }
 
 // retry resends a single request that the node answered with -5, with the
@@ -152,9 +216,13 @@ func (p *proxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "JSON-RPC over POST only", http.StatusMethodNotAllowed)
 		return
 	}
-	body, err := io.ReadAll(io.LimitReader(r.Body, 32<<20))
+	body, err := io.ReadAll(io.LimitReader(r.Body, maxBody+1))
 	if err != nil {
 		http.Error(w, err.Error(), http.StatusBadRequest)
+		return
+	}
+	if len(body) > maxBody {
+		http.Error(w, "request too large", http.StatusRequestEntityTooLarge)
 		return
 	}
 
@@ -169,9 +237,8 @@ func (p *proxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	case len(trimmed) > 0 && trimmed[0] == '[':
 		out = p.patchBatch(r, trimmed, out)
 	case len(trimmed) > 0 && trimmed[0] == '{':
-		var req rpcRequest
 		var resp rawResponse
-		if json.Unmarshal(trimmed, &req) == nil && json.Unmarshal(out, &resp) == nil && isNotFound(resp) {
+		if req, err := parseRequest(trimmed); err == nil && json.Unmarshal(out, &resp) == nil && isNotFound(resp) {
 			if better, ok := p.retry(r, req); ok {
 				out, status = better, http.StatusOK
 			}
@@ -184,15 +251,29 @@ func (p *proxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 }
 
 func (p *proxy) patchBatch(r *http.Request, body, out []byte) []byte {
-	var reqs []rpcRequest
+	var rawReqs []json.RawMessage
 	var resps []json.RawMessage
-	if json.Unmarshal(body, &reqs) != nil || json.Unmarshal(out, &resps) != nil {
+	if json.Unmarshal(body, &rawReqs) != nil || json.Unmarshal(out, &resps) != nil {
 		return out
 	}
+	reqs := make([]rpcRequest, 0, len(rawReqs))
+	for _, raw := range rawReqs {
+		req, err := parseRequest(raw)
+		if err != nil {
+			return out
+		}
+		reqs = append(reqs, req)
+	}
 
+	// The node answers a batch in order, so answers pair with requests by
+	// position. Otherwise by id, and only for ids that appear once: two
+	// requests sharing an id cannot be told apart.
+	inOrder := len(reqs) == len(resps)
 	byID := make(map[string]rpcRequest, len(reqs))
+	seen := make(map[string]int, len(reqs))
 	for _, req := range reqs {
 		byID[string(req.ID)] = req
+		seen[string(req.ID)]++
 	}
 
 	changed := false
@@ -201,8 +282,13 @@ func (p *proxy) patchBatch(r *http.Request, body, out []byte) []byte {
 		if json.Unmarshal(raw, &resp) != nil || !isNotFound(resp) {
 			continue
 		}
-		req, has := byID[string(resp.ID)]
-		if !has {
+		var req rpcRequest
+		switch {
+		case inOrder && bytes.Equal(reqs[i].ID, resp.ID):
+			req = reqs[i]
+		case seen[string(resp.ID)] == 1:
+			req = byID[string(resp.ID)]
+		default:
 			continue
 		}
 		if better, ok := p.retry(r, req); ok {

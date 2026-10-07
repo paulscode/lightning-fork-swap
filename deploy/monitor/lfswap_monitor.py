@@ -67,6 +67,11 @@ LOG_PATTERNS = [
     r"Could not initialize Boltz",
 ]
 
+# The same for the txindex shim
+SHIM_LOG_PATTERNS = [
+    r"index has not synced",
+]
+
 ANSI = re.compile(r"\x1b\[[0-9;]*m")
 
 
@@ -317,16 +322,21 @@ class Monitor:
             )
 
     def check_logs(self, since):
-        out = self.runner.compose(
-            "logs", "--no-color", "--no-log-prefix", "--since", since, "boltz",
-            timeout=120,
-        )
-        patterns = [re.compile(p, re.IGNORECASE) for p in LOG_PATTERNS]
-        for line in out.splitlines():
-            line = ANSI.sub("", line).strip()
-            if any(p.search(line) for p in patterns):
-                digest = hashlib.sha256(line.encode()).hexdigest()[:16]
-                self.add(f"log:{digest}", f"Backend: {line[:400]}", event=True)
+        for service, label, patterns in (
+            ("boltz", "Backend", LOG_PATTERNS),
+            ("shim", "Shim", SHIM_LOG_PATTERNS),
+        ):
+            out = self.runner.compose(
+                "logs", "--no-color", "--no-log-prefix", "--since", since,
+                service, timeout=120,
+            )
+            compiled = [re.compile(p, re.IGNORECASE) for p in patterns]
+            for line in out.splitlines():
+                line = ANSI.sub("", line).strip()
+                if any(p.search(line) for p in compiled):
+                    digest = hashlib.sha256(line.encode()).hexdigest()[:16]
+                    self.add(f"log:{digest}", f"{label}: {line[:400]}",
+                             event=True)
 
     def check_host(self, root):
         usage = self.runner.disk_usage("/")

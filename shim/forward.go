@@ -2,12 +2,15 @@ package main
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"io"
 	"log"
 	"net"
 	"strings"
 	"sync"
+	"syscall"
+	"time"
 )
 
 // forwards parses "28332=knots:28332,28333=knots:28333": listen port on the
@@ -42,16 +45,33 @@ func forward(ctx context.Context, listen, target string) error {
 		ln.Close()
 	}()
 	log.Printf("forwarding %s to %s", listen, target)
+	backoff := 5 * time.Millisecond
 	for {
 		conn, err := ln.Accept()
 		if err != nil {
 			if ctx.Err() != nil {
 				return nil
 			}
+			// Out of file descriptors and the like pass; keep serving RPC
+			// and try again, as net/http does
+			var ne net.Error
+			if errors.As(err, &ne) && ne.Timeout() || isTemporary(err) {
+				log.Printf("forward %s: accept: %v; retrying in %s", listen, err, backoff)
+				time.Sleep(backoff)
+				backoff = min(2*backoff, time.Second)
+				continue
+			}
 			return err
 		}
+		backoff = 5 * time.Millisecond
 		go relay(ctx, conn, target)
 	}
+}
+
+func isTemporary(err error) bool {
+	return errors.Is(err, syscall.EMFILE) || errors.Is(err, syscall.ENFILE) ||
+		errors.Is(err, syscall.ECONNABORTED) || errors.Is(err, syscall.ENOBUFS) ||
+		errors.Is(err, syscall.ENOMEM)
 }
 
 func relay(ctx context.Context, conn net.Conn, target string) {

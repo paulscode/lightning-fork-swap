@@ -47,7 +47,8 @@ def healthy():
                  "expiration_height": 976200}]}]}
         ),
         ("postgres",): "",
-        ("logs",): "",
+        ("logs", "boltz"): "",
+        ("logs", "shim"): "2026/10/07 11:56:00 indexed to 976000 of 976000\n",
     }
 
 
@@ -64,7 +65,7 @@ class FakeRunner:
         if args[0] == "ps":
             return self.lookup(("ps",))
         if args[0] == "logs":
-            return self.lookup(("logs",))
+            return self.lookup(("logs", args[-1]))
         service = args[2]
         if service == "postgres":
             query = args[-1]
@@ -216,7 +217,10 @@ class ChecksTest(unittest.TestCase):
 
     def test_log_lines_that_need_a_person(self):
         outputs = healthy()
-        outputs[("logs",)] = "\n".join([
+        outputs[("logs", "shim")] = (
+            "2026/10/07 11:58:00 index has not synced for 6m0s: lookups may "
+            "miss new blocks\n")
+        outputs[("logs", "boltz")] = "\n".join([
             "07/10/2026 11:56:00:000 info: Locked up 100000 BTC",
             "07/10/2026 11:57:00:000 error: Lockup of Reverse Swap abc may "
             "have been broadcast before this error; not failing the swap",
@@ -227,7 +231,8 @@ class ChecksTest(unittest.TestCase):
         ])
         alerts, runner = run(outputs)
         texts = [a.text for a in alerts.values() if a.key.startswith("log:")]
-        self.assertEqual(len(texts), 3)
+        self.assertEqual(len(texts), 4)
+        self.assertTrue(any(t.startswith("Shim: ") for t in texts))
         self.assertTrue(all(a.event for a in alerts.values()))
         self.assertFalse(any("\x1b" in t for t in texts))
         logs_call = [c for c in runner.calls if c[0] == "logs"][0]

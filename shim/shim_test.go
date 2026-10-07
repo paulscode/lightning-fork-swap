@@ -25,15 +25,22 @@ type fakeNode struct {
 	mempool     map[string]bool
 	pruneHeight int64
 	calls       []string
+	paths       []string
+	prev        map[string]string // block hash -> previous block hash
+	heights     map[string]int    // block hash -> height, stale blocks too
+	// onRequest, when set, runs before each request is answered, with the
+	// lock held: a test changes the chain mid-sync with it
+	onRequest func(n *fakeNode, req rpcRequest)
 }
 
 func hash32(prefix string, n int) string {
-	s := fmt.Sprintf("%s%x", prefix, n)
+	// Fixed width: "ba1" and "ba10" padded with zeros would be the same hash
+	s := fmt.Sprintf("%s%08x", prefix, n)
 	return s + strings.Repeat("0", 64-len(s))
 }
 
 func newFakeNode(blocks int) *fakeNode {
-	n := &fakeNode{txs: map[string][]string{}, mempool: map[string]bool{}}
+	n := &fakeNode{txs: map[string][]string{}, mempool: map[string]bool{}, prev: map[string]string{}, heights: map[string]int{}}
 	for h := 0; h < blocks; h++ {
 		n.addBlock("a", h)
 	}
@@ -45,6 +52,10 @@ func (n *fakeNode) addBlock(fork string, h int) {
 	if h < len(n.chain) {
 		n.chain = n.chain[:h]
 	}
+	if h > 0 {
+		n.prev[bh] = n.chain[h-1]
+	}
+	n.heights[bh] = h
 	n.chain = append(n.chain, bh)
 	n.txs[bh] = []string{hash32("c"+fork, h), hash32("d"+fork, h)}
 }
@@ -53,6 +64,7 @@ func (n *fakeNode) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	body, _ := io.ReadAll(r.Body)
 	n.mu.Lock()
 	defer n.mu.Unlock()
+	n.paths = append(n.paths, r.URL.RequestURI())
 	trimmed := bytes.TrimSpace(body)
 	if trimmed[0] == '[' {
 		var reqs []rpcRequest
@@ -74,6 +86,9 @@ func (n *fakeNode) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 }
 
 func (n *fakeNode) handle(req rpcRequest) map[string]any {
+	if n.onRequest != nil {
+		n.onRequest(n, req)
+	}
 	n.calls = append(n.calls, req.Method+" "+string(req.Params))
 	ok := func(v any) map[string]any { return map[string]any{"result": v, "error": nil, "id": req.ID} }
 	fail := func(code int, msg string) map[string]any {
@@ -97,7 +112,22 @@ func (n *fakeNode) handle(req rpcRequest) map[string]any {
 		}
 		return ok(n.chain[h])
 	case "getblock":
-		return ok(map[string]any{"tx": n.txs[params[0].(string)]})
+		block := map[string]any{"tx": n.txs[params[0].(string)]}
+		if prev, has := n.prev[params[0].(string)]; has {
+			block["previousblockhash"] = prev
+		}
+		return ok(block)
+	case "getblockheader":
+		bh := params[0].(string)
+		h, known := n.heights[bh]
+		if !known {
+			return fail(-5, "Block not found")
+		}
+		confirmations := -1
+		if h < len(n.chain) && n.chain[h] == bh {
+			confirmations = len(n.chain) - h
+		}
+		return ok(map[string]any{"hash": bh, "height": h, "confirmations": confirmations})
 	case "getrawtransaction":
 		txid := params[0].(string)
 		if n.mempool[txid] {
@@ -430,5 +460,183 @@ func TestCatchUpIsOneCallWhenCurrent(t *testing.T) {
 	}
 	if got := h.node.calls[before:]; len(got) != 1 || !strings.HasPrefix(got[0], "getbestblockhash") {
 		t.Fatalf("calls when current: %v", got)
+	}
+}
+
+// A reorganisation between the walk back and the indexing of new blocks
+// must not leave the old block below the new ones.
+func TestReorganisationDuringSync(t *testing.T) {
+	h := newHarness(t, 50, 100)
+	h.sync(t) // blocks 0 to 49 of the first chain
+	h.node.mu.Lock()
+	h.node.addBlock("a", 50)
+	fired := false
+	// After the walk back has found the index tip (49) current, and just
+	// as block 50 is fetched, the node switches to a chain where 49 and 50
+	// are other blocks
+	h.node.onRequest = func(n *fakeNode, req rpcRequest) {
+		if !fired && req.Method == "getblockhash" && string(req.Params) == "[50]" {
+			fired = true
+			n.addBlock("f", 49)
+			n.addBlock("f", 50)
+		}
+	}
+	h.node.mu.Unlock()
+
+	h.sync(t)
+
+	if !fired {
+		t.Fatal("the reorganisation was not triggered")
+	}
+	if b, _ := h.ix.lookup(hash32("ca", 49)); b != "" {
+		t.Errorf("the replaced block 49 is still indexed: %s", b)
+	}
+	if b, _ := h.ix.lookup(hash32("cf", 49)); b != hash32("bf", 49) {
+		t.Errorf("the new block 49 is not indexed: %q", b)
+	}
+	if b, _ := h.ix.lookup(hash32("cf", 50)); b != hash32("bf", 50) {
+		t.Errorf("the new block 50 is not indexed: %q", b)
+	}
+}
+
+func TestProxyKeepsTheWalletPath(t *testing.T) {
+	h := newHarness(t, 5, 10)
+	req, _ := http.NewRequest(http.MethodPost, h.shim.URL+"/wallet/boltz?x=1", strings.NewReader(`{"id":1,"method":"getbalances","params":[]}`))
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	resp.Body.Close()
+	h.node.mu.Lock()
+	defer h.node.mu.Unlock()
+	if got := h.node.paths[len(h.node.paths)-1]; got != "/wallet/boltz?x=1" {
+		t.Fatalf("the node was asked at %q", got)
+	}
+}
+
+func TestProxyRetriesAtTheWalletPath(t *testing.T) {
+	h := newHarness(t, 30, 10)
+	h.sync(t)
+	h.node.mu.Lock()
+	h.node.paths = nil
+	h.node.mu.Unlock()
+	req, _ := http.NewRequest(http.MethodPost, h.shim.URL+"/wallet/boltz", strings.NewReader(`{"id":1,"method":"getrawtransaction","params":["`+hash32("ca", 25)+`",true]}`))
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	resp.Body.Close()
+	h.node.mu.Lock()
+	defer h.node.mu.Unlock()
+	for _, p := range h.node.paths {
+		if p != "/wallet/boltz" {
+			t.Fatalf("a request went to %q", p)
+		}
+	}
+}
+
+func TestBatchWithDuplicateIDs(t *testing.T) {
+	h := newHarness(t, 30, 10)
+	h.sync(t)
+	a, b := hash32("ca", 28), hash32("ca", 29)
+	_, out := h.post(t, `[{"id":1,"method":"getrawtransaction","params":["`+a+`"]},{"id":1,"method":"getrawtransaction","params":["`+b+`"]}]`)
+	var resps []rawResponse
+	if err := json.Unmarshal([]byte(out), &resps); err != nil {
+		t.Fatal(err)
+	}
+	if len(resps) != 2 {
+		t.Fatalf("%s", out)
+	}
+	if got := string(resps[0].Result); !strings.Contains(got, a) {
+		t.Errorf("first answer is %s, not for %s", got, a)
+	}
+	if got := string(resps[1].Result); !strings.Contains(got, b) {
+		t.Errorf("second answer is %s, not for %s", got, b)
+	}
+}
+
+// An index entry whose block left the active chain is not used, even
+// before the index has caught up with the reorganisation.
+func TestStaleIndexEntryIsNotUsed(t *testing.T) {
+	h := newHarness(t, 30, 10)
+	h.sync(t)
+	h.shim.Close()
+	h.shim = httptest.NewServer(&proxy{upstream: h.nodeS.URL, ix: h.ix, http: &http.Client{Timeout: 10 * time.Second}, inActiveChain: h.idx.inActiveChain})
+	// Block 29 is replaced on the node; the index has not synced
+	h.node.mu.Lock()
+	h.node.addBlock("f", 29)
+	h.node.mu.Unlock()
+
+	_, out := h.post(t, `{"id":1,"method":"getrawtransaction","params":["`+hash32("ca", 29)+`"]}`)
+	var resp rawResponse
+	if err := json.Unmarshal([]byte(out), &resp); err != nil {
+		t.Fatal(err)
+	}
+	if !isNotFound(resp) {
+		t.Fatalf("answered %s for a transaction only in a stale block", out)
+	}
+	// Still found in a block that is active
+	_, out = h.post(t, `{"id":1,"method":"getrawtransaction","params":["`+hash32("ca", 28)+`"]}`)
+	if !strings.Contains(out, "block:"+hash32("ba", 28)) {
+		t.Fatalf("answered %s", out)
+	}
+}
+
+func TestMethodKeyMustBeExact(t *testing.T) {
+	h := newHarness(t, 30, 10)
+	h.sync(t)
+	// The node runs "method"; a request whose "Method" is getrawtransaction
+	// is not retried as one
+	_, out := h.post(t, `{"id":1,"method":"nosuchmethod","Method":"getrawtransaction","params":["`+hash32("ca", 25)+`"]}`)
+	if strings.Contains(out, "block:") {
+		t.Fatalf("retried as another method: %s", out)
+	}
+	if _, err := parseRequest([]byte(`{"Method":"getrawtransaction"}`)); err == nil {
+		t.Fatal("parsed a request without an exact method key")
+	}
+}
+
+func TestRefusesAnOversizedBody(t *testing.T) {
+	h := newHarness(t, 5, 10)
+	resp, err := http.Post(h.shim.URL, "application/json", bytes.NewReader(make([]byte, maxBody+1)))
+	if err != nil {
+		t.Fatal(err)
+	}
+	resp.Body.Close()
+	if resp.StatusCode != http.StatusRequestEntityTooLarge {
+		t.Fatalf("status %d", resp.StatusCode)
+	}
+}
+
+func TestCatchUpDoesNotWaitForALongSync(t *testing.T) {
+	h := newHarness(t, 30, 10)
+	h.sync(t)
+	h.node.mu.Lock()
+	h.node.addBlock("a", 30)
+	h.node.mu.Unlock()
+	old := catchUpWait
+	catchUpWait = 50 * time.Millisecond
+	defer func() { catchUpWait = old }()
+
+	h.idx.mu.Lock()
+	start := time.Now()
+	err := h.idx.catchUp(context.Background())
+	h.idx.mu.Unlock()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if waited := time.Since(start); waited > time.Second {
+		t.Fatalf("waited %s", waited)
+	}
+}
+
+func TestSyncRecordsWhenItReachedTheTip(t *testing.T) {
+	h := newHarness(t, 30, 10)
+	if !h.idx.lastSynced.get().IsZero() {
+		t.Fatal("synced before syncing")
+	}
+	h.sync(t)
+	if time.Since(h.idx.lastSynced.get()) > time.Minute {
+		t.Fatal("not recorded")
 	}
 }
