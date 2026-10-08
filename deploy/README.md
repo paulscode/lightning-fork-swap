@@ -119,6 +119,9 @@ and reported once more when it clears. A log line is reported once.
 
 ## Liquidity
 
+`OPERATING.md` is the operator's guide to money: first funding, keeping both
+swap directions open, fees, earnings and taking them out. In short:
+
 - **Reverse swaps** (Lightning → chain) pay out of the Knots wallet `boltz`
   and are paid to lnd over Lightning. They need on-chain funds in `boltz` and
   inbound capacity on lnd's channels.

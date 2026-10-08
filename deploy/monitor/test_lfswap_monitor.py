@@ -41,6 +41,14 @@ def healthy():
         ("lnd", "getinfo"): json.dumps(
             {"synced_to_chain": True, "num_peers": 3, "block_height": 976000}
         ),
+        ("lnd", "channelbalance"): json.dumps(
+            {"local_balance": {"sat": "500000"},
+             "remote_balance": {"sat": "300000"}}
+        ),
+        ("lnd", "walletbalance"): json.dumps({"confirmed_balance": "20000"}),
+        ("lnd", "pendingchannels"): json.dumps({"pending_open_channels": []}),
+        ("lnd", "fwdinghistory"): json.dumps({"forwarding_events": [
+            {"fee_msat": "1500"}, {"fee_msat": "2600"}]}),
         ("lnd", "listchannels"): json.dumps(
             {"channels": [{"chan_id": "1", "pending_htlcs": [
                 {"incoming": True, "hash_lock": "ab" * 32,
@@ -214,6 +222,15 @@ class ChecksTest(unittest.TestCase):
         alerts, _ = run(outputs)
         self.assertIn("check:pairs", alerts)
 
+    def test_liquidity_floors(self):
+        alerts, _ = run(env={"MONITOR_MIN_OUTBOUND_SAT": "600000",
+                             "MONITOR_MIN_INBOUND_SAT": "200000"})
+        self.assertIn("lnd:liquidity:send", alerts)
+        self.assertIn("500,000 sat", alerts["lnd:liquidity:send"].text)
+        self.assertNotIn("lnd:liquidity:receive", alerts)
+        alerts, _ = run()
+        self.assertNotIn("lnd:liquidity:send", alerts)
+
     def test_swap_states(self):
         outputs = healthy()
         outputs["sql"] = {
@@ -297,6 +314,30 @@ class ChecksTest(unittest.TestCase):
         self.assertIn("wallet locked", alerts["check:lnd"].text)
         self.assertIn("check:wallet", alerts)
         self.assertNotIn("check:chain", alerts)
+
+
+class ReportTest(unittest.TestCase):
+    def test_report(self):
+        outputs = healthy()
+        outputs["sql"] = {
+            "FROM swaps WHERE status IN": "3|300000|1500|420|9000\n",
+            "status = 'invoice.settled'": "2|190000|1000\n",
+            '"transactionId" IS NOT NULL': "450\n",
+        }
+        runner = FakeRunner(outputs)
+        lines = m.report(m.Monitor(runner, {}, NOW), 7)
+        text = "\n".join(lines)
+        self.assertIn("hot wallet (reverse lockups): 30,000,000 sat", text)
+        self.assertIn("can send 500,000 sat, can receive 300,000 sat", text)
+        self.assertIn("reverse (Lightning to chain): up to 300,000 sat", text)
+        self.assertIn("submarine: 3 swaps, 300,000 sat paid out", text)
+        self.assertIn("service fees earned: 2,500 sat", text)
+        # 420 claim + 9 routing (9000 msat) + 450 lockup
+        self.assertIn("costs: 879 sat", text)
+        self.assertIn("routing fees earned by lnd: 4 sat (2 forwards)", text)
+        self.assertIn("net: 1,625 sat", text)
+        self.assertIn("net (without routing income): 1,621 sat", text)
+        self.assertTrue(any("interval '7 days'" in q for q in runner.queries))
 
 
 class PlanTest(unittest.TestCase):

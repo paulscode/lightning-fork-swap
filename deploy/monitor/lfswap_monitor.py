@@ -19,9 +19,16 @@ Configuration, from deploy/.env (all optional):
 State (what was sent, where the logs were read up to) is kept in
 $LFSWAP_ROOT/monitor/state.json.
 
+  MONITOR_MIN_OUTBOUND_SAT alert when lnd can send less over its channels
+  MONITOR_MIN_INBOUND_SAT  alert when lnd can receive less over its channels
+
   lfswap_monitor.py           check once, send what is new
   lfswap_monitor.py --test    send a test alert and exit
   lfswap_monitor.py --dry-run check once, print, send nothing, keep no state
+  lfswap_monitor.py --report [--days N] [--send]
+                              balances, what each kind of swap can take now,
+                              swaps and fees over N days (default 7) and in
+                              all; --send also sends it to the webhook
 """
 
 import datetime
@@ -261,6 +268,22 @@ class Monitor:
                 f"lnd has {info.get('num_peers', 0)} peers "
                 f"(alert below {int(min_peers)})",
             )
+        balance = json.loads(self.lncli("channelbalance"))
+        local = int(balance.get("local_balance", {}).get("sat", 0))
+        remote = int(balance.get("remote_balance", {}).get("sat", 0))
+        for key, have, side, swaps in (
+            ("MONITOR_MIN_OUTBOUND_SAT", local, "send", "submarine"),
+            ("MONITOR_MIN_INBOUND_SAT", remote, "receive", "reverse"),
+        ):
+            floor = number(self.env, key, None)
+            if floor is not None and have < floor:
+                self.add(
+                    f"lnd:liquidity:{side}",
+                    f"lnd can {side} only {have:,} sat over its channels "
+                    f"(alert below {int(floor):,}): {swaps} swaps are "
+                    "limited to that",
+                )
+
         height = info.get("block_height") or self.height
         channels = json.loads(self.lncli("listchannels"))["channels"]
         for channel in channels:
@@ -446,6 +469,98 @@ class Monitor:
         return self.alerts
 
 
+# --- the report -------------------------------------------------------------
+
+SUBMARINE_DONE = ("invoice.paid", "transaction.claim.pending",
+                  "transaction.claimed")
+
+
+def sats(value):
+    return f"{int(value):,} sat"
+
+
+def report(monitor, days):
+    """Balances, capacity and earnings, as lines of text."""
+    m = monitor
+    lines = []
+
+    knots = json.loads(m.knots("-rpcwallet=boltz", "getbalances"))["mine"]
+    hot = round(knots["trusted"] * 1e8)
+    pending = round(knots.get("untrusted_pending", 0) * 1e8)
+    lnd_chain = int(json.loads(m.lncli("walletbalance"))[
+        "confirmed_balance"])
+    balance = json.loads(m.lncli("channelbalance"))
+    local = int(balance.get("local_balance", {}).get("sat", 0))
+    remote = int(balance.get("remote_balance", {}).get("sat", 0))
+    channels = json.loads(m.lncli("listchannels"))["channels"]
+    active = sum(1 for c in channels if c.get("active"))
+    pending_channels = json.loads(m.lncli("pendingchannels"))
+    opening = len(pending_channels.get("pending_open_channels", []))
+
+    lines.append("Balances")
+    lines.append(f"  hot wallet (reverse lockups): {sats(hot)}"
+                 + (f" (+{sats(pending)} unconfirmed)" if pending else ""))
+    lines.append(f"  lnd on chain: {sats(lnd_chain)}")
+    lines.append(f"  channels: {active} active of {len(channels)}"
+                 + (f", {opening} opening" if opening else "")
+                 + f"; can send {sats(local)}, can receive {sats(remote)}")
+    lines.append(f"  total: {sats(hot + pending + lnd_chain + local)}")
+
+    lines.append("What swaps can take now (before the pair limits)")
+    lines.append(f"  submarine (chain to Lightning): up to {sats(local)}, "
+                 "what lnd can send")
+    lines.append(f"  reverse (Lightning to chain): up to "
+                 f"{sats(min(hot, remote))}, the smaller of the hot wallet "
+                 "and what lnd can receive")
+
+    def swap_totals(since):
+        cond = (f' AND "createdAt" >= now() - interval \'{int(since)} days\''
+                if since else "")
+        done = ", ".join(f"'{s}'" for s in SUBMARINE_DONE)
+        sub = m.psql(
+            "SELECT count(*), coalesce(sum(\"invoiceAmount\"), 0), "
+            "coalesce(sum(fee), 0), coalesce(sum(\"minerFee\"), 0), "
+            "coalesce(sum(\"routingFee\"), 0) FROM swaps "
+            f"WHERE status IN ({done}){cond}")[0]
+        rev = m.psql(
+            "SELECT count(*), coalesce(sum(\"onchainAmount\"), 0), "
+            "coalesce(sum(fee), 0) FROM \"reverseSwaps\" "
+            f"WHERE status = 'invoice.settled'{cond}")[0]
+        # Every lockup costs its miner fee, claimed or refunded
+        lockups = m.psql(
+            "SELECT coalesce(sum(\"minerFee\"), 0) FROM \"reverseSwaps\" "
+            f"WHERE \"transactionId\" IS NOT NULL{cond}")[0]
+        return ([int(x) for x in sub], [int(x) for x in rev],
+                int(lockups[0]))
+
+    for label, since in ((f"Last {days} days", days), ("Since the start",
+                                                       None)):
+        sub, rev, lockup_fees = swap_totals(since)
+        fees = sub[2] + rev[2]
+        costs = sub[3] + round(sub[4] / 1000) + lockup_fees
+        lines.append(label)
+        lines.append(f"  submarine: {sub[0]} swaps, {sats(sub[1])} paid out")
+        lines.append(f"  reverse: {rev[0]} swaps, {sats(rev[1])} locked up")
+        lines.append(f"  service fees earned: {sats(fees)}")
+        lines.append(f"  costs: {sats(costs)} (claim and lockup miner fees, "
+                     f"Lightning routing fees)")
+        if since:
+            forwards = json.loads(m.lncli(
+                "fwdinghistory", "--start_time", f"-{int(since)}d",
+                "--max_events", "50000"))
+            routed = sum(int(f.get("fee_msat", 0))
+                         for f in forwards.get("forwarding_events", []))
+            lines.append(f"  routing fees earned by lnd: "
+                         f"{sats(round(routed / 1000))} "
+                         f"({len(forwards.get('forwarding_events', []))} "
+                         "forwards)")
+            lines.append(f"  net: {sats(fees - costs + round(routed / 1000))}")
+        else:
+            lines.append(f"  net (without routing income): "
+                         f"{sats(fees - costs)}")
+    return lines
+
+
 # --- deciding what to send ------------------------------------------------
 
 
@@ -561,6 +676,17 @@ def main(argv):
         sent = send(env, "Lightning Fork Swap: test alert",
                     f"Sent by lfswap_monitor.py --test at {stamp}.")
         print("sent" if sent else "no ALERT_WEBHOOK_URL in .env")
+        return 0
+
+    if "--report" in argv:
+        days = 7
+        if "--days" in argv:
+            days = int(argv[argv.index("--days") + 1])
+        monitor = Monitor(Runner(DEPLOY), env, now, network)
+        text = "\n".join(report(monitor, days))
+        print(text)
+        if "--send" in argv:
+            send(env, f"Lightning Fork Swap report, {stamp[:10]}", text)
         return 0
 
     dry = "--dry-run" in argv

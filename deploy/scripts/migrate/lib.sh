@@ -45,7 +45,11 @@ install_crons() {
 	echo "17 * * * * root $DEPLOY/scripts/backup-secrets.sh" > /etc/cron.d/lfswap-backup
 	mkdir -p "$ROOT/monitor"
 	chmod 700 "$ROOT/monitor"
-	echo "*/5 * * * * root /usr/bin/python3 $DEPLOY/monitor/lfswap_monitor.py >> $ROOT/monitor/monitor.log 2>&1" > /etc/cron.d/lfswap-monitor
+	{
+		echo "*/5 * * * * root /usr/bin/python3 $DEPLOY/monitor/lfswap_monitor.py >> $ROOT/monitor/monitor.log 2>&1"
+		# The weekly report: balances, capacity, swaps and fees
+		echo "0 13 * * 1 root /usr/bin/python3 $DEPLOY/monitor/lfswap_monitor.py --report --send >> $ROOT/monitor/monitor.log 2>&1"
+	} > /etc/cron.d/lfswap-monitor
 	if [ -z "${ALERT_WEBHOOK_URL:-}" ]; then
 		log "no ALERT_WEBHOOK_URL in .env: alerts are only written to $ROOT/monitor/monitor.log"
 	fi
