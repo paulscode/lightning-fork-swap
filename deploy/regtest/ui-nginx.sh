@@ -32,8 +32,11 @@ up)
 		-e "s#server 127.0.0.1:9004#server 127.0.0.1:19004#" \
 		-e "s#server 127.0.0.1:9005#server 127.0.0.1:19005#" \
 		-e "s#listen 443 ssl http2;#listen 127.0.0.1:18443 ssl http2;#" \
+		-e "s#listen 443 ssl default_server;#listen 127.0.0.1:18443 ssl default_server;#" \
 		-e "/listen \[::\]/d" \
 		-e "s#listen 80;#listen 127.0.0.1:18080;#" \
+		-e "s#listen 80 default_server;#listen 127.0.0.1:18080 default_server;#" \
+		-e "s#server_name lightningfork.com www.lightningfork.com;#server_name lightningfork.com www.lightningfork.com localhost;#" \
 		-e "s#wss://lightningfork.com#wss://localhost:18443#" \
 		"$here/../nginx/lightningfork.conf" > "$state/site.conf"
 	chmod -R a+rX "$state"
