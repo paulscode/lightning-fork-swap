@@ -28,3 +28,4 @@ data/
 *.tar
 *.tar.gz
 __pycache__/
+shim/shim
