@@ -54,12 +54,14 @@ if [ ! -f "$ROOT/lnd/data/chain/bitcoin/${NETWORK:-mainnet}/wallet.db" ]; then
 	[ "$(wc -l < "$S/lnd-seed.txt.tmp")" = 24 ] || { echo "could not write the seed" >&2; exit 1; }
 	sync "$S/lnd-seed.txt.tmp"
 	mv "$S/lnd-seed.txt.tmp" "$S/lnd-seed.txt"
-	pw=$(base64 -w0 < "$ROOT/lnd/wallet-password")
-	# On stdin, not the command line, where other users of the host see it
-	jq -cn --arg pw "$pw" --argjson mnemonic "$mnemonic" \
-		'{wallet_password: $pw, cipher_seed_mnemonic: $mnemonic}' |
+	# Neither on the command line, where other users of the host see it: the
+	# password from a file, the seed on stdin
+	echo "$seed" | jq -c --rawfile pw <(base64 -w0 < "$ROOT/lnd/wallet-password") \
+		'{wallet_password: $pw, cipher_seed_mnemonic: .cipher_seed_mnemonic}' |
 		curl -skf -X POST https://127.0.0.1:8080/v1/initwallet --data-binary @- >/dev/null ||
 		{ echo "initwallet failed; the seed in $S/lnd-seed.txt was not used, run again" >&2; exit 1; }
 	echo "created the lnd wallet; its 24-word seed is in $S/lnd-seed.txt (no passphrase)"
 fi
+# The backend's own lnd macaroon, limited to what it calls
+./scripts/bake-macaroon.sh
 ls -l "$S"

@@ -91,17 +91,19 @@ psql_q 'update keys set "highestUsedIndex" = "highestUsedIndex" + 1000' >/dev/nu
 log "lnd, from its seed and channel.backup"
 dc up -d shim tor lnd
 wait_for "lnd to ask for a wallet" 60 curl -skf https://127.0.0.1:8080/v1/genseed
-words=$(sed -E 's/^[0-9]+\. //' "$ROOT/secrets/lnd-seed.txt" | jq -R . | jq -sc .)
-body=$(jq -n --argjson words "$words" \
-	--arg pw "$(base64 -w0 < "$ROOT/lnd/wallet-password")" \
-	--arg scb "$(base64 -w0 < "$STAGE/channel.backup")" \
-	'{wallet_password: $pw, cipher_seed_mnemonic: $words, recovery_window: 2500,
-	  channel_backups: {multi_chan_backup: {multi_chan_backup: $scb}}}')
-curl -skf -X POST https://127.0.0.1:8080/v1/initwallet -d "$body" >/dev/null
+# The password, seed and channel backup go from files and stdin, never on a
+# command line, where other users of the host would see them
+sed -E 's/^[0-9]+\. //' "$ROOT/secrets/lnd-seed.txt" | jq -R . | jq -sc \
+	--rawfile pw <(base64 -w0 < "$ROOT/lnd/wallet-password") \
+	--rawfile scb <(base64 -w0 < "$STAGE/channel.backup") \
+	'{wallet_password: $pw, cipher_seed_mnemonic: ., recovery_window: 2500,
+	  channel_backups: {multi_chan_backup: {multi_chan_backup: $scb}}}' |
+	curl -skf -X POST https://127.0.0.1:8080/v1/initwallet --data-binary @- >/dev/null
 wait_for "lnd" 120 sh -c "docker compose exec -T lnd lncli --network=$NETWORK getinfo </dev/null | grep -Eq '\"synced_to_chain\": +true'"
 [ "$(lncli getinfo | jq -r .identity_pubkey)" = "$(jq -r .lnd_pubkey "$STAGE/manifest.json")" ] || die "lnd came back with a different identity"
 
-log "the backend"
+log "the backend, with a macaroon of the restored lnd"
+"$DEPLOY/scripts/bake-macaroon.sh" --force
 dc up -d boltz
 wait_for "the backend" 60 curl -sf http://127.0.0.1:9001/version
 install_crons

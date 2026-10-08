@@ -131,6 +131,12 @@ services:
     volumes:
       - ${LFSWAP_ROOT:-/srv/lfswap}/boltz:/boltz
       - ${LFSWAP_ROOT:-/srv/lfswap}/lnd/tls.cert:/lnd/tls.cert:ro
-      - ${LFSWAP_ROOT:-/srv/lfswap}/lnd/data/chain/bitcoin/${NETWORK:-mainnet}/admin.macaroon:/lnd/admin.macaroon:ro
+      # lnd's calls the backend makes and no others (scripts/bake-macaroon.sh);
+      # missing, the backend does not start rather than run on a directory
+      - type: bind
+        source: ${LFSWAP_ROOT:-/srv/lfswap}/lnd/boltz.macaroon
+        target: /lnd/boltz.macaroon
+        read_only: true
+        bind: {create_host_path: false}
     logging: *logging
     mem_limit: 700m

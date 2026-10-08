@@ -45,11 +45,14 @@ about 1 GB between them once running.
    unless you run `firewall-confirm` from a new SSH session), then `tls`, then
    `nginx` (creates the preview password).
 5. `./scripts/init-wallets.sh`: the Knots wallet and the lnd wallet; seeds go
-   to `/srv/lfswap/secrets`.
+   to `/srv/lfswap/secrets`. It also bakes the backend's lnd macaroon
+   (`scripts/bake-macaroon.sh`), limited to the calls the backend makes.
 6. `docker compose up -d` (Postgres, the shim and the backend). The backend
    creates its own seed (`/srv/lfswap/boltz/seed.dat`) at first start.
 7. Put the web app's `dist/` (built with `bun run mainnet && bun run build`)
-   in `/srv/lfswap/webapp`.
+   in `/srv/lfswap/webapp`, owned by root:
+   `rsync -a --delete --chown=root:root --chmod=D755,F644 --exclude '*.map'
+   webapp/dist/ root@HOST:/srv/lfswap/webapp/`.
 8. `./scripts/install-crons.sh`: the hourly copy of the recovery files, the
    alert monitor every five minutes and, once `BACKUP_AGE_RECIPIENT` is set,
    the daily offsite backup.
@@ -175,7 +178,7 @@ On the **new host** (Debian 12):
 # private notes and the source trees the host does not need
 tar -czf - -C /path/to/lightning-fork-swap --exclude=.git --exclude=internal_docs \
     --exclude=references --exclude=backend --exclude=webapp --exclude=e2e . \
-  | ssh root@NEW 'mkdir -p /opt/lfswap && tar -xzf - -C /opt/lfswap'
+  | ssh root@NEW 'mkdir -p /opt/lfswap && tar --no-same-owner -xzf - -C /opt/lfswap'
 ssh root@NEW /opt/lfswap/deploy/scripts/provision-host.sh     # prints an age public key
 ssh root@NEW /opt/lfswap/deploy/scripts/install-host.sh firewall   # confirm from a 2nd session
 docker save lfswap/boltz:dev | gzip | ssh root@NEW 'gunzip | docker load'

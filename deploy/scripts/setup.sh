@@ -107,4 +107,15 @@ chown -R "$TOR_UID" "$ROOT/tor/data"
 chmod 700 "$ROOT/tor/data"
 chown -R 65532:65532 "$ROOT/shim"
 
+# The deployment files run as root (cron, these scripts) and the web app is
+# served to every user: root's alone, whatever owner a copy kept (tar and
+# rsync as root keep the owner of the machine they came from)
+# (only where the runbook installs them, never a working copy elsewhere)
+DEPLOY_ROOT=$(cd .. && pwd)
+for d in "$DEPLOY_ROOT" "$ROOT/webapp"; do
+	[ "$DEPLOY_ROOT" = /opt/lfswap ] && [ -d "$d" ] || continue
+	chown -R root:root "$d"
+	chmod -R go-w "$d"
+done
+
 echo "rendered configuration under $ROOT"
