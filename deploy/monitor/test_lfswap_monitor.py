@@ -530,6 +530,47 @@ class SendTest(unittest.TestCase):
         self.assertEqual(received[0][0], "application/json")
         self.assertEqual(json.loads(received[0][1]), {"text": "*T*\nx"})
 
+    def test_a_long_message_goes_whole_in_pieces(self):
+        import http.server
+        import threading
+
+        received = []
+
+        class Handler(http.server.BaseHTTPRequestHandler):
+            def do_POST(self):
+                length = int(self.headers["Content-Length"])
+                received.append(json.loads(self.rfile.read(length)))
+                self.send_response(200)
+                self.end_headers()
+
+            def log_message(self, *args):
+                pass
+
+        lines = [f"NEW log:{i} " + "x" * 390 for i in range(25)]
+        server = http.server.HTTPServer(("127.0.0.1", 0), Handler)
+        thread = threading.Thread(target=server.serve_forever, daemon=True)
+        thread.start()
+        try:
+            env = {"ALERT_WEBHOOK_URL":
+                   f"http://127.0.0.1:{server.server_port}/bot/sendMessage",
+                   "ALERT_WEBHOOK_KIND": "telegram",
+                   "ALERT_TELEGRAM_CHAT_ID": "1"}
+            self.assertTrue(m.send(env, "Title", "\n".join(lines)))
+        finally:
+            server.shutdown()
+            server.server_close()
+        self.assertGreater(len(received), 1)
+        self.assertTrue(all(len(r["text"]) <= 4000 for r in received))
+        self.assertTrue(received[0]["text"].startswith(
+            f"Title (1/{len(received)})\n"))
+        delivered = "\n".join(r["text"].split("\n", 1)[1] for r in received)
+        self.assertEqual(delivered, "\n".join(lines))
+
+    def test_split_text(self):
+        self.assertEqual(m.split_text("a\nb\nc", 3), ["a\nb", "c"])
+        self.assertEqual(m.split_text("abcdefg", 3), ["abc", "def", "g"])
+        self.assertEqual(m.split_text("", 3), [""])
+
     def test_no_url_sends_nothing(self):
         self.assertFalse(m.send({}, "T", "x"))
 

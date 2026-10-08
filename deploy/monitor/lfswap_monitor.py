@@ -658,17 +658,48 @@ def payload(kind, title, text, env):
     return json.dumps(body).encode(), {"Content-Type": "application/json"}
 
 
+# What fits in one message, title included, for the kinds that cut longer ones
+MESSAGE_LIMITS = {"discord": 1900, "telegram": 3900}
+
+
+def split_text(text, limit):
+    """Pieces of at most limit characters, cut between lines where possible.
+    Each alert is sent once, so none may be cut off."""
+    pieces, current = [], ""
+    for line in text.split("\n"):
+        while len(line) > limit:
+            if current:
+                pieces.append(current)
+                current = ""
+            pieces.append(line[:limit])
+            line = line[limit:]
+        candidate = f"{current}\n{line}" if current else line
+        if len(candidate) > limit:
+            pieces.append(current)
+            current = line
+        else:
+            current = candidate
+    if current or not pieces:
+        pieces.append(current)
+    return pieces
+
+
 def send(env, title, text):
     url = env.get("ALERT_WEBHOOK_URL", "")
     if not url:
         return False
-    data, headers = payload(env.get("ALERT_WEBHOOK_KIND", "json"), title, text,
-                            env)
-    request = urllib.request.Request(url, data=data, headers=headers,
-                                     method="POST")
-    with urllib.request.urlopen(request, timeout=20) as response:
-        if response.status >= 300:
-            raise RuntimeError(f"webhook answered {response.status}")
+    kind = env.get("ALERT_WEBHOOK_KIND", "json")
+    limit = MESSAGE_LIMITS.get(kind)
+    pieces = split_text(text, limit - len(title) - 16) if limit else [text]
+    for number, piece in enumerate(pieces, 1):
+        part = title if len(pieces) == 1 else \
+            f"{title} ({number}/{len(pieces)})"
+        data, headers = payload(kind, part, piece, env)
+        request = urllib.request.Request(url, data=data, headers=headers,
+                                         method="POST")
+        with urllib.request.urlopen(request, timeout=20) as response:
+            if response.status >= 300:
+                raise RuntimeError(f"webhook answered {response.status}")
     return True
 
 
