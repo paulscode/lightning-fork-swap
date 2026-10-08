@@ -427,6 +427,14 @@ class MainTest(unittest.TestCase):
         self.assertEqual(self.main(), 0)
         self.assertEqual(len(self.sent), 1)
 
+    def test_the_heartbeat_is_logged_once_a_day_without_a_webhook(self):
+        self.write_env("MONITOR_HEARTBEAT_HOURS=24\n")
+        self.assertEqual(self.main(), 0)
+        first = self.state()["heartbeat"]
+        self.assertEqual(self.main(), 0)
+        self.assertEqual(self.state()["heartbeat"], first)
+        self.assertEqual(self.sent, [])
+
     def test_dry_run_keeps_no_state(self):
         self.assertEqual(self.main("--dry-run"), 0)
         self.assertFalse(os.path.exists(os.path.join(self.root, "monitor")))

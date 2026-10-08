@@ -597,8 +597,9 @@ def main(argv):
     if msg:
         print(f"{stamp} {msg[0]}\n{msg[1]}")
         try:
-            if send(env, *msg):
-                new_state["heartbeat"] = now.timestamp()
+            send(env, *msg)
+            # Any message, sent or only logged, shows the monitor runs
+            new_state["heartbeat"] = now.timestamp()
         except Exception as error:
             # Keep the old state so the same alerts are sent next run
             print(f"{stamp} could not send the alert: {error}", file=sys.stderr)
