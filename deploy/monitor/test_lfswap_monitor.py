@@ -320,8 +320,8 @@ class ReportTest(unittest.TestCase):
     def test_report(self):
         outputs = healthy()
         outputs["sql"] = {
-            "FROM swaps WHERE status IN": "3|300000|1500|420|9000\n",
-            "status = 'invoice.settled'": "2|190000|1000\n",
+            "FROM swaps WHERE status IN": "3|300000|1500|420|9000|302400\n",
+            "status = 'invoice.settled'": "2|190000|1000|191500\n",
             '"transactionId" IS NOT NULL': "450\n",
         }
         runner = FakeRunner(outputs)
@@ -332,11 +332,15 @@ class ReportTest(unittest.TestCase):
         self.assertIn("reverse (Lightning to chain): up to 300,000 sat", text)
         self.assertIn("submarine: 3 swaps, 300,000 sat paid out", text)
         self.assertIn("service fees earned: 2,500 sat", text)
+        # Users paid 302,400 - 300,000 - 1,500 = 900 on submarine swaps and
+        # 191,500 - 190,000 - 1,000 = 500 on reverse ones; the service spent
         # 420 claim + 9 routing (9000 msat) + 450 lockup
-        self.assertIn("costs: 879 sat", text)
+        self.assertIn("network fees: users paid 1,400 sat, the service spent "
+                      "879 sat", text)
         self.assertIn("routing fees earned by lnd: 4 sat (2 forwards)", text)
-        self.assertIn("net: 1,625 sat", text)
-        self.assertIn("net (without routing income): 1,621 sat", text)
+        # 2,500 + 1,400 - 879 = 3,021, plus 4 routed
+        self.assertIn("net: 3,025 sat", text)
+        self.assertIn("net (without routing income): 3,021 sat", text)
         self.assertTrue(any("interval '7 days'" in q for q in runner.queries))
 
 

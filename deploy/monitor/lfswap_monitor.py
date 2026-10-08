@@ -520,11 +520,13 @@ def report(monitor, days):
         sub = m.psql(
             "SELECT count(*), coalesce(sum(\"invoiceAmount\"), 0), "
             "coalesce(sum(fee), 0), coalesce(sum(\"minerFee\"), 0), "
-            "coalesce(sum(\"routingFee\"), 0) FROM swaps "
+            "coalesce(sum(\"routingFee\"), 0), "
+            "coalesce(sum(\"onchainAmount\"), 0) FROM swaps "
             f"WHERE status IN ({done}){cond}")[0]
         rev = m.psql(
             "SELECT count(*), coalesce(sum(\"onchainAmount\"), 0), "
-            "coalesce(sum(fee), 0) FROM \"reverseSwaps\" "
+            "coalesce(sum(fee), 0), coalesce(sum(\"invoiceAmount\"), 0) "
+            "FROM \"reverseSwaps\" "
             f"WHERE status = 'invoice.settled'{cond}")[0]
         # Every lockup costs its miner fee, claimed or refunded
         lockups = m.psql(
@@ -537,13 +539,18 @@ def report(monitor, days):
                                                        None)):
         sub, rev, lockup_fees = swap_totals(since)
         fees = sub[2] + rev[2]
-        costs = sub[3] + round(sub[4] / 1000) + lockup_fees
+        # Users pay the network fees in the quote, on top of the service fee:
+        # what a swap brought in beyond what it paid out, less the service fee
+        paid_by_users = (sub[5] - sub[1] - sub[2]) + (rev[3] - rev[1] - rev[2])
+        spent = sub[3] + round(sub[4] / 1000) + lockup_fees
+        gained = fees + paid_by_users - spent
         lines.append(label)
         lines.append(f"  submarine: {sub[0]} swaps, {sats(sub[1])} paid out")
         lines.append(f"  reverse: {rev[0]} swaps, {sats(rev[1])} locked up")
         lines.append(f"  service fees earned: {sats(fees)}")
-        lines.append(f"  costs: {sats(costs)} (claim and lockup miner fees, "
-                     f"Lightning routing fees)")
+        lines.append(f"  network fees: users paid {sats(paid_by_users)}, the "
+                     f"service spent {sats(spent)} (claim and lockup miner "
+                     "fees, Lightning routing fees)")
         if since:
             forwards = json.loads(m.lncli(
                 "fwdinghistory", "--start_time", f"-{int(since)}d",
@@ -554,10 +561,10 @@ def report(monitor, days):
                          f"{sats(round(routed / 1000))} "
                          f"({len(forwards.get('forwarding_events', []))} "
                          "forwards)")
-            lines.append(f"  net: {sats(fees - costs + round(routed / 1000))}")
+            lines.append(f"  net: {sats(gained + round(routed / 1000))}")
         else:
             lines.append(f"  net (without routing income): "
-                         f"{sats(fees - costs)}")
+                         f"{sats(gained)}")
     return lines
 
 

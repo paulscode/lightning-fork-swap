@@ -157,8 +157,9 @@ Two kinds of fee, two levers:
 ## 6. Earnings, and taking them out
 
 `python3 monitor/lfswap_monitor.py --report [--days N]` shows, for the last N
-days and since the start: swaps and volume, service fees earned, costs (miner
-fees of claims and lockups, Lightning routing fees paid), routing fees lnd
+days and since the start: swaps and volume, service fees earned, network
+fees (what users paid for them in their quotes, and what the service spent:
+miner fees of claims and lockups, Lightning routing fees), routing fees lnd
 earned, and the net. Every Monday at 13:00 UTC it also goes to Telegram.
 
 The earnings are not in a separate pot: they are part of the balances. Keep
