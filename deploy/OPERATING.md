@@ -98,7 +98,7 @@ sat to start) caps any single swap.
      one move (you pay the service's fee to yourself, plus miner fees).
 4. **Fund the hot wallet** for reverse swaps:
    ```sh
-   $K getnewaddress                   # send coins here
+   $K getnewaddress "" bech32m        # send coins here (Taproot; the default is the old 1... kind)
    $K getbalances                     # mine.trusted is what the service can use
    ```
 5. **Set the alert floors** in `.env` (sat), so Telegram tells you before a
@@ -121,7 +121,7 @@ Watch the weekly report and the floor alerts. Then:
 
 | What you see | Why | What to do |
 | --- | --- | --- |
-| lnd can send little; hot wallet growing | mostly submarine swaps | move hot wallet coins into channels: `$K sendtoaddress <lnd newaddress> <BTC>`, then open a channel; or run a **reverse** swap through the service yourself (pay from your own node, receive on chain), which turns the service's inbound back into outbound |
+| lnd can send little; hot wallet growing | mostly submarine swaps | move hot wallet coins into channels: `$K sendtoaddress <lnd newaddress p2tr> <BTC>`, then open a channel; or run a **reverse** swap through the service yourself (pay from your own node, receive on chain), which turns the service's inbound back into outbound |
 | lnd can receive little, or hot wallet low | mostly reverse swaps | add to the hot wallet; or run a **submarine** swap through the service yourself (refills the hot wallet and the inbound together); or get another inbound channel |
 | a channel never moves | a poor peer | close it (`$L closechannel --funding_txid ... --output_index ...`); the coins return to lnd's on-chain wallet |
 | both directions low | the service has outgrown its capital | add capital, or lower `MAX_SWAP_SAT` meanwhile |
