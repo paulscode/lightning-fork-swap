@@ -31,7 +31,7 @@ openssl req -x509 -newkey rsa:2048 -nodes -days 2 -subj "/CN=lightningfork.com" 
 	-keyout site.key -out site.crt 2>/dev/null
 printf 'preview:%s\n' "$(openssl passwd -apr1 test)" > htpasswd
 printf 'auth_basic "preview";\nauth_basic_user_file /t/htpasswd;\n' > preview.conf
-mkdir -p webapp source
+mkdir -p webapp
 echo '<!doctype html><title>app</title>' > webapp/index.html
 : > maintenance.conf
 chmod -R a+rX "$work"
@@ -45,7 +45,6 @@ render() {
 		-e "s#/etc/nginx/lfswap-maintenance.conf#/t/maintenance.conf#" \
 		-e "s#/etc/ssl/certs/ca-certificates.crt#/t/ca.crt#" \
 		-e "s#root /srv/lfswap/webapp;#root /t/webapp;#" \
-		-e "s#alias /srv/lfswap/source/;#alias /t/source/;#" \
 		-e "s#server 127.0.0.1:\(900[145]\)#server mock:\1#" \
 		-e "s#https://mempool.guide/api/#https://mempool.guide:$explorer_port/api/#" \
 		"$here/../lightningfork.conf"

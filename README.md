@@ -10,14 +10,19 @@ This repository holds what runs the service:
 | Path | What |
 | --- | --- |
 | `shim/` | `txindex-shim`: a JSON-RPC proxy that lets the swap backend run against a pruned Bitcoin Knots node (see below) |
-| `deploy/` | Docker Compose file, config templates, nginx site, firewall and setup scripts for one Debian host |
+| `deploy/` | Docker Compose file, config templates, nginx site, firewall and setup scripts for one Debian host; the operator's guides (`deploy/README.md`, `deploy/OPERATING.md`) |
+| `e2e/` | end-to-end tests against the service on regtest, through the API and through the web app in a browser |
 
 The backend and the web app are forks kept in their own repositories, each
-describing its changes from upstream (`LIGHTNING-FORK.md` in the backend, the
-CHANGES section of the web app's README):
-`lightning-fork-swap-backend` (from `BoltzExchange/boltz-backend` by way of
-`SwapMarket/boltz-backend`) and `lightning-fork-swap-webapp` (from
-`BoltzExchange/boltz-web-app`).
+describing its changes from upstream:
+
+| Repository | Fork of | Changes |
+| --- | --- | --- |
+| [lightning-fork-swap-backend](https://github.com/paulscode/lightning-fork-swap-backend) (branch `blake2b`) | [BoltzExchange/boltz-backend](https://github.com/BoltzExchange/boltz-backend) by way of [SwapMarket/boltz-backend](https://github.com/SwapMarket/boltz-backend) | `LIGHTNING-FORK.md` |
+| [lightning-fork-swap-webapp](https://github.com/paulscode/lightning-fork-swap-webapp) (branch `blake2b`) | [BoltzExchange/boltz-web-app](https://github.com/BoltzExchange/boltz-web-app) | the CHANGES section of its README |
+
+What runs at [lightningfork.com](https://lightningfork.com) is the head of
+these three repositories: deployments are pushed here first.
 
 ## What the Bitcoin BLAKE2b chain changes
 
