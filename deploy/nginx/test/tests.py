@@ -4,23 +4,36 @@ config rendered by run.sh. Run by run.sh inside the test network."""
 import base64
 import http.client
 import json
+import os
+import socket
 import ssl
 import sys
 import unittest
 
-NGINX = "nginx"
+NGINX = os.environ.get("LFSWAP_NGINX", "nginx")
 UNTRUSTED = "nginx-untrusted"
 AUTH = "Basic " + base64.b64encode(b"preview:test").decode()
 
 
+class SNIConnection(http.client.HTTPSConnection):
+    """HTTPS to a container, presenting the site's name in the handshake."""
+
+    def __init__(self, *args, sni="lightningfork.com", **kwargs):
+        super().__init__(*args, **kwargs)
+        self.sni = sni
+
+    def connect(self):
+        sock = socket.create_connection((self.host, self.port), self.timeout)
+        self.sock = self._context.wrap_socket(sock, server_hostname=self.sni)
+
+
 def request(method, path, headers=None, body=None, host=NGINX, port=443,
-            auth=True):
+            auth=True, sni="lightningfork.com", host_header="lightningfork.com"):
     context = ssl._create_unverified_context()
-    conn = (http.client.HTTPSConnection(host, port, context=context,
-                                        timeout=10)
+    conn = (SNIConnection(host, port, context=context, timeout=10, sni=sni)
             if port == 443 else http.client.HTTPConnection(host, port,
                                                            timeout=10))
-    all_headers = {"Host": "lightningfork.com"}
+    all_headers = {"Host": host_header}
     if auth:
         all_headers["Authorization"] = AUTH
     all_headers.update(headers or {})
@@ -156,6 +169,19 @@ class Headers(unittest.TestCase):
         status, _, _ = request("GET", "/v2/swap/submarine", auth=False)
         self.assertEqual(status, 401)
 
+    def test_other_names_get_nothing(self):
+        # No certificate for a name that is not the site's
+        with self.assertRaises(ssl.SSLError):
+            request("GET", "/", sni="example.com")
+        with self.assertRaises(ssl.SSLError):
+            request("GET", "/", sni=None)
+        # A forged Host on the site's handshake: closed without an answer
+        with self.assertRaises(http.client.RemoteDisconnected):
+            request("GET", "/", host_header="example.com")
+        with self.assertRaises(http.client.RemoteDisconnected):
+            request("GET", "/", port=80, auth=False,
+                    host_header="example.com")
+
     def test_redirects(self):
         status, headers, _ = request("GET", "/x", headers={
             "Host": "www.lightningfork.com"})
@@ -171,7 +197,7 @@ class Headers(unittest.TestCase):
 class Explorer(unittest.TestCase):
     def test_its_answer_is_inert_on_this_origin(self):
         status, headers, raw = request(
-            "GET", "/explorer/api/tx/ab/hex",
+            "GET", "/explorer/api/tx/abababababababababababababababababababababababababababababababab/hex",
             headers={"Cookie": "a=b", "X-Forwarded-For": "6.6.6.6"})
         self.assertEqual(status, 200)
         self.assertEqual(header(headers, "Content-Type"),
@@ -184,14 +210,40 @@ class Explorer(unittest.TestCase):
         self.assertEqual(header(headers, "X-Content-Type-Options"),
                          ["nosniff"])
         self.assertEqual(header(headers, "X-Explorer-Path"),
-                         ["/api/tx/ab/hex"])
+                         ["/api/tx/abababababababababababababababababababababababababababababababab/hex"])
         self.assertEqual(header(headers, "X-Seen-Cookie"), [""])
         self.assertEqual(header(headers, "X-Seen-Forwarded"), [""])
         self.assertIn(b"<script>", raw)  # served, but as text
 
-    def test_only_get_and_post(self):
-        status, _, _ = request("PUT", "/explorer/api/tx", body="x")
-        self.assertEqual(status, 403)
+    def test_only_the_paths_the_app_uses(self):
+        for method, path in [
+            ("GET", "/explorer/api/address/bc1qxy2kgdygjrsqtzq2n0yrf2493p83kkfjhx0wlh/utxo"),
+            ("GET", "/explorer/api/tx/abababababababababababababababababababababababababababababababab/hex"),
+            ("GET", "/explorer/api/tx/abababababababababababababababababababababababababababababababab/outspend/1"),
+            ("GET", "/explorer/api/blocks/tip/height"),
+            ("GET", "/explorer/api/fee-estimates"),
+            ("GET", "/explorer/api/v1/fees/recommended"),
+            ("POST", "/explorer/api/tx"),
+        ]:
+            with self.subTest(method=method, path=path):
+                status, _, _ = request(method, path, body="x"
+                                       if method == "POST" else None)
+                self.assertEqual(status, 200)
+        for method, path in [
+            ("PUT", "/explorer/api/tx"),
+            ("GET", "/explorer/api/tx"),
+            ("POST", "/explorer/api/tx/abababababababababababababababababababababababababababababababab/hex"),
+            ("GET", "/explorer/api/mempool/recent"),
+            ("GET", "/explorer/api/v1/mining/pools/1w"),
+            ("GET", "/explorer/api/tx/ABABABABABABABABABABABABABABABABABABABABABABABABABABABABABABABAB/hex"),
+            ("GET", "/explorer/api/tx/ab/hex"),
+            ("GET", "/explorer/api/address/x/txs"),
+            ("GET", "/explorer/api/"),
+        ]:
+            with self.subTest(method=method, path=path):
+                status, _, _ = request(method, path, body="x"
+                                       if method in ("POST", "PUT") else None)
+                self.assertEqual(status, 404)
 
     def test_an_upstream_with_an_untrusted_certificate_is_refused(self):
         status, _, raw = request("GET", "/explorer/api/blocks/tip/height",
@@ -209,6 +261,30 @@ class RateLimits(unittest.TestCase):
         self.assertEqual(statuses[0], 200)
 
 
+class SharedPrefix(unittest.TestCase):
+    """Run by run.sh from two addresses in one IPv6 /64, one after the other
+    (LFSWAP_PHASE=first, then second): together they get one client's
+    creation limit, not one each."""
+
+    def test_one_64_is_one_client(self):
+        phase = os.environ.get("LFSWAP_PHASE")
+        if phase is None:
+            self.skipTest("run by run.sh in the IPv6 phase")
+        if phase == "first":
+            statuses = [request("POST", "/v2/swap/submarine", body="{}")[0]
+                        for _ in range(6)]
+            self.assertEqual(set(statuses), {200})
+        else:
+            status, _, _ = request("POST", "/v2/swap/submarine", body="{}")
+            self.assertEqual(status, 503)
+
+
 if __name__ == "__main__":
+    only = os.environ.get("LFSWAP_ONLY")
+    if only:
+        suite = unittest.defaultTestLoader.loadTestsFromName(
+            only, sys.modules[__name__])
+        ok = unittest.TextTestRunner(verbosity=2).run(suite).wasSuccessful()
+        sys.exit(0 if ok else 1)
     result = unittest.main(exit=False, verbosity=2).result
     sys.exit(0 if result.wasSuccessful() else 1)

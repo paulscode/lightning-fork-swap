@@ -54,6 +54,12 @@ nginx)
 	install -m 0644 nginx/lightningfork.conf /etc/nginx/sites-available/lightningfork.conf
 	ln -sf /etc/nginx/sites-available/lightningfork.conf /etc/nginx/sites-enabled/lightningfork.conf
 	rm -f /etc/nginx/sites-enabled/default
+	# Debian's 768 connections per worker run out before the site's
+	# per-client cap (30) does, with a few dozen clients holding theirs open
+	# (and each connection needs file descriptors beyond the default 1024)
+	sed -i -E 's/^(\s*worker_connections)\s+[0-9]+;/\1 4096;/' /etc/nginx/nginx.conf
+	grep -q '^worker_rlimit_nofile' /etc/nginx/nginx.conf ||
+		sed -i '/^worker_processes/a worker_rlimit_nofile 16384;' /etc/nginx/nginx.conf
 	nginx -t
 	# A restart, not a reload: a reload that fails at runtime (a changed
 	# limit_req zone, say) passes nginx -t and silently keeps the old config.

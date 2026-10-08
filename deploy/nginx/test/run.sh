@@ -12,7 +12,7 @@ id=lfswap-nginx-test-$$
 work=$(mktemp -d)
 cleanup() {
 	docker rm -f "$id-mock" "$id-nginx" "$id-untrusted" >/dev/null 2>&1 || true
-	docker network rm "$id" >/dev/null 2>&1 || true
+	docker network rm "$id" "$id-v6" >/dev/null 2>&1 || true
 	rm -rf "$work"
 }
 trap cleanup EXIT
@@ -77,3 +77,14 @@ done
 
 docker run --rm --network "$id" -v "$here/tests.py:/tests.py:ro" "$PYTHON_IMAGE" \
 	python3 /tests.py
+
+# Two clients in one IPv6 /64 share the limits of one client
+v6=fd00:1f5:0:1
+docker network create --ipv6 --subnet "$v6::/64" "$id-v6" >/dev/null
+docker network connect --ip6 "$v6::2" "$id-v6" "$id-nginx"
+for phase_ip in first:10 second:20; do
+	docker run --rm --network "$id-v6" --ip6 "$v6::${phase_ip#*:}" \
+		-e LFSWAP_NGINX="$v6::2" -e LFSWAP_PHASE="${phase_ip%%:*}" \
+		-e LFSWAP_ONLY=SharedPrefix -v "$here/tests.py:/tests.py:ro" \
+		"$PYTHON_IMAGE" python3 /tests.py
+done
