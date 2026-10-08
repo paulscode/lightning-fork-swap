@@ -48,6 +48,12 @@ install -m 600 "$STAGE/env" "$DEPLOY/.env"
 mkdir -p "$ROOT/boltz" "$ROOT/secrets" "$ROOT/lnd"
 install -m 600 "$STAGE/boltz-seed.dat" "$ROOT/boltz/seed.dat"
 cp -a "$STAGE/secrets/." "$ROOT/secrets/"
+# Once the operator has taken the seeds offline they are not in the backup:
+# they go back into secrets/ from the offline copy before a restore
+for f in lnd-seed.txt lnd-wallet-password.txt; do
+	[ -s "$ROOT/secrets/$f" ] ||
+		die "$ROOT/secrets/$f is missing (taken offline): copy it there from the offline backup, then run this again"
+done
 install -m 600 "$ROOT/secrets/lnd-wallet-password.txt" "$ROOT/lnd/wallet-password"
 [ -f "$STAGE/letsencrypt.tar" ] && tar -C /etc -xf "$STAGE/letsencrypt.tar"
 [ -f "$STAGE/lfswap.htpasswd" ] && install -o root -g www-data -m 640 "$STAGE/lfswap.htpasswd" /etc/nginx/lfswap.htpasswd

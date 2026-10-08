@@ -242,7 +242,10 @@ echo "40 3 * * * root /opt/lfswap/deploy/scripts/backup-offsite.sh" > /etc/cron.
 ```
 
 If the host is lost: provision a new one, copy a pruned chain to it from a
-node you trust (or let it sync, slowly), then
+node you trust (or let it sync, slowly). Once the seeds have been taken
+offline (see Backups), backups no longer contain `lnd-seed.txt` and
+`lnd-wallet-password.txt`: put them in `/srv/lfswap/secrets` from the
+offline copy first. Then
 
 ```sh
 scripts/migrate/restore.sh BACKUP --identity YOUR_AGE_KEY --public-ip NEW_IP
