@@ -63,8 +63,9 @@ Not by itself (the operator's work):
 
 Sizes are yours to choose; the rule of thumb: the **hot wallet is the most
 the service can lose** to a bug or an attack on the reverse path, so keep it
-to a working float and the rest cold. The pair limit (`MAX_SWAP_SAT`, 1,000,000
-sat to start) caps any single swap.
+to a working float and the rest cold. The pair limit (`MAX_SWAP_SAT`) caps
+any single swap; size it to what the network's channels can carry (a swap
+larger than the user's own channels cannot be paid anyway).
 
 1. **Fund lnd's on-chain wallet**, enough for the channels you will open plus
    a small reserve (anchor channels keep about 10,000 sat per channel for fee
