@@ -33,6 +33,7 @@ printf 'preview:%s\n' "$(openssl passwd -apr1 test)" > htpasswd
 printf 'auth_basic "preview";\nauth_basic_user_file /t/htpasswd;\n' > preview.conf
 mkdir -p webapp
 echo '<!doctype html><title>app</title>' > webapp/index.html
+echo '{"name": "app"}' > webapp/manifest.json
 : > maintenance.conf
 chmod -R a+rX "$work"
 

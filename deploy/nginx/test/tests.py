@@ -150,6 +150,9 @@ class Headers(unittest.TestCase):
     def test_the_preview_password_is_required(self):
         status, _, _ = request("GET", "/", auth=False)
         self.assertEqual(status, 401)
+        # Only the manifest, which browsers fetch without credentials
+        status, _, _ = request("GET", "/manifest.json", auth=False)
+        self.assertEqual(status, 200)
         status, _, _ = request("GET", "/v2/swap/submarine", auth=False)
         self.assertEqual(status, 401)
 
