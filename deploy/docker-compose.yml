@@ -87,6 +87,15 @@ services:
     mem_limit: 512m
     # lnd last of all: killed mid-update it can need a force close
     oom_score_adj: -500
+    # Healthy once its RPC server answers: the backend skips an lnd that is
+    # still starting, and never tries it again until it restarts itself
+    healthcheck:
+      test: ["CMD-SHELL", "lncli --network=${NETWORK:-mainnet} getinfo >/dev/null 2>&1"]
+      interval: 15s
+      timeout: 10s
+      retries: 3
+      start_period: 15m
+      start_interval: 5s
 
   postgres:
     # By digest: a move copies the data directory, which needs the same major
@@ -111,7 +120,7 @@ services:
       guard: {condition: service_completed_successfully}
       postgres: {condition: service_started}
       shim: {condition: service_started}
-      lnd: {condition: service_started}
+      lnd: {condition: service_healthy}
     environment:
       NODE_OPTIONS: --max-old-space-size=384
     command: ["--configpath", "/boltz/boltz.conf", "--datadir", "/boltz"]

@@ -47,6 +47,8 @@ def healthy():
                  "expiration_height": 976200}]}]}
         ),
         ("postgres",): "",
+        ("http", "submarine"): json.dumps({"BTC": {"BTC": {"rate": 1}}}),
+        ("http", "reverse"): json.dumps({"BTC": {"BTC": {"rate": 1}}}),
         ("logs", "boltz"): "",
         ("logs", "shim"): "2026/10/07 11:56:00 indexed to 976000 of 976000\n",
     }
@@ -103,6 +105,9 @@ class FakeRunner:
 
     def disk_usage(self, path):
         return self.disk
+
+    def http_get(self, url):
+        return self.lookup(("http", url.rsplit("/", 1)[1]))
 
 
 def run(outputs=None, env=None, **kwargs):
@@ -198,6 +203,16 @@ class ChecksTest(unittest.TestCase):
         self.assertIn("expires in 20 blocks",
                       alerts["lnd:htlc:" + "cd" * 32].text)
         self.assertNotIn("lnd:htlc:" + "ef" * 32, alerts)
+
+    def test_no_pairs(self):
+        outputs = healthy()
+        outputs[("http", "reverse")] = "{}"
+        alerts, _ = run(outputs)
+        self.assertIn("api:pairs:reverse", alerts)
+        self.assertNotIn("api:pairs:submarine", alerts)
+        outputs[("http", "submarine")] = RuntimeError("connection refused")
+        alerts, _ = run(outputs)
+        self.assertIn("check:pairs", alerts)
 
     def test_swap_states(self):
         outputs = healthy()

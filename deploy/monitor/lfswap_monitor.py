@@ -154,6 +154,10 @@ class Runner:
     def disk_usage(self, path):
         return shutil.disk_usage(path)
 
+    def http_get(self, url):
+        with urllib.request.urlopen(url, timeout=20) as response:
+            return response.read().decode()
+
 
 class Monitor:
     def __init__(self, runner, env, now, network="mainnet"):
@@ -271,6 +275,19 @@ class Monitor:
                         f"HTLC {htlc['hash_lock'][:16]}... on channel "
                         f"{channel['chan_id']} expires in {left} blocks",
                     )
+
+    def check_pairs(self):
+        # The backend serves no pairs when it has no Lightning node, which
+        # happens when lnd was still starting as it started
+        for kind in ("submarine", "reverse"):
+            pairs = json.loads(self.runner.http_get(
+                f"http://127.0.0.1:9001/v2/swap/{kind}"))
+            if not pairs.get("BTC", {}).get("BTC"):
+                self.add(
+                    f"api:pairs:{kind}",
+                    f"The API offers no {kind} swaps (is the backend "
+                    "connected to lnd? docker compose restart boltz)",
+                )
 
     def check_swaps(self):
         height = self.height
@@ -411,6 +428,7 @@ class Monitor:
             ("chain", self.check_chain),
             ("wallet", self.check_wallet),
             ("lnd", self.check_lnd),
+            ("pairs", self.check_pairs),
             ("swaps", self.check_swaps),
             ("logs", lambda: self.check_logs(since)),
             ("host", lambda: self.check_host(root)),
