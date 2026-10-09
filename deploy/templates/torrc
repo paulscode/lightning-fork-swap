@@ -1,6 +1,7 @@
 # Rendered by scripts/setup.sh.
 SocksPort 0.0.0.0:9050
-SocksPolicy accept 172.16.0.0/12
+# Only lnd, on the compose network "tor" (docker-compose.yml)
+SocksPolicy accept 172.30.90.0/24
 SocksPolicy reject *
 ControlPort 0.0.0.0:9051
 HashedControlPassword ${TOR_CONTROL_HASH}

@@ -21,6 +21,7 @@ services:
   # above all, starts here again by accident.
   guard:
     image: lfswap/knots:29.4.2
+    security_opt: [no-new-privileges:true]
     entrypoint: ["sh", "-c", "if [ -f /srv/MIGRATED ]; then echo 'this host was migrated away:'; cat /srv/MIGRATED; exit 1; fi"]
     volumes:
       - ${LFSWAP_ROOT:-/srv/lfswap}:/srv:ro
@@ -28,6 +29,7 @@ services:
 
   knots:
     image: lfswap/knots:29.4.2
+    security_opt: [no-new-privileges:true]
     build: ./knots
     restart: unless-stopped
     depends_on:
@@ -42,6 +44,7 @@ services:
 
   shim:
     image: lfswap/txindex-shim:dev
+    security_opt: [no-new-privileges:true]
     build: ../shim
     restart: unless-stopped
     depends_on: [knots]
@@ -59,10 +62,15 @@ services:
     logging: *logging
     mem_limit: 128m
 
+  # Tor's control port can take the node's onion service down or reroute its
+  # traffic: only lnd reaches Tor (network "tor"), and Tor reaches the
+  # internet through a network of its own
   tor:
     image: lfswap/tor:dev
+    security_opt: [no-new-privileges:true]
     build: ./tor
     restart: unless-stopped
+    networks: [tor, tor_egress]
     volumes:
       - ${LFSWAP_ROOT:-/srv/lfswap}/tor/torrc:/etc/tor/torrc:ro
       - ${LFSWAP_ROOT:-/srv/lfswap}/tor/data:/var/lib/tor
@@ -71,12 +79,18 @@ services:
 
   lnd:
     image: paulscode/lightning-fork:0.21.3-beta-blake2b.17@sha256:1922383540d5545d67f0089149254eb0a23360e73c9d754b85f061a6485596f6
+    security_opt: [no-new-privileges:true]
     restart: unless-stopped
     stop_grace_period: 2m
     depends_on:
       guard: {condition: service_completed_successfully}
       knots: {condition: service_started}
       tor: {condition: service_started}
+    networks:
+      default: {}
+      # A fixed address: Tor forwards the node's onion service to it
+      # (tor.targetipaddress in lnd.conf)
+      tor: {ipv4_address: 172.30.90.10}
     ports:
       - "9735:9735"
       - "127.0.0.1:10009:10009"
@@ -101,6 +115,7 @@ services:
     # By digest: a move copies the data directory, which needs the same major
     # version on both hosts.
     image: postgres:18-alpine@sha256:77f585114c32fbca283dc835b0596f4e52b51b4c6662d7810b2f4084f60a1873
+    security_opt: [no-new-privileges:true]
     restart: unless-stopped
     environment:
       POSTGRES_DB: boltz
@@ -114,6 +129,7 @@ services:
 
   boltz:
     image: lfswap/boltz:dev
+    security_opt: [no-new-privileges:true]
     restart: unless-stopped
     stop_grace_period: 1m
     depends_on:
@@ -140,3 +156,13 @@ services:
         bind: {create_host_path: false}
     logging: *logging
     mem_limit: 700m
+
+networks:
+  default: {}
+  # lnd and Tor only, no way out; a fixed subnet for torrc's SocksPolicy
+  tor:
+    internal: true
+    ipam:
+      config:
+        - subnet: 172.30.90.0/24
+  tor_egress: {}

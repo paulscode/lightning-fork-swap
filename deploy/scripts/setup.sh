@@ -76,8 +76,22 @@ $(rpcauth boltz "$BOLTZ_RPCPASSWORD")
 $(rpcauth shim "$SHIM_RPCPASSWORD")"
 export RPCAUTH_LINES
 
-# Tor wants its control password hashed; ask a tor binary for the hash.
-TOR_CONTROL_HASH=$(docker run --rm --entrypoint tor lfswap/tor:dev --hash-password "$TOR_CONTROL_PASSWORD" | tail -1)
+# Tor wants its control password hashed (its salted, iterated SHA-1, as
+# tor --hash-password makes it). Here, not by a tor binary, so that the
+# password is on no command line; it comes through the environment.
+TOR_CONTROL_HASH=$(PW=$TOR_CONTROL_PASSWORD python3 - <<'PY'
+import hashlib, os
+salt, indicator = os.urandom(8), 0x60
+count = (16 + (indicator & 15)) << ((indicator >> 4) + 6)
+data = salt + os.environ["PW"].encode()
+digest = hashlib.sha1()
+while count > 0:
+    chunk = data[:count]
+    digest.update(chunk)
+    count -= len(chunk)
+print("16:" + (salt + bytes([indicator]) + digest.digest()).hex().upper())
+PY
+)
 export TOR_CONTROL_HASH
 
 render() {

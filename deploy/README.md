@@ -32,7 +32,7 @@ about 1 GB between them once running.
    docker build -t lfswap/tor:dev tor
    docker build -t lfswap/txindex-shim:dev ../shim
    # the backend image is built from the backend repository:
-   #   docker build -f docker/boltz/Dockerfile --build-arg NODE_VERSION=24-bookworm-slim \
+   #   docker build -f docker/boltz/Dockerfile --build-arg NODE_VERSION=24-bookworm-slim@sha256:d6aa754f16b3197301076f047b5def2f02ea1dbbc2ca920407d46d7ec7f87b20 \
    #     --build-arg SOURCE=local -t lfswap/boltz:dev .
    ./scripts/setup.sh          # .env with fresh secrets, directories, configs
    ```
