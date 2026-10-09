@@ -162,6 +162,13 @@ fees (what users paid for them in their quotes, and what the service spent:
 miner fees of claims and lockups, Lightning routing fees), routing fees lnd
 earned, and the net. Every Monday at 13:00 UTC it also goes to Telegram.
 
+The report ends with a "Sizing" block from the telemetry (the README's
+Telemetry section): how much the hot wallet held against what reverse swaps
+needed at once, the net flow and how long the busier side lasts at that
+rate, refused swaps by kind, channels that carried none of our payments,
+and any change of terms in the week. `--analysis [--days N]` gives the same
+over a longer period; base the floors, bands, limits and fees on it.
+
 The earnings are not in a separate pot: they are part of the balances. Keep
 a note of what you put in; what the service holds beyond that (the report's
 "total" minus capital in) is profit.

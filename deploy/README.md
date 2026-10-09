@@ -120,6 +120,29 @@ tail /srv/lfswap/monitor/monitor.log
 An alert is sent when it appears, repeated every six hours while it holds,
 and reported once more when it clears. A log line is reported once.
 
+## Telemetry
+
+Each monitor run also records what later sizing decisions need, in
+`/srv/lfswap/telemetry/telemetry.db` (SQLite; `monitor/lfswap_telemetry.py`):
+balances of both wallets, each channel (local, remote, HTLCs, uptime, our
+routing policy), committed lockups, fee estimates, chain and host figures
+every five minutes (kept 180 days); swaps and when each status was seen,
+refused swap creations by kind (from the backend's log), creations by status
+(from nginx's log, without addresses), forwards, our payments and their
+first hops, channel opens and closes, peers coming and going, our own
+transactions' fees and confirmation times, lost branches, and every change
+of terms (fees, limits, floors, the rebalancer's bands, routing policies);
+daily rollups of all of it (kept). No IP addresses, no user addresses or
+invoices. It is not published: it shows where liquidity is thin.
+
+```sh
+python3 monitor/lfswap_monitor.py --analysis [--days 30]   # findings: needs, flows, refusals, channels
+python3 monitor/lfswap_monitor.py --export daily > daily.csv   # any table as CSV
+```
+
+The weekly report ends with a "Sizing" block from it. `MONITOR_TELEMETRY=off`
+in `.env` turns it off. The offsite backup carries a copy.
+
 ## Liquidity
 
 `OPERATING.md` is the operator's guide to money: first funding, keeping both

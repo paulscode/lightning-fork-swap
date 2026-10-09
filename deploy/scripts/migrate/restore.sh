@@ -48,6 +48,10 @@ install -m 600 "$STAGE/env" "$DEPLOY/.env"
 mkdir -p "$ROOT/boltz" "$ROOT/secrets" "$ROOT/lnd"
 install -m 600 "$STAGE/boltz-seed.dat" "$ROOT/boltz/seed.dat"
 cp -a "$STAGE/secrets/." "$ROOT/secrets/"
+if [ -f "$STAGE/telemetry.db" ]; then
+	install -d -m 700 "$ROOT/telemetry"
+	install -m 600 "$STAGE/telemetry.db" "$ROOT/telemetry/telemetry.db"
+fi
 # Once the operator has taken the seeds offline they are not in the backup:
 # they go back into secrets/ from the offline copy before a restore
 for f in lnd-seed.txt lnd-wallet-password.txt; do

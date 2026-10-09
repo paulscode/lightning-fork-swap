@@ -28,7 +28,19 @@ $LFSWAP_ROOT/monitor/state.json.
   lfswap_monitor.py --report [--days N] [--send]
                               balances, what each kind of swap can take now,
                               swaps and fees over N days (default 7) and in
-                              all; --send also sends it to the webhook
+                              all, and what telemetry says about sizing;
+                              --send also sends it to the webhook
+  lfswap_monitor.py --analysis [--days N]
+                              findings from the telemetry over N days
+                              (default 30): needs, flows, refusals, channels
+  lfswap_monitor.py --export TABLE
+                              a telemetry table as CSV on stdout (snapshot,
+                              channel_snapshot, event, swap, terms_change,
+                              daily)
+
+Each run also records telemetry for sizing decisions in
+$LFSWAP_ROOT/telemetry/telemetry.db (lfswap_telemetry.py); MONITOR_TELEMETRY=off
+turns that off.
 """
 
 import datetime
@@ -40,6 +52,9 @@ import shutil
 import subprocess
 import sys
 import urllib.request
+
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+import lfswap_telemetry  # noqa: E402
 
 DEPLOY = os.environ.get("LFSWAP_DEPLOY", "/opt/lfswap/deploy")
 
@@ -572,6 +587,30 @@ def report(monitor, days):
     return lines
 
 
+def telemetry_path(root):
+    return os.path.join(root, "telemetry", "telemetry.db")
+
+
+def record_telemetry(monitor, env, root, since):
+    """Records this run's telemetry; an alert when part of it failed."""
+    if env.get("MONITOR_TELEMETRY", "on") == "off":
+        return
+    try:
+        t = lfswap_telemetry.Telemetry(telemetry_path(root))
+        try:
+            failed = t.record(monitor, root)
+            t.record_logs(monitor, since, "/var/log/nginx/access.log")
+            t.record_terms(env, monitor.now.timestamp())
+            t.rollup(monitor.now)
+        finally:
+            t.close()
+    except Exception as error:  # noqa: BLE001 (never stops the monitor)
+        failed = [f"database: {str(error)[:200]}"]
+    if failed:
+        monitor.add("check:telemetry",
+                    "Telemetry could not read: " + "; ".join(failed)[:400])
+
+
 # --- deciding what to send ------------------------------------------------
 
 
@@ -725,10 +764,34 @@ def main(argv):
         if "--days" in argv:
             days = int(argv[argv.index("--days") + 1])
         monitor = Monitor(Runner(DEPLOY), env, now, network)
-        text = "\n".join(report(monitor, days))
+        lines = report(monitor, days)
+        if os.path.exists(telemetry_path(root)):
+            t = lfswap_telemetry.Telemetry(telemetry_path(root))
+            try:
+                lines += lfswap_telemetry.sizing_block(t, env, now)
+            finally:
+                t.close()
+        text = "\n".join(lines)
         print(text)
         if "--send" in argv:
             send(env, f"Lightning Fork Swap report, {stamp[:10]}", text)
+        return 0
+
+    if "--analysis" in argv or "--export" in argv:
+        if not os.path.exists(telemetry_path(root)):
+            print("no telemetry yet", file=sys.stderr)
+            return 1
+        t = lfswap_telemetry.Telemetry(telemetry_path(root))
+        try:
+            if "--export" in argv:
+                t.export(argv[argv.index("--export") + 1], sys.stdout)
+            else:
+                days = 30
+                if "--days" in argv:
+                    days = int(argv[argv.index("--days") + 1])
+                print("\n".join(lfswap_telemetry.analysis(t, env, now, days)))
+        finally:
+            t.close()
         return 0
 
     dry = "--dry-run" in argv
@@ -748,6 +811,9 @@ def main(argv):
         minutes=15)).strftime("%Y-%m-%dT%H:%M:%SZ")
     monitor = Monitor(Runner(DEPLOY), env, now, network)
     alerts = monitor.run_all(since, root, env.get("DOMAIN", ""))
+    if not dry:
+        record_telemetry(monitor, env, root, since)
+        alerts = monitor.alerts
 
     outcome, new_state = plan(
         alerts, state, now,

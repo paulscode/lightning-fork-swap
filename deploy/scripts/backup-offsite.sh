@@ -48,6 +48,12 @@ knots -rpcwallet=boltz listdescriptors true > "$P/knots-boltz-descriptors.json"
 cp "$ROOT/lnd/data/chain/bitcoin/$NETWORK/channel.backup" "$P/channel.backup"
 mkdir -p "$P/secrets" && cp -a "$ROOT/secrets/." "$P/secrets/"
 cp "$DEPLOY/.env" "$P/env"
+# Telemetry (history for sizing decisions): a consistent copy while the
+# monitor may be writing
+if [ -f "$ROOT/telemetry/telemetry.db" ]; then
+	python3 -c 'import sqlite3, sys; src = sqlite3.connect(sys.argv[1]); dst = sqlite3.connect(sys.argv[2]); src.backup(dst); dst.close()' \
+		"$ROOT/telemetry/telemetry.db" "$P/telemetry.db"
+fi
 [ -d /etc/letsencrypt ] && tar -C /etc -cf "$P/letsencrypt.tar" letsencrypt
 [ -f /etc/nginx/lfswap.htpasswd ] && cp /etc/nginx/lfswap.htpasswd "$P/"
 [ -f /etc/nginx/lfswap-preview.conf ] && cp /etc/nginx/lfswap-preview.conf "$P/"
