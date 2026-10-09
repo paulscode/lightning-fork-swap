@@ -146,8 +146,8 @@ class Headers(unittest.TestCase):
                 self.assertNotIn("unsafe-inline';", csp[0].split(
                     "style-src-attr")[0])
                 self.assertEqual(header(headers, "X-Frame-Options"), ["DENY"])
-                self.assertEqual(len(header(headers,
-                                            "Strict-Transport-Security")), 1)
+                self.assertEqual(header(headers, "Strict-Transport-Security"),
+                                 ["max-age=31536000; includeSubDomains"])
 
     def test_the_backend_sees_the_real_client_not_a_forged_one(self):
         for path in ["/v2/swap/submarine", "/v2/ws"]:
