@@ -42,6 +42,29 @@ if ! command -v docker >/dev/null; then
 	apt-get update -q
 	apt-get install -y -q docker-ce docker-ce-cli containerd.io docker-compose-plugin >/dev/null
 fi
+# SSH by key only: bots try passwords on every public host all day. Only
+# once root has a key, so that this cannot lock anyone out.
+if [ -s /root/.ssh/authorized_keys ]; then
+	cat > /etc/ssh/sshd_config.d/00-lfswap.conf <<'SSHD'
+# Lightning Fork Swap: keys only. Read before sshd_config (Include is at its
+# top and the first value of a setting wins).
+PasswordAuthentication no
+KbdInteractiveAuthentication no
+PermitRootLogin prohibit-password
+PermitEmptyPasswords no
+X11Forwarding no
+MaxAuthTries 3
+SSHD
+	sshd -t && systemctl reload ssh
+else
+	echo "root has no SSH key: password logins left on; add a key and run again" >&2
+fi
+
+# The journal keeps at most 200 MB (it grew past 1 GB on a 40 GB disk)
+mkdir -p /etc/systemd/journald.conf.d
+printf '[Journal]\nSystemMaxUse=200M\n' > /etc/systemd/journald.conf.d/lfswap.conf
+systemctl restart systemd-journald
+
 # On shutdown Docker gives containers 15 s and systemd gives Docker 90 s;
 # Knots needs up to 5 minutes to stop cleanly (stop_grace_period), and a
 # pruned node stopped hard may have to download the chain again.
