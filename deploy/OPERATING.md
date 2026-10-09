@@ -181,17 +181,35 @@ To take profit out, or anything above the floats you want:
 Never take the hot wallet below `MONITOR_MIN_WALLET_SAT`, nor lnd below the
 outbound floor, unless you mean to shrink the service.
 
-## 7. Routine
+## 7. A refund that does not confirm
+
+When a reverse swap times out, the service refunds its lockup to the hot
+wallet. If that refund is still unconfirmed 20 blocks after the swap's
+timeout, the alert says so ("is not confirmed ... blocks after the swap's
+timeout"). It matters: about 42 blocks after the timeout lnd gives the
+user's Lightning payment back, and the user could then still claim the
+lockup. A refund that fell out of the mempool is sent again by itself;
+one stuck at too low a fee needs a push. Spend its output to the wallet at
+a higher fee (the wallet pays the refund's shortfall too, so the pair
+confirms together):
+
+```sh
+$K gettransaction <refund txid> | jq '.details[] | {vout, amount}'
+$K -named sendall recipients='["'$($K getnewaddress "" bech32m)'"]' \
+  inputs='[{"txid":"<refund txid>","vout":<vout>}]' fee_rate=<sat/vB>
+```
+
+## 8. Routine
 
 | When | What |
 | --- | --- |
-| As it comes | Telegram alerts: each says what is wrong; the README's Alerts section lists them |
+| As it comes | Telegram alerts: each says what is wrong; the README's Alerts section lists them (a late refund: §7) |
 | Weekly | the Monday report: rebalance (§4), adjust fees (§5) |
 | After any channel open or close | copy `channel.backup` offline |
 | Monthly, or as you like | take earnings out (§6) |
 | Before raising limits or the hot wallet | weeks without trouble |
 
-## 8. Before opening the service to users
+## 9. Before opening the service to users
 
 1. Funding as in §3: lnd's on-chain wallet, outbound channels, inbound, the
    hot wallet, the monitor floors.

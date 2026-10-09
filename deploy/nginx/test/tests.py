@@ -140,7 +140,8 @@ class Headers(unittest.TestCase):
                 self.assertEqual(status, 200)
                 csp = header(headers, "Content-Security-Policy")
                 self.assertEqual(len(csp), 1)
-                self.assertIn("script-src 'self' 'wasm-unsafe-eval';", csp[0])
+                self.assertIn("script-src 'self';", csp[0])
+                self.assertNotIn("eval", csp[0])
                 self.assertIn("frame-ancestors 'none'", csp[0])
                 self.assertNotIn("unsafe-inline';", csp[0].split(
                     "style-src-attr")[0])
@@ -219,6 +220,7 @@ class Explorer(unittest.TestCase):
         for method, path in [
             ("GET", "/explorer/api/address/bc1qxy2kgdygjrsqtzq2n0yrf2493p83kkfjhx0wlh/utxo"),
             ("GET", "/explorer/api/tx/abababababababababababababababababababababababababababababababab/hex"),
+            ("GET", "/explorer/api/tx/abababababababababababababababababababababababababababababababab/status"),
             ("GET", "/explorer/api/tx/abababababababababababababababababababababababababababababababab/outspend/1"),
             ("GET", "/explorer/api/blocks/tip/height"),
             ("GET", "/explorer/api/fee-estimates"),

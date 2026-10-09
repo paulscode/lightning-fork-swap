@@ -56,6 +56,10 @@ LOG_PATTERNS = [
     r"Not expiring Reverse Swap .* yet",
     # Reverse swaps: an HTLC that would not outlast the lockup, a late lockup
     r"Cancelling hold invoice of Reverse Swap .* its HTLC expires",
+    r"Cancelling hold invoice of Reverse Swap .* paid in \d+ parts",
+    # A refund that does not confirm, or could not be sent again
+    r"is not confirmed \d+ blocks after the swap's timeout",
+    r"Could not send refund .* again",
     r"Not acting on confirmed server lockup transaction .* because it is",
     r"Could not settle invoice of",
     # Submarine swaps
