@@ -41,6 +41,8 @@ type wallet struct {
 	leaseErr   error
 	txs        []lnd.Transaction
 	released   *guard.Released
+	// The open goes through but its answer is lost (a timeout)
+	lostAnswer bool
 	t          *testing.T
 }
 
@@ -194,8 +196,11 @@ func (f *wallet) OpenChannel(ctx context.Context, r lnd.OpenRequest) (string, er
 	}
 	point := txid + ":0"
 	f.pending = append(f.pending, lnd.PendingChannel{RemoteNodePub: r.NodePubkey,
-		ChannelPoint: point, Capacity: lnd.Int(capacity)})
+		ChannelPoint: point, Capacity: lnd.Int(capacity), Memo: r.Memo})
 	f.txs = append(f.txs, lnd.Transaction{TxHash: txid})
+	if f.lostAnswer {
+		return "", context.DeadlineExceeded
+	}
 	return point, nil
 }
 
@@ -621,6 +626,43 @@ func TestTwoDonatedChannelsANode(t *testing.T) {
 	}
 	if o := h.get(ids[2]); o.State != NeedsAttention || o.ErrorCode != ErrNodeLimit {
 		t.Fatalf("%s %s", o.State, o.ErrorCode)
+	}
+}
+
+func TestAnOpenWhoseAnswerIsLostIsAdopted(t *testing.T) {
+	h := newHarness(t)
+	h.lnd.lostAnswer = true
+	id := h.order(donorNode, "91.190.100.60:9735")
+	h.pass()
+	h.lnd.pay(h.get(id).Address, 2_000_000, 3)
+	h.pass()
+	o := h.get(id)
+	if o.State != FundingBroadcast || o.ChannelPoint != h.lnd.pending[0].ChannelPoint {
+		t.Fatalf("%s %q %s", o.State, o.ChannelPoint, h.kinds(id))
+	}
+	// Not leased again: the coins are spent
+	if len(h.lnd.leases) != 0 {
+		t.Fatalf("leases %v", h.lnd.leases)
+	}
+	// Another order's channel to the same node is not taken
+	h.lnd.lostAnswer = false
+	other := h.order(donorNode, "91.190.100.60:9735")
+	h.pass()
+	h.lnd.pay(h.get(other).Address, 2_000_000, 3)
+	h.lnd.openErr = errors.New("refused")
+	h.pass()
+	if o := h.get(other); o.State != Retrying || o.ChannelPoint != "" {
+		t.Fatalf("%s %q", o.State, o.ChannelPoint)
+	}
+}
+
+func TestAddressesAreCounted(t *testing.T) {
+	h := newHarness(t)
+	h.order(donorNode, "")
+	h.order(donorNode, "")
+	h.pass()
+	if v := h.store.Settings[SettingAddressesIssued]; v != "2" {
+		t.Fatalf("%q", v)
 	}
 }
 

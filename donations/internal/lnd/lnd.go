@@ -43,8 +43,8 @@ func New(url, certPath, macaroonPath string) (*Client, error) {
 	return &Client{
 		URL:      url,
 		macaroon: hex.EncodeToString(mac),
+		// Each call has its own deadline (call, OpenChannel)
 		http: &http.Client{
-			Timeout: 30 * time.Second,
 			Transport: &http.Transport{TLSClientConfig: &tls.Config{
 				RootCAs: pool, MinVersion: tls.VersionTLS12,
 			}},
@@ -99,6 +99,9 @@ func (c *Client) Transactions(ctx context.Context, startHeight int64) ([]Transac
 	return out.Transactions, nil
 }
 
+// CallTimeout bounds a call that has no deadline of its own.
+const CallTimeout = 30 * time.Second
+
 // Error is lnd's answer to a call that failed.
 type Error struct {
 	Status  int
@@ -109,6 +112,11 @@ func (e *Error) Error() string { return fmt.Sprintf("lnd: HTTP %d: %.300s", e.St
 
 // call sends one request; body (if any) as JSON; the answer into out.
 func (c *Client) call(ctx context.Context, method, path string, body, out any) error {
+	if _, ok := ctx.Deadline(); !ok {
+		var cancel context.CancelFunc
+		ctx, cancel = context.WithTimeout(ctx, CallTimeout)
+		defer cancel()
+	}
 	var reader io.Reader
 	if body != nil {
 		b, err := json.Marshal(body)

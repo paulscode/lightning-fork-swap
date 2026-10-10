@@ -100,6 +100,14 @@ psql_q 'update keys set "highestUsedIndex" = "highestUsedIndex" + 1000' >/dev/nu
 "$DEPLOY/scripts/init-donations-db.sh" >/dev/null
 
 log "lnd, from its seed and channel.backup"
+# Channel donations hand out an lnd address each, most never paid: lnd
+# must look past that many unused addresses to find every coin, and past
+# those handed out since the backup (at most 300 a day)
+ISSUED=$(dc exec -T postgres psql -U boltz -d donations -Atc \
+	"select value from channel_settings where key = 'addresses_issued'" </dev/null 2>/dev/null || true)
+[[ "$ISSUED" =~ ^[0-9]+$ ]] || ISSUED=0
+RECOVERY=$((2500 + ISSUED + 1000))
+log "recovery window $RECOVERY addresses"
 dc up -d shim tor lnd
 wait_for "lnd to ask for a wallet" 60 curl -skf https://127.0.0.1:8080/v1/genseed
 # The password, seed and channel backup go from files and stdin, never on a
@@ -107,7 +115,8 @@ wait_for "lnd to ask for a wallet" 60 curl -skf https://127.0.0.1:8080/v1/gensee
 sed -E 's/^[0-9]+\. //' "$ROOT/secrets/lnd-seed.txt" | jq -R . | jq -sc \
 	--rawfile pw <(base64 -w0 < "$ROOT/lnd/wallet-password") \
 	--rawfile scb <(base64 -w0 < "$STAGE/channel.backup") \
-	'{wallet_password: $pw, cipher_seed_mnemonic: ., recovery_window: 2500,
+	--argjson rw "$RECOVERY" \
+	'{wallet_password: $pw, cipher_seed_mnemonic: ., recovery_window: $rw,
 	  channel_backups: {multi_chan_backup: {multi_chan_backup: $scb}}}' |
 	curl -skf -X POST https://127.0.0.1:8080/v1/initwallet --data-binary @- >/dev/null
 wait_for "lnd" 120 sh -c "docker compose exec -T lnd lncli --network=$NETWORK getinfo </dev/null | grep -Eq '\"synced_to_chain\": +true'"

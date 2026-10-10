@@ -43,6 +43,8 @@ const (
 	SettingOurNode  = "our_node"
 	SettingLastPass = "last_pass"
 	SettingPruned   = "pruned"
+	// Addresses ever handed out (never lowered by pruning)
+	SettingAddressesIssued = "addresses_issued"
 )
 
 // Worker runs the orders.
@@ -212,6 +214,13 @@ func (w *Worker) issue(ctx context.Context, o *Order, now time.Time) ([]Event, e
 	}
 	address, err := w.Lnd.NewAddress(ctx)
 	if err != nil {
+		return nil, err
+	}
+	// Counted for a seed restore: lnd must look past this many unused
+	// addresses (restore.sh widens its recovery window by it)
+	issued, _ := w.Store.Setting(ctx, SettingAddressesIssued)
+	n, _ := strconv.ParseInt(issued, 10, 64)
+	if err := w.Store.SetSetting(ctx, SettingAddressesIssued, strconv.FormatInt(n+1, 10)); err != nil {
 		return nil, err
 	}
 	o.Address, o.State = address, AwaitingPayment
@@ -474,6 +483,12 @@ func (w *Worker) tryOpen(ctx context.Context, o *Order, now time.Time, prior []E
 	}
 	point, err := w.Lnd.OpenChannel(ctx, req)
 	if err != nil {
+		// lnd may have opened it all the same (the call timed out while it
+		// went on): a new pending channel to the node is this one
+		w.channels, w.pending = nil, nil
+		if adopted, _ := w.adopt(ctx, o, now); adopted != nil {
+			return adopted, nil
+		}
 		w.release(ctx, o)
 		return w.lndFailed(o, now, err), nil
 	}
@@ -524,6 +539,17 @@ func (w *Worker) resume(ctx context.Context, o *Order, now time.Time) ([]Event, 
 		o.State = Connecting
 		return []Event{event(now, "resuming", nil)}, nil
 	}
+	adopted, err := w.adopt(ctx, o, now)
+	if err != nil || adopted != nil {
+		return adopted, err
+	}
+	return w.lostCoins(ctx, o, now)
+}
+
+// adopt takes a channel to the order's node that no order has: the one
+// this order's open made when its answer was lost. Its memo says whose it
+// is when lnd tells; otherwise the node does.
+func (w *Worker) adopt(ctx context.Context, o *Order, now time.Time) ([]Event, error) {
 	if err := w.loadChannels(ctx); err != nil {
 		return nil, err
 	}
@@ -533,21 +559,24 @@ func (w *Worker) resume(ctx context.Context, o *Order, now time.Time) ([]Event, 
 			taken[other.ChannelPoint] = true
 		}
 	}
+	take := func(point string) []Event {
+		o.ChannelPoint, o.State, o.ErrorCode, o.NextAttempt = point, FundingBroadcast, "", nil
+		return []Event{event(now, "funding_broadcast", map[string]any{
+			"channelPoint": point, "capacitySat": o.CapacitySat})}
+	}
 	for _, p := range w.pending {
-		if p.RemoteNodePub == o.NodePubkey && !taken[p.ChannelPoint] {
-			o.ChannelPoint, o.State = p.ChannelPoint, FundingBroadcast
-			return []Event{event(now, "funding_broadcast", map[string]any{
-				"channelPoint": p.ChannelPoint, "capacitySat": o.CapacitySat})}, nil
+		if p.RemoteNodePub == o.NodePubkey && !taken[p.ChannelPoint] &&
+			(p.Memo == "" || p.Memo == "donation:"+o.ID) {
+			return take(p.ChannelPoint), nil
 		}
 	}
 	for _, c := range w.channels {
-		if c.RemotePubkey == o.NodePubkey && c.Initiator && !taken[c.ChannelPoint] {
-			o.ChannelPoint, o.State = c.ChannelPoint, FundingBroadcast
-			return []Event{event(now, "funding_broadcast", map[string]any{
-				"channelPoint": c.ChannelPoint, "capacitySat": o.CapacitySat})}, nil
+		if c.RemotePubkey == o.NodePubkey && c.Initiator && !taken[c.ChannelPoint] &&
+			(c.Memo == "" || c.Memo == "donation:"+o.ID) {
+			return take(c.ChannelPoint), nil
 		}
 	}
-	return w.lostCoins(ctx, o, now)
+	return nil, nil
 }
 
 // lostCoins: the order's coins are no longer leased to us and no channel

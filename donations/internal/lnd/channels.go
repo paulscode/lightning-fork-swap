@@ -9,6 +9,7 @@ import (
 	"net/url"
 	"strconv"
 	"strings"
+	"time"
 )
 
 // Int reads lnd's 64-bit numbers, which its REST API sends as strings.
@@ -97,6 +98,7 @@ func HasFeature(features map[string]Feature, bit int) bool {
 type Channel struct {
 	RemotePubkey string `json:"remote_pubkey"`
 	ChannelPoint string `json:"channel_point"`
+	Memo         string `json:"memo"`
 	Capacity     Int    `json:"capacity"`
 	Active       bool   `json:"active"`
 	Initiator    bool   `json:"initiator"`
@@ -106,6 +108,7 @@ type Channel struct {
 type PendingChannel struct {
 	RemoteNodePub string `json:"remote_node_pub"`
 	ChannelPoint  string `json:"channel_point"`
+	Memo          string `json:"memo"`
 	Capacity      Int    `json:"capacity"`
 }
 
@@ -239,9 +242,15 @@ func (c *Client) ListPeers(ctx context.Context) ([]Peer, error) {
 	return out.Peers, c.call(ctx, http.MethodGet, "/v1/peers", nil, &out)
 }
 
+// OpenTimeout is how long an open may take: negotiating with a slow peer
+// (over Tor) can take minutes, and lnd goes on after a client gives up.
+const OpenTimeout = 6 * time.Minute
+
 // OpenChannel opens a channel and returns its channel point (txid:index)
 // once the funding transaction is published.
 func (c *Client) OpenChannel(ctx context.Context, r OpenRequest) (string, error) {
+	ctx, cancel := context.WithTimeout(ctx, OpenTimeout)
+	defer cancel()
 	key, err := hex.DecodeString(r.NodePubkey)
 	if err != nil || len(key) != 33 {
 		return "", fmt.Errorf("bad node key")
