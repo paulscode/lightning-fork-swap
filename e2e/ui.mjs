@@ -75,7 +75,8 @@ process.env.NODE_TLS_REJECT_UNAUTHORIZED = '0'; // the harness's own certificate
 const browser = await chromium.launch({
   channel: 'chrome',
   headless: true,
-  args: ['--ignore-certificate-errors'],
+  // WebGL in headless Chrome, for the network sky
+  args: ['--ignore-certificate-errors', '--use-angle=swiftshader', '--enable-unsafe-swiftshader'],
 });
 
 const newPage = async (options = {}) => {
@@ -432,6 +433,47 @@ scenarios.channel = async () => {
   assertNoProblems(problems, 'channel');
   await context.close();
   return `a channel donation from the browser opened: ${capacity.trim()}`;
+};
+
+// The network sky at /network: drawn under the production CSP (WebGL by
+// SwiftShader in headless Chrome), our node first, a search that selects
+// another, a phone and reduced motion. Needs graph files served at
+// /graph/ (deploy/regtest/ui-nginx.sh up DIST GRAPH, GRAPH a graph
+// generator's output).
+scenarios.network = async () => {
+  const { context, page, problems } = await newPage();
+  await page.goto(`${SITE}/network`);
+  const panel = page.locator('[data-testid=sky-panel]');
+  await panel.waitFor({ timeout: 30_000 });
+  const first = (await panel.locator('h2').textContent()).trim();
+  await page.waitForTimeout(1500);
+  await screenshot(page, 'network-ours');
+  const stats = await page.locator('[data-testid=sky-stats]').textContent();
+  const nodes = Number(/^([0-9]+) nodes/.exec(stats.replace(/\s/g, ' '))?.[1] ?? 0);
+  // Search by the first letters of the largest other node, then select it
+  const list = page.locator('[data-testid=sky-channels] button');
+  const target = (await list.first().textContent()).trim();
+  await page.fill('[data-testid=sky-search]', target.slice(0, 4));
+  await page.locator('[data-testid=sky-results] button').first().waitFor({ timeout: 10_000 });
+  await page.locator('[data-testid=sky-results] button', { hasText: target }).first().click();
+  await page.waitForFunction((name) => document.querySelector('[data-testid=sky-panel] h2')?.textContent?.includes(name), target);
+  await page.waitForTimeout(1500);
+  await screenshot(page, 'network-selected');
+  await page.click('[data-testid=sky-home]');
+  await page.waitForFunction((name) => document.querySelector('[data-testid=sky-panel] h2')?.textContent?.includes(name), first);
+  assertNoProblems(problems, 'network');
+  await context.close();
+
+  const phone = await newPage({ ...devices['Pixel 7'], reducedMotion: 'reduce' });
+  await phone.page.goto(`${SITE}/network`);
+  await phone.page.locator('[data-testid=sky-panel]').waitFor({ timeout: 30_000 });
+  const width = await phone.page.evaluate(() => document.documentElement.scrollWidth);
+  if (width > phone.page.viewportSize().width) throw new Error(`the network page is ${width} px wide on a phone`);
+  await phone.page.waitForTimeout(1000);
+  await screenshot(phone.page, 'network-phone');
+  assertNoProblems(phone.problems, 'network (phone)');
+  await phone.context.close();
+  return `the sky of ${nodes} nodes drawn, ${first} first, ${target} found and selected, a phone with reduced motion`;
 };
 
 // --- run -------------------------------------------------------------------
