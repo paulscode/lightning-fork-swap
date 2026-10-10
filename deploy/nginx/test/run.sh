@@ -34,6 +34,10 @@ printf 'auth_basic "preview";\nauth_basic_user_file /t/htpasswd;\n' > preview.co
 mkdir -p webapp
 echo '<!doctype html><title>app</title>' > webapp/index.html
 echo '{"name": "app"}' > webapp/manifest.json
+mkdir -p graph/v3/node
+echo '{"version": 3}' > graph/meta.json
+echo '{"nodes": {}}' > graph/v3/overview.json
+gzip -k graph/v3/overview.json
 : > maintenance.conf
 chmod -R a+rX "$work"
 
@@ -46,6 +50,7 @@ render() {
 		-e "s#/etc/nginx/lfswap-maintenance.conf#/t/maintenance.conf#" \
 		-e "s#/etc/ssl/certs/ca-certificates.crt#/t/ca.crt#" \
 		-e "s#root /srv/lfswap/webapp;#root /t/webapp;#" \
+		-e "s#root /srv/lfswap;#root /t;#" \
 		-e "s#server 127.0.0.1:\(900[145]\|9010\)#server mock:\1#" \
 		-e "s#https://mempool.guide/api/#https://mempool.guide:$explorer_port/api/#" \
 		"$here/../lightningfork.conf"

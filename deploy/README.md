@@ -32,6 +32,7 @@ about 1 GB between them once running.
    docker build -t lfswap/tor:dev tor
    docker build -t lfswap/txindex-shim:dev ../shim
    docker build -t lfswap/donations:dev ../donations
+   docker build -t lfswap/graph:dev ../graph
    # the backend image is built from the backend repository:
    #   docker build -f docker/boltz/Dockerfile --build-arg NODE_VERSION=24-bookworm-slim@sha256:d6aa754f16b3197301076f047b5def2f02ea1dbbc2ca920407d46d7ec7f87b20 \
    #     --build-arg SOURCE=local -t lfswap/boltz:dev .
@@ -153,6 +154,23 @@ python3 monitor/lfswap_monitor.py --export daily > daily.csv   # any table as CS
 
 The weekly report ends with a "Sizing" block from it. `MONITOR_TELEMETRY=off`
 in `.env` turns it off. The offsite backup carries a copy.
+
+## The network sky
+
+The `graph` service (`../graph`) reads the channel graph from lnd every 10
+minutes with a macaroon that may only read it (`graph.macaroon`), lays it
+out in 3D (our node at the origin; positions kept between versions in
+`/srv/lfswap/graph-state`), finds its communities, and writes static files
+to `/srv/lfswap/graph`, which nginx serves at `/graph/`: `meta.json` (the
+current version, never cached) and `v<N>/` (overview, octree cells once the
+graph outgrows one file, each node's channels in `node/<xx>.json`, search
+shards; cached for good). The last three versions are kept. The monitor
+alerts when it has not looked at the graph for an hour.
+
+```sh
+docker compose logs graph
+jq '{version, nodes, channels, checkedAt}' /srv/lfswap/graph/meta.json
+```
 
 ## Liquidity
 
@@ -313,6 +331,7 @@ python3 -m unittest discover -s deploy/monitor
 python3 -m unittest discover -s deploy/rebalance
 (cd shim && go test -race ./...)
 (cd donations && go test ./...)             # DONATIONS_TEST_DB=postgres://... also tests the store
+(cd graph && go test ./...)                 # GRAPH_BIG=1: the 100,000-node budgets
 deploy/regtest/bootstrap.sh                 # the service on regtest
 (cd e2e && node run.mjs)                    # swaps, refunds and failures through the API
 python3 deploy/rebalance/regtest.py         # the rebalancer with the regtest wallets

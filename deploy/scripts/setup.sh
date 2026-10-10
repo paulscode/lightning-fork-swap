@@ -62,7 +62,7 @@ if [ -n "${KNOTS_ADDNODE:-}" ]; then
 fi
 export NETWORK KNOTS_CHAIN_LINE KNOTS_SECTION KNOTS_NETWORK_EXTRA LND_NETWORK_EXTRA BOLTZ_CURRENCY_NETWORK
 
-mkdir -p "$ROOT"/{knots/data,shim,tor/data,lnd,postgres,boltz,secrets,webapp}
+mkdir -p "$ROOT"/{knots/data,shim,tor/data,lnd,postgres,boltz,secrets,webapp,graph,graph-state}
 chmod 700 "$ROOT/secrets"
 
 # rpcauth lines, so the node stores only salted hashes of the passwords.
@@ -124,6 +124,9 @@ TOR_UID=$(docker run --rm --entrypoint id lfswap/tor:dev -u)
 chown -R "$TOR_UID" "$ROOT/tor/data"
 chmod 700 "$ROOT/tor/data"
 chown -R 65532:65532 "$ROOT/shim"
+# The graph generator writes the sky's files (served by nginx) and its layout
+chown -R 65532:65532 "$ROOT/graph" "$ROOT/graph-state"
+chmod 755 "$ROOT/graph"
 
 # The deployment files run as root (cron, these scripts) and the web app is
 # served to every user: root's alone, whatever owner a copy kept (tar and

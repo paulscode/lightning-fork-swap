@@ -14,6 +14,7 @@
 #                       the guard (below) approves each call
 #   guard.macaroon      the guard: registers itself as lnd's middleware and
 #                       lists leases
+#   graph.macaroon      the graph generator: reads the channel graph
 #
 #   bake-macaroon.sh            once: keeps the ones that exist
 #   bake-macaroon.sh --force    bake new ones (after restoring lnd from its
@@ -21,7 +22,7 @@
 #                               know the old ones)
 #
 # Each has its own root key, so one can be revoked alone (lncli
-# deletemacaroonid N): boltz 1, donations 2, channels 3, guard 4.
+# deletemacaroonid N): boltz 1, donations 2, channels 3, guard 4, graph 5.
 set -euo pipefail
 cd "$(dirname "$0")/.."
 set -a; . ./.env; set +a
@@ -87,8 +88,13 @@ guard=(
 	uri:/walletrpc.WalletKit/ListLeases
 )
 
+graph=(
+	uri:/lnrpc.Lightning/GetInfo
+	uri:/lnrpc.Lightning/DescribeGraph
+)
+
 missing boltz.macaroon || missing donations.macaroon || missing channels.macaroon ||
-	missing guard.macaroon || exit 0
+	missing guard.macaroon || missing graph.macaroon || exit 0
 
 lncli() { docker compose exec -T lnd lncli --network="${NETWORK:-mainnet}" "$@" </dev/null; }
 for _ in $(seq 1 150); do
@@ -115,3 +121,4 @@ bake boltz.macaroon 0:0 1 "${boltz[@]}"
 bake donations.macaroon 65532:65532 2 "${donations[@]}"
 bake channels.macaroon 65532:65532 3 "${channels[@]}"
 bake guard.macaroon 65532:65532 4 "${guard[@]}"
+bake graph.macaroon 65532:65532 5 "${graph[@]}"

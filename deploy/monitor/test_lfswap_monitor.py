@@ -120,7 +120,15 @@ class FakeRunner:
         return self.lookup(("http", url.rsplit("/", 1)[1]))
 
 
+GRAPH_META = "/srv/lfswap/graph/meta.json"
+
+
 def run(outputs=None, env=None, **kwargs):
+    files = kwargs.pop("files", None)
+    if files is None:
+        files = {GRAPH_META: json.dumps(
+            {"version": 3, "checkedAt": "2026-10-07T11:55:00Z"})}
+    kwargs["files"] = files
     runner = FakeRunner(outputs or healthy(), **kwargs)
     monitor = m.Monitor(runner, env or {}, NOW)
     alerts = monitor.run_all("2026-10-07T11:55:00Z", "/srv/lfswap",
@@ -248,6 +256,15 @@ class ChecksTest(unittest.TestCase):
         self.assertIn("claim:pending:sub2", alerts)
         self.assertIn("submarine:paid-not-claimed:sub3", alerts)
         self.assertTrue(any("- 976000 <= 30" in q for q in runner.queries))
+
+    def test_the_sky_generator_is_watched(self):
+        alerts, _ = run(files={GRAPH_META: json.dumps(
+            {"checkedAt": "2026-10-07T10:30:00Z"})})
+        self.assertIn("1.5 hours ago", alerts["graph:stale"].text)
+        alerts, _ = run(files={})
+        self.assertIn("graph:missing", alerts)
+        alerts, _ = run(files={GRAPH_META: "{not json"})
+        self.assertIn("graph:missing", alerts)
 
     def test_donations_are_not_watched_without_an_address(self):
         alerts, runner = run()

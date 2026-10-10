@@ -214,6 +214,35 @@ services:
     logging: *logging
     mem_limit: 64m
 
+  # The network sky's files (../graph): the channel graph from lnd (read
+  # only), laid out in 3D, written as static files nginx serves at /graph/.
+  # No ports, no keys, nothing reachable from outside.
+  graph:
+    image: lfswap/graph:dev
+    build: ../graph
+    security_opt: [no-new-privileges:true]
+    read_only: true
+    restart: unless-stopped
+    depends_on:
+      lnd: {condition: service_healthy}
+    environment:
+      LND_REST_URL: https://lnd:8080
+      LND_TLS_CERT: /lnd/tls.cert
+      GRAPH_MACAROON: /lnd/graph.macaroon
+      OUT_DIR: /out
+      STATE_FILE: /state/state.json
+    volumes:
+      - ${LFSWAP_ROOT:-/srv/lfswap}/lnd/tls.cert:/lnd/tls.cert:ro
+      - type: bind
+        source: ${LFSWAP_ROOT:-/srv/lfswap}/lnd/graph.macaroon
+        target: /lnd/graph.macaroon
+        read_only: true
+        bind: {create_host_path: false}
+      - ${LFSWAP_ROOT:-/srv/lfswap}/graph:/out
+      - ${LFSWAP_ROOT:-/srv/lfswap}/graph-state:/state
+    logging: *logging
+    mem_limit: 256m
+
   # Channel donations (profile "channels": COMPOSE_PROFILES=channels in
   # .env). The guard is lnd's middleware for the worker's macaroon: it holds
   # the only macaroon that may register one, apart from the worker, so a

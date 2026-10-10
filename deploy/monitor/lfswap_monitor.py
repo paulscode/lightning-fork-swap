@@ -63,7 +63,7 @@ import lfswap_telemetry  # noqa: E402
 
 DEPLOY = os.environ.get("LFSWAP_DEPLOY", "/opt/lfswap/deploy")
 
-SERVICES = ["knots", "shim", "tor", "lnd", "postgres", "boltz"]
+SERVICES = ["knots", "shim", "tor", "lnd", "postgres", "boltz", "graph"]
 # Watched once a donation address is set (DONATION_ADDRESS in .env)
 DONATION_SERVICES = ["donations-worker", "donations-api"]
 # And once channel donations are on (CHANNEL_DONATIONS=on)
@@ -589,6 +589,25 @@ class Monitor:
                     "backend slow down or time out)",
                 )
 
+    def check_graph(self, root):
+        """The network sky's generator has looked at the graph within the
+        hour (it does every 10 minutes)."""
+        path = os.path.join(root, "graph", "meta.json")
+        try:
+            meta = json.loads(self.runner.read(path))
+            checked = datetime.datetime.fromisoformat(
+                meta["checkedAt"].replace("Z", "+00:00"))
+        except (OSError, ValueError, KeyError, TypeError):
+            self.add("graph:missing",
+                     "The network sky has no meta.json yet (the graph "
+                     "service)")
+            return
+        age = (self.now - checked).total_seconds()
+        if age > 3600:
+            self.add("graph:stale",
+                     f"The network sky was last refreshed {age / 3600:.1f} "
+                     "hours ago (docker compose logs graph)")
+
     def check_backup(self, root):
         scb = f"{root}/lnd/data/chain/bitcoin/{self.network}/channel.backup"
         copy = f"{root}/secrets/channel.backup"
@@ -645,6 +664,7 @@ class Monitor:
             ("logs", lambda: self.check_logs(since)),
             ("host", lambda: self.check_host(root)),
             ("backup", lambda: self.check_backup(root)),
+            ("graph", lambda: self.check_graph(root)),
             ("certificate", lambda: self.check_certificate(domain)),
         ]
         for name, check in checks:

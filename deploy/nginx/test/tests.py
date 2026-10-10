@@ -280,6 +280,41 @@ class Explorer(unittest.TestCase):
         self.assertEqual(status, 502, raw[:200])
 
 
+class Graph(unittest.TestCase):
+    def test_the_sky_files_are_served_cached_right(self):
+        status, headers, raw = request("GET", "/graph/meta.json")
+        self.assertEqual((status, raw.strip()), (200, b'{"version": 3}'))
+        self.assertEqual(header(headers, "Cache-Control"), ["no-cache"])
+        status, headers, _ = request("GET", "/graph/v3/overview.json")
+        self.assertEqual(status, 200)
+        self.assertEqual(header(headers, "Cache-Control"),
+                         ["public, max-age=31536000, immutable"])
+        # The server's headers are still there
+        self.assertEqual(len(header(headers, "Content-Security-Policy")), 1)
+        self.assertEqual(header(headers, "X-Content-Type-Options"), ["nosniff"])
+
+    def test_the_gzip_copy(self):
+        status, headers, raw = request("GET", "/graph/v3/overview.json",
+                                       headers={"Accept-Encoding": "gzip"})
+        self.assertEqual(status, 200)
+        self.assertEqual(header(headers, "Content-Encoding"), ["gzip"])
+        self.assertEqual(raw[:2], b"\x1f\x8b")
+
+    def test_nothing_else(self):
+        for method, path, want in [
+            ("GET", "/graph/v3/missing.json", 404),
+            ("GET", "/graph/", 404),
+            ("GET", "/graph/v3/node/", 404),
+            ("POST", "/graph/meta.json", 403),
+            ("PUT", "/graph/v4/overview.json", 403),
+        ]:
+            with self.subTest(method=method, path=path):
+                status, _, raw = request(method, path, body="x"
+                                         if method in ("POST", "PUT") else None)
+                self.assertEqual(status, want)
+                self.assertNotIn(b"<title>app</title>", raw)
+
+
 class RateLimits(unittest.TestCase):
     def test_creating_swaps_is_limited_and_reading_them_is_not(self):
         statuses = [request("GET", "/v2/swap/reverse")[0] for _ in range(12)]
