@@ -322,14 +322,15 @@ scenarios.rescue = async () => {
 // and URI). Regtest has no explorer: the thank-you and the totals are left
 // to the unit tests.
 const axeSource = readFileSync(join(dirname(fileURLToPath(import.meta.url)), 'node_modules', 'axe-core', 'axe.min.js'), 'utf8');
-const accessibility = async (url, options = {}) => {
+const accessibility = async (url, options = {}, selector = '#donate-modal') => {
   // axe is injected as a script: only in a context without the policy
   const { context, page } = await newPage({ ...options, bypassCSP: true });
   await page.goto(url);
-  await page.locator('#donate-modal').waitFor();
+  await page.locator(selector).first().waitFor({ timeout: 30_000 });
+  await page.waitForTimeout(1000);
   await page.addScriptTag({ content: axeSource });
-  const result = await page.evaluate(() =>
-    window.axe.run('#donate-modal', { runOnly: ['wcag2a', 'wcag2aa', 'wcag21a', 'wcag21aa'] }),
+  const result = await page.evaluate((sel) =>
+    window.axe.run(sel, { runOnly: ['wcag2a', 'wcag2aa', 'wcag21a', 'wcag21aa'] }), selector,
   );
   await context.close();
   const serious = result.violations.filter((v) => v.impact === 'serious' || v.impact === 'critical');
@@ -481,7 +482,8 @@ scenarios.network = async () => {
   await screenshot(phone.page, 'network-phone');
   assertNoProblems(phone.problems, 'network (phone)');
   await phone.context.close();
-  return `the sky of ${nodes} nodes drawn, ${first} first, ${target} found and selected, a phone with reduced motion`;
+  const minor = await accessibility(`${SITE}/network`, {}, 'body');
+  return `the sky of ${nodes} nodes drawn, ${first} first, ${target} found and selected, a phone with reduced motion; no serious accessibility findings (${minor} minor)`;
 };
 
 // The home page: the sky behind, the network's numbers, the swap card; on
@@ -512,7 +514,8 @@ scenarios.home = async () => {
   await screenshot(phone.page, 'home-phone');
   assertNoProblems(phone.problems, 'home (phone)');
   await phone.context.close();
-  return `home: ${stats.trim()}; card beside the words, on a phone below the sky`;
+  const minor = await accessibility(`${SITE}/`, {}, 'body');
+  return `home: ${stats.trim()}; card beside the words, on a phone below the sky; no serious accessibility findings (${minor} minor)`;
 };
 
 // --- run -------------------------------------------------------------------
