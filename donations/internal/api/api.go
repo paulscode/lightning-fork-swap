@@ -13,9 +13,15 @@ import (
 	"github.com/paulscode/lightning-fork-swap/donations/internal/store"
 )
 
+// Routes is more of /donate/v1/ (the channel donations).
+type Routes interface{ Register(mux *http.ServeMux) }
+
 // Handler serves /donate/v1/.
-func Handler(s store.Store) http.Handler {
+func Handler(s store.Store, more ...Routes) http.Handler {
 	mux := http.NewServeMux()
+	for _, r := range more {
+		r.Register(mux)
+	}
 	mux.HandleFunc("GET /donate/v1/health", func(w http.ResponseWriter, r *http.Request) {
 		write(w, http.StatusOK, map[string]string{"status": "ok"})
 	})

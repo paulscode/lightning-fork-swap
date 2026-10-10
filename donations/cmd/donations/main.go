@@ -4,7 +4,14 @@
 //	                     replay protection (DONATIONS_DB_URL, LND_REST_URL,
 //	                     LND_TLS_CERT, LND_MACAROON, DONATION_ADDRESSES)
 //	donations api        serve /donate/v1/ from the database (read only;
-//	                     DONATIONS_DB_URL, LISTEN)
+//	                     DONATIONS_DB_URL, LISTEN; CHANNEL_DONATIONS=on adds
+//	                     the channel donation routes, which may also insert
+//	                     an order or an edit request)
+//	donations channels   run channel donations with lnd (DONATIONS_DB_URL,
+//	                     LND_REST_URL, LND_TLS_CERT, CHANNELS_MACAROON)
+//	donations guard      lnd's middleware for the channels macaroon
+//	                     (LND_GRPC, LND_REST_URL, LND_TLS_CERT,
+//	                     GUARD_MACAROON)
 //	donations replay list [--at-risk | --replayed | --unknown | --all]
 //	donations replay show TXID
 //	donations replay note TXID TEXT
@@ -75,11 +82,15 @@ func main() {
 
 func run(ctx context.Context, args []string, logger *log.Logger) error {
 	if len(args) == 0 {
-		return errors.New("usage: donations worker|api|replay|check")
+		return errors.New("usage: donations worker|api|channels|guard|replay|check")
 	}
 	switch args[0] {
 	case "worker":
 		return runWorker(ctx, logger)
+	case "channels":
+		return runChannels(ctx, logger)
+	case "guard":
+		return runGuard(ctx, logger)
 	case "api":
 		return runAPI(ctx, logger)
 	case "check":
@@ -134,9 +145,14 @@ func runAPI(ctx context.Context, logger *log.Logger) error {
 		return err
 	}
 	defer db.Pool.Close()
+	var more []api.Routes
+	if env("CHANNEL_DONATIONS", "off") == "on" {
+		more = append(more, channelAPI(db.Pool))
+		logger.Print("channel donations on")
+	}
 	server := &http.Server{
 		Addr:              env("LISTEN", ":9010"),
-		Handler:           api.Handler(db),
+		Handler:           api.Handler(db, more...),
 		ReadHeaderTimeout: 5 * time.Second,
 		ReadTimeout:       10 * time.Second,
 		WriteTimeout:      10 * time.Second,

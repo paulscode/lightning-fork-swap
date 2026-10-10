@@ -17,7 +17,7 @@ import (
 
 const (
 	ourNode   = "03cd3175b98f56a4b7a27d169ff211afe4d49973448fce92e2f7f03f526663e666"
-	donorNode = "02" + "11111111111111111111111111111111111111111111111111111111111111" + "11"
+	donorNode = "0279be667ef9dcbbac55a06295ce870b07029bfcdb2dce28d959f2815b16f81798"
 )
 
 // wallet simulates lnd for the worker: coins, leases, peers, channels.
@@ -40,13 +40,15 @@ type wallet struct {
 	down       bool
 	leaseErr   error
 	txs        []lnd.Transaction
+	released   *guard.Released
 	t          *testing.T
 }
 
 func newWallet(t *testing.T) *wallet {
 	return &wallet{height: 976000, leases: map[string]bool{}, nodes: map[string]lnd.Node{},
 		reachable: map[string]bool{"91.190.100.60:9735": true},
-		features:  map[string]string{donorNode: "fork"}, peers: map[string]bool{}, fee: 2, t: t}
+		features:  map[string]string{donorNode: "fork"}, peers: map[string]bool{}, fee: 2,
+		released: guard.NewReleased(), t: t}
 }
 
 func (f *wallet) GetInfo(context.Context) (lnd.Info, error) {
@@ -97,6 +99,7 @@ func (f *wallet) LeaseOutput(_ context.Context, id []byte, op lnd.OutPoint, seco
 
 func (f *wallet) ReleaseOutput(_ context.Context, _ []byte, op lnd.OutPoint) error {
 	delete(f.leases, op.String())
+	f.released.Note(op.String())
 	return nil
 }
 
@@ -157,8 +160,15 @@ func (f *wallet) OpenChannel(ctx context.Context, r lnd.OpenRequest) (string, er
 	}
 	p := guard.DefaultPolicy()
 	p.Leases = guardLeases{f}
+	p.Released = f.released
 	if err := p.OpenChannelCheck(ctx, req); err != nil {
 		f.t.Fatalf("the guard would refuse the worker's open: %v", err)
+	}
+	// As lnd: no open from coins that are leased
+	for _, op := range r.Outpoints {
+		if f.leases[op.String()] {
+			return "", &lnd.Error{Status: 500, Message: "outpoint already spent or locked by another subsystem: " + op.String()}
+		}
 	}
 	f.opens = append(f.opens, r)
 	// The coins are spent
@@ -517,6 +527,19 @@ func TestTheDonorIsAskedToActWhenOnlyTheyCan(t *testing.T) {
 	}
 }
 
+func TestAConnectedNodeNeedsNoAddress(t *testing.T) {
+	h := newHarness(t)
+	h.lnd.peers[donorNode] = true
+	h.lnd.connectErr = errors.New("must not dial")
+	id := h.order(donorNode, "")
+	h.pass()
+	h.lnd.pay(h.get(id).Address, 2_000_000, 3)
+	h.pass()
+	if o := h.get(id); o.State != FundingBroadcast {
+		t.Fatalf("%s %s", o.State, o.ErrorCode)
+	}
+}
+
 func TestAnAddressFromTheGraph(t *testing.T) {
 	h := newHarness(t)
 	h.lnd.nodes[donorNode] = lnd.Node{Alias: "donor", Addresses: []lnd.NodeAddress{
@@ -546,7 +569,7 @@ func TestTheNodeRefusesTwiceThenTheDonorActs(t *testing.T) {
 	if o := h.get(id); o.State != NeedsAttention || o.ErrorCode != ErrRejectedSize {
 		t.Fatalf("%s %s", o.State, o.ErrorCode)
 	}
-	// The coins stay leased for the channel meanwhile
+	// The coins are leased again for the channel meanwhile
 	if len(h.lnd.leases) != 1 {
 		t.Fatalf("leases %v", h.lnd.leases)
 	}
@@ -622,6 +645,36 @@ func TestAnInterruptedOpenIsResumed(t *testing.T) {
 	h.pass()
 	if o = h.get(id); o.State != FundingBroadcast || o.ChannelPoint != point || len(h.lnd.opens) != 1 {
 		t.Fatalf("%s %s %d", o.State, o.ChannelPoint, len(h.lnd.opens))
+	}
+}
+
+func TestCoinsLeftUnleasedAfterAFailedOpenAreLeasedAgain(t *testing.T) {
+	h := newHarness(t)
+	id := h.order(donorNode, "91.190.100.60:9735")
+	h.pass()
+	h.lnd.pay(h.get(id).Address, 2_000_000, 3)
+	h.pass()
+	if h.get(id).State != FundingBroadcast {
+		t.Fatal("the usual open failed")
+	}
+	// Another order: its open fails and the coins cannot be leased again
+	id = h.order(donorNode, "91.190.100.60:9735")
+	h.pass()
+	h.lnd.pay(h.get(id).Address, 2_000_000, 3)
+	h.lnd.openErr = errors.New("lnd restarted")
+	failing := &failingLease{wallet: h.lnd, after: 1, calls: new(int)}
+	h.w.Lnd = failing
+	h.pass()
+	o := h.get(id)
+	if o.State != Retrying || h.lnd.leases[o.Utxos[0].Outpoint] {
+		t.Fatalf("%s %v", o.State, h.lnd.leases)
+	}
+	h.w.Lnd = h.lnd
+	h.lnd.openErr = nil
+	h.wait(time.Minute)
+	h.pass()
+	if o = h.get(id); o.State != FundingBroadcast || o.ErrorCode != "" {
+		t.Fatalf("%s %s", o.State, o.ErrorCode)
 	}
 }
 

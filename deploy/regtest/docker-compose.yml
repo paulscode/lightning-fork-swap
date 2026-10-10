@@ -64,6 +64,8 @@ services:
       - --tlsextradomain=lnd-swap
       - --tlsextradomain=lnd-user
       - --alias=lfswap-regtest
+      # Channel donations' guard (channel-donations.sh)
+      - --rpcmiddleware.enable
     volumes: [lnd-swap:/root/.lnd]
 
   lnd-user:

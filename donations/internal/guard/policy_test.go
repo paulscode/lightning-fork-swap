@@ -5,6 +5,7 @@ import (
 	"errors"
 	"strings"
 	"testing"
+	"time"
 
 	"google.golang.org/protobuf/encoding/protowire"
 	"google.golang.org/protobuf/proto"
@@ -248,5 +249,31 @@ func TestLeasesThatCannotBeCheckedRefuse(t *testing.T) {
 	p.Leases = nil
 	if check(p, open(t, goodOpen())) == nil {
 		t.Fatal("passed without a lease source")
+	}
+}
+
+func TestAnOpenFromCoinsJustReleased(t *testing.T) {
+	p := policy()
+	p.Leases = leases{} // nothing leased any more
+	now := time.Date(2026, 10, 10, 12, 0, 0, 0, time.UTC)
+	p.Released = NewReleased()
+	p.Released.Now = func() time.Time { return now }
+	if check(p, open(t, goodOpen())) == nil {
+		t.Fatal("an open from coins neither leased nor released passed")
+	}
+	// The worker releases both: the guard sees the releases pass
+	for _, op := range goodOpen().Outpoints {
+		msg := message(t, "/walletrpc.WalletKit/ReleaseOutput", "walletrpc.ReleaseOutputRequest",
+			&lnrpc.ReleaseOutputRequest{Id: LeaseID, Outpoint: op})
+		if err := check(p, msg); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := check(p, open(t, goodOpen())); err != nil {
+		t.Fatalf("refused just after the release: %v", err)
+	}
+	now = now.Add(3 * time.Minute)
+	if check(p, open(t, goodOpen())) == nil {
+		t.Fatal("passed long after the release")
 	}
 }

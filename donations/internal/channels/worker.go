@@ -359,12 +359,22 @@ func (w *Worker) tryOpen(ctx context.Context, o *Order, now time.Time, prior []E
 	if held >= w.Rules.MaxPerNode {
 		return append(events, w.attention(o, now, ErrNodeLimit)...), nil
 	}
-	// All the order's coins must still be leased to us
-	for _, u := range o.Utxos {
-		if !u.Leased || !w.leased[u.Outpoint] && !justLeased(prior) {
+	// All the order's coins must still be ours: leased, or (after an
+	// open that failed) unspent and leased again now
+	for i, u := range o.Utxos {
+		if w.leased[u.Outpoint] || justLeased(prior) {
+			continue
+		}
+		if !w.isUnspent(o.Address, u.Outpoint) {
 			more, err := w.lostCoins(ctx, o, now)
 			return append(events, more...), err
 		}
+		if err := w.Lnd.LeaseOutput(ctx, guard.LeaseID, outpoint(u.Outpoint),
+			w.Rules.LeaseSeconds); err != nil {
+			return events, err
+		}
+		w.leased[u.Outpoint] = true
+		o.Utxos[i].Leased = true
 	}
 
 	if node, err := w.Lnd.GetNodeInfo(ctx, o.NodePubkey); err == nil {
@@ -380,31 +390,37 @@ func (w *Worker) tryOpen(ctx context.Context, o *Order, now time.Time, prior []E
 			}
 		}
 	}
-	if o.NodeAddr == "" {
-		return append(events, w.attention(o, now, ErrNoAddress)...), nil
-	}
-	addr, err := netcheck.Literal(o.NodeAddr)
-	if err != nil {
-		return append(events, w.attention(o, now, ErrNoAddress)...), nil
-	}
-	if o.State != Connecting {
-		o.State = Connecting
-		events = append(events, event(now, "connecting", map[string]any{"node": addr}))
-	}
-	w.opened = true
-	if err := w.Lnd.ConnectPeer(ctx, o.NodePubkey, addr, 30); err != nil {
-		return append(events, w.failed(o, now, classify(err))...), nil
-	}
 	peers, err := w.Lnd.ListPeers(ctx)
 	if err != nil {
 		return append(events, w.failed(o, now, ErrLndUnavailable)...), nil
 	}
-	var peer *lnd.Peer
-	for i := range peers {
-		if peers[i].PubKey == o.NodePubkey {
-			peer = &peers[i]
+	peer := findPeer(peers, o.NodePubkey)
+	// Already connected (it may have a channel with us): nothing to dial
+	if peer == nil {
+		if o.NodeAddr == "" {
+			return append(events, w.attention(o, now, ErrNoAddress)...), nil
 		}
+		addr, err := netcheck.Literal(o.NodeAddr)
+		if err != nil {
+			return append(events, w.attention(o, now, ErrNoAddress)...), nil
+		}
+		if o.State != Connecting {
+			o.State = Connecting
+			events = append(events, event(now, "connecting", map[string]any{"node": addr}))
+		}
+		w.opened = true
+		if err := w.Lnd.ConnectPeer(ctx, o.NodePubkey, addr, 30); err != nil {
+			return append(events, w.lndFailed(o, now, err)...), nil
+		}
+		if peers, err = w.Lnd.ListPeers(ctx); err != nil {
+			return append(events, w.failed(o, now, ErrLndUnavailable)...), nil
+		}
+		peer = findPeer(peers, o.NodePubkey)
+	} else if o.State != Connecting {
+		o.State = Connecting
+		events = append(events, event(now, "connecting", nil))
 	}
+	w.opened = true
 	if peer == nil {
 		return append(events, w.failed(o, now, ErrDisconnected)...), nil
 	}
@@ -447,9 +463,19 @@ func (w *Worker) tryOpen(ctx context.Context, o *Order, now time.Time, prior []E
 		return nil, err
 	}
 	o.Version++
+	// lnd opens only from coins that are not leased: release them just
+	// before (the guard allows an open from coins we released a moment
+	// ago), and lease them again if the open fails
+	for _, op := range outpoints {
+		if err := w.Lnd.ReleaseOutput(ctx, guard.LeaseID, op); err != nil {
+			w.release(ctx, o)
+			return w.lndFailed(o, now, err), nil
+		}
+	}
 	point, err := w.Lnd.OpenChannel(ctx, req)
 	if err != nil {
-		return w.failed(o, now, classify(err)), nil
+		w.release(ctx, o)
+		return w.lndFailed(o, now, err), nil
 	}
 	o.ChannelPoint, o.State = point, FundingBroadcast
 	o.ErrorCode, o.NextAttempt = "", nil
@@ -457,17 +483,44 @@ func (w *Worker) tryOpen(ctx context.Context, o *Order, now time.Time, prior []E
 		"channelPoint": point, "capacitySat": o.CapacitySat, "remainderSat": o.RemainderSat})}, nil
 }
 
+// release leases an order's coins again after an open did not use them
+// (a coin it cannot lease is found unleased next pass and leased then).
+func (w *Worker) release(ctx context.Context, o *Order) {
+	for _, u := range o.Utxos {
+		_ = w.Lnd.LeaseOutput(ctx, guard.LeaseID, outpoint(u.Outpoint), w.Rules.LeaseSeconds)
+	}
+}
+
+func (w *Worker) isUnspent(address, op string) bool {
+	for _, u := range w.unspent[address] {
+		if strings.EqualFold(u.Outpoint.String(), op) {
+			return true
+		}
+	}
+	return false
+}
+
+func findPeer(peers []lnd.Peer, pubkey string) *lnd.Peer {
+	for i := range peers {
+		if peers[i].PubKey == pubkey {
+			return &peers[i]
+		}
+	}
+	return nil
+}
+
 // resume finds what happened to an open that was interrupted (the worker
 // stopped during the call).
 func (w *Worker) resume(ctx context.Context, o *Order, now time.Time) ([]Event, error) {
 	allLeased := true
 	for _, u := range o.Utxos {
-		if !w.leased[u.Outpoint] {
+		if !w.leased[u.Outpoint] && !w.isUnspent(o.Address, u.Outpoint) {
 			allLeased = false
 		}
 	}
 	if allLeased {
-		// Nothing was spent: try again
+		// Nothing was spent (the coins are leased, or released just
+		// before the open and still unspent): try again
 		o.State = Connecting
 		return []Event{event(now, "resuming", nil)}, nil
 	}
@@ -569,6 +622,15 @@ func (w *Worker) watchOpen(ctx context.Context, o *Order, now time.Time) ([]Even
 		}
 	}
 	return nil, nil
+}
+
+// lndFailed: lnd's own words go to the operator's log; the donor sees a
+// code.
+func (w *Worker) lndFailed(o *Order, now time.Time, err error) []Event {
+	if w.Logger != nil {
+		w.Logger.Printf("order %s: %v", o.ID, err)
+	}
+	return w.failed(o, now, classify(err))
 }
 
 // failed schedules another try, or asks the donor to act.

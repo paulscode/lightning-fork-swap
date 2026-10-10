@@ -14,6 +14,8 @@ import (
 	"errors"
 	"fmt"
 	"strings"
+	"sync"
+	"time"
 
 	"google.golang.org/protobuf/proto"
 	"google.golang.org/protobuf/reflect/protoreflect"
@@ -72,6 +74,49 @@ type Policy struct {
 	// The longest a lease may last, in seconds
 	MaxLeaseSeconds uint64
 	Leases          Leases
+	// Coins the worker released just now: lnd opens only from coins not
+	// leased, so the worker releases them right before the open
+	Released *Released
+}
+
+// ReleaseWindow is how long after its release a coin may fund an open.
+const ReleaseWindow = 2 * time.Minute
+
+// Released remembers the coins the worker released, and when.
+type Released struct {
+	mu  sync.Mutex
+	at  map[string]time.Time
+	Now func() time.Time
+}
+
+// NewReleased is an empty record.
+func NewReleased() *Released {
+	return &Released{at: map[string]time.Time{}, Now: time.Now}
+}
+
+// Note records a release (the guard does it as it passes a ReleaseOutput).
+func (r *Released) Note(key string) { r.note(key) }
+
+func (r *Released) note(key string) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	now := r.Now()
+	for k, t := range r.at {
+		if now.Sub(t) > ReleaseWindow {
+			delete(r.at, k)
+		}
+	}
+	r.at[key] = now
+}
+
+func (r *Released) recent(key string) bool {
+	if r == nil {
+		return false
+	}
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	t, ok := r.at[key]
+	return ok && r.Now().Sub(t) <= ReleaseWindow
 }
 
 // DefaultPolicy is the production limit, before the leases source is set.
@@ -143,6 +188,13 @@ func (p Policy) Check(ctx context.Context, condition string, msg *lnrpc.RPCMessa
 		if string(req.Id) != string(LeaseID) {
 			return refuse("releases only under the donations lease id")
 		}
+		key, err := outpointKey(req.Outpoint)
+		if err != nil {
+			return err
+		}
+		if p.Released != nil {
+			p.Released.note(key)
+		}
 	}
 	return nil
 }
@@ -180,38 +232,56 @@ func (p Policy) openChannel(ctx context.Context, r *lnrpc.OpenChannelRequest) er
 	}
 	seen := map[string]bool{}
 	for _, op := range r.Outpoints {
-		txid := op.TxidStr
-		if txid == "" && len(op.TxidBytes) == 32 {
-			// lnd's byte order is reversed from the hex form
-			b := make([]byte, 32)
-			for i := range b {
-				b[i] = op.TxidBytes[31-i]
-			}
-			txid = hex.EncodeToString(b)
-		} else if len(op.TxidBytes) != 0 {
-			return refuse("an outpoint in two forms")
+		key, err := outpointKey(op)
+		if err != nil {
+			return err
 		}
-		txid = strings.ToLower(txid)
-		if len(txid) != 64 {
-			return refuse("bad outpoint")
-		}
-		key := fmt.Sprintf("%s:%d", txid, op.OutputIndex)
 		if seen[key] {
 			return refuse("an outpoint twice")
 		}
 		seen[key] = true
+		if p.Released.recent(key) {
+			continue
+		}
 		if p.Leases == nil {
 			return refuse("cannot check leases")
 		}
-		ok, err := p.Leases.LeasedByUs(ctx, txid, op.OutputIndex)
+		txid, index := key[:64], op.OutputIndex
+		ok, err := p.Leases.LeasedByUs(ctx, txid, index)
 		if err != nil {
 			return refuse("cannot check leases: %v", err)
 		}
 		if !ok {
-			return refuse("%s is not leased for donations", key)
+			return refuse("%s is neither leased for donations nor just released", key)
 		}
 	}
 	return nil
+}
+
+// outpointKey is txid:index, from either form lnd accepts.
+func outpointKey(op *lnrpc.OutPoint) (string, error) {
+	if op == nil {
+		return "", refuse("no outpoint")
+	}
+	txid := op.TxidStr
+	if txid == "" && len(op.TxidBytes) == 32 {
+		// lnd's byte order is reversed from the hex form
+		b := make([]byte, 32)
+		for i := range b {
+			b[i] = op.TxidBytes[31-i]
+		}
+		txid = hex.EncodeToString(b)
+	} else if len(op.TxidBytes) != 0 {
+		return "", refuse("an outpoint in two forms")
+	}
+	txid = strings.ToLower(txid)
+	if len(txid) != 64 {
+		return "", refuse("bad outpoint")
+	}
+	if _, err := hex.DecodeString(txid); err != nil {
+		return "", refuse("bad outpoint")
+	}
+	return fmt.Sprintf("%s:%d", txid, op.OutputIndex), nil
 }
 
 func connectPeer(r *lnrpc.ConnectPeerRequest) error {
