@@ -268,3 +268,9 @@ func unknown(m protoreflect.Message) bool {
 	})
 	return found
 }
+
+// OpenChannelCheck judges an open request on its own (the worker's tests
+// use it to show the worker asks only for what the guard allows).
+func (p Policy) OpenChannelCheck(ctx context.Context, r *lnrpc.OpenChannelRequest) error {
+	return p.openChannel(ctx, r)
+}
