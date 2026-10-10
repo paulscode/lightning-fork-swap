@@ -1,8 +1,10 @@
-// Package lnd reads lnd's on-chain transactions over its REST API, with a
-// macaroon that may do nothing else.
+// Package lnd talks to lnd over its REST API: the donation watcher reads
+// on-chain transactions with a macaroon that may do nothing else; the
+// channel donation worker and its guard use the calls in channels.go.
 package lnd
 
 import (
+	"bytes"
 	"context"
 	"crypto/tls"
 	"crypto/x509"
@@ -87,29 +89,62 @@ func (t Transaction) Paid(addresses map[string]bool) (string, int64) {
 // Transactions lists the wallet's transactions from a height on (and
 // unconfirmed ones).
 func (c *Client) Transactions(ctx context.Context, startHeight int64) ([]Transaction, error) {
-	url := fmt.Sprintf("%s/v1/transactions?start_height=%d&end_height=-1", c.URL, startHeight)
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
-	if err != nil {
-		return nil, err
-	}
-	req.Header.Set("Grpc-Metadata-macaroon", c.macaroon)
-	res, err := c.http.Do(req)
-	if err != nil {
-		return nil, err
-	}
-	defer res.Body.Close()
-	body, err := io.ReadAll(io.LimitReader(res.Body, 64<<20))
-	if err != nil {
-		return nil, err
-	}
-	if res.StatusCode != http.StatusOK {
-		return nil, fmt.Errorf("lnd: HTTP %d: %.200s", res.StatusCode, body)
-	}
 	var out struct {
 		Transactions []Transaction `json:"transactions"`
 	}
-	if err := json.Unmarshal(body, &out); err != nil {
+	path := fmt.Sprintf("/v1/transactions?start_height=%d&end_height=-1", startHeight)
+	if err := c.call(ctx, http.MethodGet, path, nil, &out); err != nil {
 		return nil, err
 	}
 	return out.Transactions, nil
+}
+
+// Error is lnd's answer to a call that failed.
+type Error struct {
+	Status  int
+	Message string
+}
+
+func (e *Error) Error() string { return fmt.Sprintf("lnd: HTTP %d: %.300s", e.Status, e.Message) }
+
+// call sends one request; body (if any) as JSON; the answer into out.
+func (c *Client) call(ctx context.Context, method, path string, body, out any) error {
+	var reader io.Reader
+	if body != nil {
+		b, err := json.Marshal(body)
+		if err != nil {
+			return err
+		}
+		reader = bytes.NewReader(b)
+	}
+	req, err := http.NewRequestWithContext(ctx, method, c.URL+path, reader)
+	if err != nil {
+		return err
+	}
+	req.Header.Set("Grpc-Metadata-macaroon", c.macaroon)
+	if body != nil {
+		req.Header.Set("Content-Type", "application/json")
+	}
+	res, err := c.http.Do(req)
+	if err != nil {
+		return err
+	}
+	defer res.Body.Close()
+	b, err := io.ReadAll(io.LimitReader(res.Body, 64<<20))
+	if err != nil {
+		return err
+	}
+	if res.StatusCode != http.StatusOK {
+		var e struct {
+			Message string `json:"message"`
+		}
+		if json.Unmarshal(b, &e) != nil || e.Message == "" {
+			e.Message = string(b)
+		}
+		return &Error{Status: res.StatusCode, Message: e.Message}
+	}
+	if out == nil {
+		return nil
+	}
+	return json.Unmarshal(b, out)
 }

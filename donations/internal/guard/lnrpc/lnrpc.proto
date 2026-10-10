@@ -1,0 +1,133 @@
+// The parts of lnd's RPC the donations guard uses, copied field for field
+// from lnd's lnrpc/lightning.proto and lnrpc/walletrpc/walletkit.proto
+// (lnd 0.21). Fields the guard only needs to see set, never read (a
+// funding shim), are declared as bytes: an embedded message has the same
+// wire form. Generate with:
+//
+//   protoc --go_out=. --go_opt=paths=source_relative lnrpc.proto
+syntax = "proto3";
+
+package lnrpc;
+
+option go_package = "github.com/paulscode/lightning-fork-swap/donations/internal/guard/lnrpc";
+
+service Lightning {
+    rpc RegisterRPCMiddleware (stream RPCMiddlewareResponse)
+        returns (stream RPCMiddlewareRequest);
+}
+
+message RPCMiddlewareRequest {
+    uint64 request_id = 1;
+    bytes raw_macaroon = 2;
+    string custom_caveat_condition = 3;
+    oneof intercept_type {
+        StreamAuth stream_auth = 4;
+        RPCMessage request = 5;
+        RPCMessage response = 6;
+        bool reg_complete = 8;
+    }
+    uint64 msg_id = 7;
+    map<string, MetadataValues> metadata_pairs = 9;
+}
+
+message MetadataValues {
+    repeated string values = 1;
+}
+
+message StreamAuth {
+    string method_full_uri = 1;
+}
+
+message RPCMessage {
+    string method_full_uri = 1;
+    bool stream_rpc = 2;
+    string type_name = 3;
+    bytes serialized = 4;
+    bool is_error = 5;
+}
+
+message RPCMiddlewareResponse {
+    uint64 ref_msg_id = 1;
+    oneof middleware_message {
+        MiddlewareRegistration register = 2;
+        InterceptFeedback feedback = 3;
+    }
+}
+
+message MiddlewareRegistration {
+    string middleware_name = 1;
+    string custom_macaroon_caveat_name = 2;
+    bool read_only_mode = 3;
+}
+
+message InterceptFeedback {
+    string error = 1;
+    bool replace_response = 2;
+    bytes replacement_serialized = 3;
+}
+
+message OutPoint {
+    bytes txid_bytes = 1;
+    string txid_str = 2;
+    uint32 output_index = 3;
+}
+
+message OpenChannelRequest {
+    uint64 sat_per_vbyte = 1;
+    bytes node_pubkey = 2;
+    string node_pubkey_string = 3;
+    int64 local_funding_amount = 4;
+    int64 push_sat = 5;
+    int32 target_conf = 6;
+    int64 sat_per_byte = 7;
+    bool private = 8;
+    int64 min_htlc_msat = 9;
+    uint32 remote_csv_delay = 10;
+    int32 min_confs = 11;
+    bool spend_unconfirmed = 12;
+    string close_address = 13;
+    bytes funding_shim = 14;
+    uint64 remote_max_value_in_flight_msat = 15;
+    uint32 remote_max_htlcs = 16;
+    uint32 max_local_csv = 17;
+    int32 commitment_type = 18;
+    bool zero_conf = 19;
+    bool scid_alias = 20;
+    uint64 base_fee = 21;
+    uint64 fee_rate = 22;
+    bool use_base_fee = 23;
+    bool use_fee_rate = 24;
+    uint64 remote_chan_reserve_sat = 25;
+    bool fund_max = 26;
+    string memo = 27;
+    repeated OutPoint outpoints = 28;
+}
+
+message LightningAddress {
+    string pubkey = 1;
+    string host = 2;
+}
+
+message ConnectPeerRequest {
+    LightningAddress addr = 1;
+    bool perm = 2;
+    uint64 timeout = 3;
+}
+
+message NewAddressRequest {
+    int32 type = 1;
+    string account = 2;
+}
+
+// walletrpc
+message LeaseOutputRequest {
+    bytes id = 1;
+    OutPoint outpoint = 2;
+    uint64 expiration_seconds = 3;
+    uint32 release_after_spend_confs = 4;
+}
+
+message ReleaseOutputRequest {
+    bytes id = 1;
+    OutPoint outpoint = 2;
+}
