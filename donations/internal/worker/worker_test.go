@@ -158,6 +158,29 @@ func TestAFailedCheckIsRecordedAsUnknown(t *testing.T) {
 	}
 }
 
+func TestChannelDonationAddressesAreWatchedToo(t *testing.T) {
+	wk, mem, _, _, _, _ := setup()
+	wk.Now = time.Now
+	wk.MoreAddresses = func(context.Context) ([]string, error) {
+		return []string{"bc1qother"}, nil
+	}
+	if err := wk.Pass(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if len(mem.Records) != 2 {
+		t.Fatalf("records: %v", mem.Records)
+	}
+	// Their source failing does not stop the fixed address
+	wk, mem, _, _, _, _ = setup()
+	wk.MoreAddresses = func(context.Context) ([]string, error) {
+		return nil, errors.New("no such table")
+	}
+	_ = wk.Pass(context.Background())
+	if len(mem.Records) != 1 {
+		t.Fatalf("records: %v", mem.Records)
+	}
+}
+
 func TestLndDownStopsThePass(t *testing.T) {
 	wk, mem, w, _, _, _ := setup()
 	w.fail = errors.New("lnd down")

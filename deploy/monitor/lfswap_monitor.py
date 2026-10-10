@@ -66,6 +66,8 @@ DEPLOY = os.environ.get("LFSWAP_DEPLOY", "/opt/lfswap/deploy")
 SERVICES = ["knots", "shim", "tor", "lnd", "postgres", "boltz"]
 # Watched once a donation address is set (DONATION_ADDRESS in .env)
 DONATION_SERVICES = ["donations-worker", "donations-api"]
+# And once channel donations are on (CHANNEL_DONATIONS=on)
+CHANNEL_SERVICES = ["donations-channels", "donations-guard"]
 
 # Lines in the backend's log that need a person. Each is reported once, when
 # it first appears.
@@ -217,6 +219,9 @@ class Monitor:
     def donations_on(self):
         return bool(self.env.get("DONATION_ADDRESS"))
 
+    def channels_on(self):
+        return self.env.get("CHANNEL_DONATIONS") == "on"
+
     def psql(self, query, database="boltz"):
         out = self.runner.compose(
             "exec", "-T", "postgres", "psql", "-U", "boltz", "-d", database,
@@ -238,7 +243,8 @@ class Monitor:
             rows.extend(parsed if isinstance(parsed, list) else [parsed])
         state = {row.get("Service"): row.get("State") for row in rows}
         services = SERVICES + (DONATION_SERVICES if self.donations_on()
-                               else [])
+                               else []) + (CHANNEL_SERVICES
+                                           if self.channels_on() else [])
         for service in services:
             if state.get(service) != "running":
                 self.add(
@@ -463,6 +469,87 @@ class Monitor:
                 event=True,
             )
 
+    def check_channel_donations(self):
+        """The channel worker works; orders are not stuck; and every channel
+        we opened as a donation is one, with nothing pushed."""
+        if not self.channels_on():
+            return
+        db = "donations"
+        rows = self.psql("SELECT value FROM channel_settings "
+                         "WHERE key = 'last_pass'", db)
+        last = None
+        if rows:
+            try:
+                last = datetime.datetime.fromisoformat(
+                    rows[0][0].replace("Z", "+00:00"))
+            except ValueError:
+                pass
+        if last is None or (self.now - last).total_seconds() > 600:
+            self.add("channels:stale",
+                     "The channel donation worker has not completed a pass "
+                     + (f"since {last:%Y-%m-%d %H:%M} UTC" if last else "yet")
+                     + " (lnd, the guard or the database)")
+        for order, state, minutes in self.psql(
+            "SELECT id, state, round(extract(epoch FROM now() - updated_at) "
+            "/ 60) FROM channel_orders WHERE state IN ('payment_confirmed', "
+            "'connecting', 'opening') AND updated_at < now() - interval "
+            "'30 minutes'", db):
+            self.add(f"channels:stuck:{order}",
+                     f"Channel donation {order} has been {state} for "
+                     f"{minutes} minutes")
+        for order, minutes in self.psql(
+            "SELECT id, round(extract(epoch FROM now() - updated_at) / 60) "
+            "FROM channel_orders WHERE state = 'funding_broadcast' AND "
+            "funding_confs = 0 AND updated_at < now() - interval '6 hours'",
+                db):
+            self.add(f"channels:unconfirmed:{order}",
+                     f"Channel donation {order}: its funding transaction is "
+                     f"unconfirmed after {minutes} minutes (bump it: "
+                     "lncli wallet bumpfee)")
+        unpaid = self.psql(
+            "SELECT count(*) FROM channel_orders WHERE state IN ('new', "
+            "'awaiting_payment') AND received_sat = 0", db)
+        if unpaid and int(unpaid[0][0]) >= 50:
+            self.add("channels:budget",
+                     f"{unpaid[0][0]} channel donations wait unpaid (of 100 "
+                     "allowed): each holds an lnd address")
+        for order, code in self.psql(
+            "SELECT id, error_code FROM channel_orders WHERE state = "
+            "'needs_attention' AND attention_since > now() - interval "
+            "'3 days'", db):
+            self.add(f"channels:attention:{order}",
+                     f"Channel donation {order} waits for the donor ({code})",
+                     event=True)
+
+        # The invariant: a channel with a donation memo belongs to that
+        # order; none of ours pushed anything
+        orders = dict(self.psql("SELECT id, coalesce(channel_point, '') "
+                                "FROM channel_orders", db))
+        channels = json.loads(self.lncli("listchannels"))["channels"]
+        pending = json.loads(self.lncli("pendingchannels")).get(
+            "pending_open_channels", [])
+        ours = [(c.get("channel_point"), c.get("memo", ""),
+                 int(c.get("push_amount_sat", 0) or 0))
+                for c in channels if c.get("initiator")]
+        ours += [(p["channel"].get("channel_point"),
+                  p["channel"].get("memo", ""), 0) for p in pending
+                 if p["channel"].get("initiator") == "INITIATOR_LOCAL"]
+        for point, memo, push in ours:
+            if push:
+                self.add(f"channels:push:{point}",
+                         f"Channel {point} was opened by us with "
+                         f"{push:,} sat pushed to the peer: if you did not "
+                         "do it, stop channel donations and look",
+                         event=True)
+            if memo.startswith("donation:"):
+                order = memo[len("donation:"):]
+                if orders.get(order) != point:
+                    self.add(f"channels:unknown:{point}",
+                             f"Channel {point} says it is donation {order}, "
+                             "which has no such channel: stop channel "
+                             "donations (COMPOSE_PROFILES) and look",
+                             event=True)
+
     def check_logs(self, since):
         for service, label, patterns in (
             ("boltz", "Backend", LOG_PATTERNS),
@@ -554,6 +641,7 @@ class Monitor:
             ("pairs", self.check_pairs),
             ("swaps", self.check_swaps),
             ("donations", self.check_donations),
+            ("channel donations", self.check_channel_donations),
             ("logs", lambda: self.check_logs(since)),
             ("host", lambda: self.check_host(root)),
             ("backup", lambda: self.check_backup(root)),
@@ -669,6 +757,29 @@ def report(monitor, days):
 
     if m.donations_on():
         lines.extend(donation_lines(m, days))
+    if m.channels_on():
+        lines.extend(channel_donation_lines(m, days))
+    return lines
+
+
+def channel_donation_lines(m, days):
+    """Channel donations: opened, open now, kept as general donations."""
+    lines = ["Channel donations"]
+    opened, capacity = m.psql(
+        "SELECT count(*), coalesce(sum(capacity_sat), 0) FROM channel_orders "
+        f"WHERE opened_at >= now() - interval '{int(days)} days'",
+        "donations")[0]
+    lines.append(f"  last {days} days: {int(opened)} opened, "
+                 f"{sats(capacity)} of capacity")
+    states = dict(m.psql("SELECT state, count(*) FROM channel_orders "
+                         "GROUP BY state", "donations"))
+    for state, text in (("open", "open now"),
+                        ("funding_broadcast", "confirming"),
+                        ("needs_attention", "waiting for the donor"),
+                        ("retrying", "retrying"),
+                        ("fell_back", "kept as general donations")):
+        if int(states.get(state, 0)):
+            lines.append(f"  {states[state]} {text}")
     return lines
 
 

@@ -320,6 +320,74 @@ class ChecksTest(unittest.TestCase):
         for q in recent:
             self.assertIn("days'", q)
 
+    def channels(self, sql, channels=(), pending=(), extra_ps=True):
+        outputs = healthy()
+        if extra_ps:
+            outputs[("ps",)] += "\n" + "\n".join(
+                json.dumps({"Service": s, "State": "running"})
+                for s in m.CHANNEL_SERVICES)
+        outputs["sql"] = {"key = 'last_pass'": "2026-10-07T11:59:00Z\n", **sql}
+        outputs[("lnd", "listchannels")] = json.dumps(
+            {"channels": list(channels)})
+        outputs[("lnd", "pendingchannels")] = json.dumps(
+            {"pending_open_channels": [{"channel": c} for c in pending]})
+        return run(outputs, env={"CHANNEL_DONATIONS": "on"})
+
+    def test_channel_donations_off_by_default(self):
+        alerts, runner = run()
+        self.assertFalse(any("channel_orders" in q for q in runner.queries))
+
+    def test_a_healthy_channel_worker(self):
+        order = "AbCdEfGhIjKlMnOpQrSt_-"
+        alerts, _ = self.channels(
+            {"SELECT id, coalesce(channel_point": f"{order}|aa:0\n"},
+            channels=[{"channel_point": "aa:0", "initiator": True,
+                       "memo": f"donation:{order}", "push_amount_sat": "0"},
+                      {"channel_point": "bb:1", "initiator": True,
+                       "memo": "", "push_amount_sat": "0"}],
+            pending=[{"channel_point": "cc:0", "initiator": "INITIATOR_REMOTE",
+                      "memo": "donation:Xx"}])
+        self.assertEqual(alerts, {})
+
+    def test_channel_workers_down_or_stale(self):
+        alerts, _ = self.channels({}, extra_ps=False)
+        self.assertIn("container:donations-channels", alerts)
+        self.assertIn("container:donations-guard", alerts)
+        alerts, _ = self.channels({"key = 'last_pass'": "2026-10-07T11:40:00Z\n"})
+        self.assertIn("since 2026-10-07 11:40 UTC", alerts["channels:stale"].text)
+
+    def test_stuck_unconfirmed_attention_and_budget(self):
+        alerts, _ = self.channels({
+            "'connecting', 'opening')": "o1|connecting|45\n",
+            "funding_confs = 0": "o2|400\n",
+            "received_sat = 0": "60\n",
+            "needs_attention": "o3|unreachable\n",
+        })
+        self.assertIn("connecting for 45 minutes", alerts["channels:stuck:o1"].text)
+        self.assertIn("bumpfee", alerts["channels:unconfirmed:o2"].text)
+        self.assertIn("60 channel donations", alerts["channels:budget"].text)
+        self.assertTrue(alerts["channels:attention:o3"].event)
+
+    def test_the_invariant_on_channels_we_opened(self):
+        order = "AbCdEfGhIjKlMnOpQrSt_-"
+        alerts, _ = self.channels(
+            {"SELECT id, coalesce(channel_point": f"{order}|aa:0\n"},
+            channels=[
+                # A donation memo for an order that has another channel
+                {"channel_point": "dd:0", "initiator": True,
+                 "memo": f"donation:{order}", "push_amount_sat": "0"},
+                # Pushed to the peer
+                {"channel_point": "ee:0", "initiator": True, "memo": "",
+                 "push_amount_sat": "5000"},
+            ],
+            pending=[{"channel_point": "ff:0", "initiator": "INITIATOR_LOCAL",
+                      "memo": "donation:NoSuchOrderXXXXXXXXXXX"}])
+        self.assertIn("channels:unknown:dd:0", alerts)
+        self.assertIn("channels:unknown:ff:0", alerts)
+        self.assertIn("5,000 sat pushed", alerts["channels:push:ee:0"].text)
+        for key in ("channels:unknown:dd:0", "channels:push:ee:0"):
+            self.assertTrue(alerts[key].event)
+
     def test_log_lines_that_need_a_person(self):
         outputs = healthy()
         outputs[("logs", "shim")] = (
@@ -416,6 +484,24 @@ class ReportTest(unittest.TestCase):
         self.assertIn("net (without routing income): 3,021 sat", text)
         self.assertTrue(any("interval '7 days'" in q for q in runner.queries))
         self.assertNotIn("Donations", text)
+
+    def test_report_with_channel_donations(self):
+        outputs = healthy()
+        outputs["sql"] = {
+            "FROM swaps WHERE status IN": "0|0|0|0|0|0\n",
+            "status = 'invoice.settled'": "0|0|0|0\n",
+            '"transactionId" IS NOT NULL': "0\n",
+            "WHERE opened_at >=": "2|3999070\n",
+            "GROUP BY state": "open|3\nfell_back|1\n",
+        }
+        runner = FakeRunner(outputs)
+        text = "\n".join(m.report(m.Monitor(runner, {"CHANNEL_DONATIONS": "on"},
+                                              NOW), 7))
+        self.assertIn("Channel donations\n  last 7 days: 2 opened, "
+                      "3,999,070 sat of capacity", text)
+        self.assertIn("3 open now", text)
+        self.assertIn("1 kept as general donations", text)
+        self.assertNotIn("retrying", text)
 
     def test_report_with_donations(self):
         outputs = healthy()

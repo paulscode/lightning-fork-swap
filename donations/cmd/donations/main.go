@@ -19,6 +19,10 @@
 //	                     check a donor's proof that ADDRESS (one of the
 //	                     transaction's inputs) is theirs
 //	donations check TXID check a transaction now, print the result
+//	donations orders list [--all] | show ID | retry ID | fallback ID
+//	                     channel donations: list the active ones (or all),
+//	                     show one with its timeline, try one again now, or
+//	                     end one as a general donation (its coins released)
 //
 // BLAKE2B_EXPLORERS and SHA256_EXPLORERS (comma-separated Esplora API URLs)
 // default to mempool.guide, and mempool.space then blockstream.info.
@@ -105,6 +109,8 @@ func run(ctx context.Context, args []string, logger *log.Logger) error {
 		return printJSON(result)
 	case "replay":
 		return runReplay(ctx, args[1:])
+	case "orders":
+		return runOrders(ctx, args[1:])
 	}
 	return fmt.Errorf("unknown command %q", args[0])
 }
@@ -133,6 +139,24 @@ func runWorker(ctx context.Context, logger *log.Logger) error {
 	w := &worker.Worker{
 		Store: db, Wallet: wallet, Blake2b: blake2b, Sha256: sha256,
 		Addresses: addresses, Now: time.Now, Logger: logger,
+		// Channel donations' addresses, when there are any
+		MoreAddresses: func(ctx context.Context) ([]string, error) {
+			rows, err := db.Pool.Query(ctx, `SELECT address FROM channel_orders
+				WHERE address IS NOT NULL`)
+			if err != nil {
+				return nil, err
+			}
+			defer rows.Close()
+			var out []string
+			for rows.Next() {
+				var a string
+				if err := rows.Scan(&a); err != nil {
+					return nil, err
+				}
+				out = append(out, a)
+			}
+			return out, rows.Err()
+		},
 	}
 	logger.Printf("watching %d donation address(es) every %ds", len(addresses), seconds)
 	w.Run(ctx, time.Duration(seconds)*time.Second)

@@ -78,6 +78,10 @@ class Allowlist(unittest.TestCase):
             ("POST", "/v2/swap/restore", 9005),
             ("GET", "/donate/v1/health", 9010),
             ("GET", "/donate/v1/replay/" + "ab" * 32, 9010),
+            ("GET", "/donate/v1/info", 9010),
+            ("POST", "/donate/v1/channel-orders", 9010),
+            ("GET", "/donate/v1/channel-orders/AbCdEfGhIjKlMnOpQrSt_-", 9010),
+            ("PATCH", "/donate/v1/channel-orders/AbCdEfGhIjKlMnOpQrSt_-/node", 9010),
         ]:
             with self.subTest(method=method, path=path):
                 status, _, raw = request(method, path, body="{}"
@@ -105,6 +109,12 @@ class Allowlist(unittest.TestCase):
             ("GET", "/donate/v1/replay/ab"),
             ("GET", "/donate/v1/replays"),
             ("GET", "/donate/v1/"),
+            ("GET", "/donate/v1/channel-orders"),
+            ("DELETE", "/donate/v1/channel-orders/AbCdEfGhIjKlMnOpQrSt_-"),
+            ("POST", "/donate/v1/channel-orders/AbCdEfGhIjKlMnOpQrSt_-"),
+            ("PATCH", "/donate/v1/channel-orders/AbCdEfGhIjKlMnOpQrSt_-"),
+            ("GET", "/donate/v1/channel-orders/short"),
+            ("PUT", "/donate/v1/channel-orders/AbCdEfGhIjKlMnOpQrSt_-/node"),
         ]:
             with self.subTest(method=method, path=path):
                 status, _, _ = request(method, path)
@@ -278,7 +288,16 @@ class RateLimits(unittest.TestCase):
                     for _ in range(8)]
         self.assertIn(503, statuses)
         self.assertEqual(statuses[0], 200)
+        # Creating a channel donation counts against the same limit
+        status, _, _ = request("POST", "/donate/v1/channel-orders", body="{}")
+        self.assertEqual(status, 503)
 
+
+    def test_a_big_body_is_refused(self):
+        status, _, _ = request("PATCH",
+                               "/donate/v1/channel-orders/AbCdEfGhIjKlMnOpQrSt_-/node",
+                               body="x" * 5000)
+        self.assertEqual(status, 413)
 
     def test_the_donations_api_is_limited(self):
         path = "/donate/v1/replay/" + "cd" * 32

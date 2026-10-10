@@ -114,7 +114,10 @@ memory; a `channel.backup` the hourly copy missed; the TLS certificate close
 to expiry. The rebalancer reports its own moves and problems the same way. With a donation address set: the donation services down, the
 donation watcher not passing for 30 minutes, and once each, a donation sent
 without replay protection, one replayed on the SHA256 chain, and one that
-could not be judged in a day. It also says once a day that it runs, so silence means it does not.
+could not be judged in a day. With channel donations on: their worker
+and guard down or the worker not passing, orders stuck, a funding
+transaction unconfirmed for 6 hours, a donor who needs to act, and at once
+a channel we opened that is no donation's or pushed coins to its peer. It also says once a day that it runs, so silence means it does not.
 
 Set `ALERT_WEBHOOK_URL` and `ALERT_WEBHOOK_KIND` in `.env` (see
 `.env.example`), then check delivery:

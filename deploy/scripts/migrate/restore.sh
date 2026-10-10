@@ -118,6 +118,7 @@ log "the backend and the donation services, with macaroons of the restored lnd"
 dc up -d boltz donations-worker donations-api
 wait_for "the backend" 60 curl -sf http://127.0.0.1:9001/version
 wait_for "the donations API" 60 curl -sf http://127.0.0.1:9010/donate/v1/health
+if [ "${CHANNEL_DONATIONS:-off}" = on ]; then dc up -d donations-guard donations-channels; fi
 install_crons
 
 cat <<MSG

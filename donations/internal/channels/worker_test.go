@@ -490,6 +490,33 @@ func TestAnEditRescuesAnUnreachableNode(t *testing.T) {
 	}
 }
 
+func TestTheOperatorRetriesOrFallsBack(t *testing.T) {
+	h := newHarness(t)
+	id := h.order(donorNode, "91.190.100.61:9735")
+	h.pass()
+	h.lnd.pay(h.get(id).Address, 2_000_000, 3)
+	h.pass()
+	h.lnd.reachable["91.190.100.61:9735"] = true
+	_ = h.store.AddRequest(context.Background(), Request{OrderID: id, Kind: "retry"})
+	h.pass()
+	if o := h.get(id); o.State != FundingBroadcast {
+		t.Fatalf("%s", o.State)
+	}
+	delete(h.lnd.peers, donorNode) // so the next one must dial, and fails
+	id = h.order(donorNode, "91.190.100.62:9735")
+	h.pass()
+	h.lnd.pay(h.get(id).Address, 2_000_000, 3)
+	h.pass()
+	if o := h.get(id); o.State != Retrying {
+		t.Fatalf("%s", o.State)
+	}
+	_ = h.store.AddRequest(context.Background(), Request{OrderID: id, Kind: "fallback"})
+	h.pass()
+	if o := h.get(id); o.State != FellBack || o.ErrorCode != "operator" || h.lnd.leases[o.Utxos[0].Outpoint] {
+		t.Fatalf("%s %s", o.State, o.ErrorCode)
+	}
+}
+
 func TestTheDonorIsAskedToActWhenOnlyTheyCan(t *testing.T) {
 	cases := map[string]func(h *harness) (node, addr string){
 		ErrNotForkNode: func(h *harness) (string, string) {

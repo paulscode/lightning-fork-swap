@@ -27,8 +27,10 @@ type Worker struct {
 	Blake2b   replay.Explorer
 	Sha256    replay.Explorer
 	Addresses map[string]bool
-	Now       func() time.Time
-	Logger    *log.Logger
+	// More addresses to watch, read each pass (channel donations' own)
+	MoreAddresses func(ctx context.Context) ([]string, error)
+	Now           func() time.Time
+	Logger        *log.Logger
 }
 
 const (
@@ -61,12 +63,25 @@ func (w *Worker) find(ctx context.Context) error {
 	if err != nil {
 		return err
 	}
+	addresses := w.Addresses
+	if w.MoreAddresses != nil {
+		// Without them (no channel donations table) the fixed ones still count
+		if more, err := w.MoreAddresses(ctx); err == nil && len(more) > 0 {
+			addresses = map[string]bool{}
+			for a := range w.Addresses {
+				addresses[a] = true
+			}
+			for _, a := range more {
+				addresses[a] = true
+			}
+		}
+	}
 	newest := start
 	for _, tx := range txs {
 		if !esplora.ValidTxid(tx.TxHash) {
 			continue
 		}
-		if to, amount := tx.Paid(w.Addresses); amount > 0 {
+		if to, amount := tx.Paid(addresses); amount > 0 {
 			if err := w.Store.AddDonation(ctx, tx.TxHash, to, amount); err != nil {
 				return err
 			}

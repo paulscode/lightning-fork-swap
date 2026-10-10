@@ -687,6 +687,20 @@ func (w *Worker) applyRequests(ctx context.Context) error {
 	now := w.Now()
 	for _, r := range reqs {
 		o, err := w.Store.GetOrder(ctx, r.OrderID)
+		// The operator's (donations orders retry|fallback)
+		if err == nil && r.Kind == "retry" && (o.State == Retrying || o.State == NeedsAttention) {
+			o.State, o.NextAttempt, o.AttentionSince, o.FailingSince = Connecting, nil, nil, nil
+			o.Attempts, o.ErrorCode = 0, ""
+			if err := w.Store.Save(ctx, o, event(now, "retry_now", nil)); err != nil {
+				return err
+			}
+		}
+		if err == nil && r.Kind == "fallback" && !o.State.Final() && o.State != Open &&
+			o.State != FundingBroadcast && o.State != Opening {
+			if err := w.Store.Save(ctx, o, w.fallBack(ctx, &o, now, "operator")...); err != nil {
+				return err
+			}
+		}
 		if err == nil && r.Kind == "node" && o.State.Editable() {
 			o.NodePubkey, o.NodeAddr, o.NodeInput, o.NodeAlias = r.Node, r.Addr, r.Input, ""
 			o.Attempts, o.ErrorCode, o.AttentionSince, o.FailingSince = 0, "", nil, nil

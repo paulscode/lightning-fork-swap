@@ -352,6 +352,63 @@ less the miner fee, once per donation transaction, and note it.
 The rest of the SHA256-chain coins (replays nobody asked about) stay where
 they are; the donation address is never reused for anything else.
 
+### Channel donations
+
+A donor can ask for their donation to open a channel from our node to
+theirs. Each such donation gets its own lnd address; once 3 confirmations
+bring at least 1,000,000 sat plus the funding fee, the worker opens a
+public channel from exactly those coins (all of them, up to
+`CHANNEL_MAX_SAT`, the rest staying in lnd's wallet). It is best effort and
+nothing is refunded: if the channel cannot be opened (the node unreachable
+for 48 hours, or waiting 7 days for the donor to fix its details), the
+coins stay in lnd's wallet as a general donation.
+
+What keeps it safe: the worker (`donations-channels`) has no listening
+port and a macaroon that lnd honours only while the guard
+(`donations-guard`) checks every call made with it. The guard allows only
+the calls the worker needs, and opens only from coins leased to the
+donations (or released by them a moment before), with nothing pushed to
+the peer, no address of theirs to close to, a `donation:<id>` memo, a
+capped size and fee rate. If the guard stops, lnd refuses the worker's
+macaroon and nothing else. The public API only inserts an order or an edit
+request into the database; it never talks to lnd.
+
+Turning it on (it needs lnd restarted once, a few minutes without swaps):
+
+1. `./scripts/migrate/maintenance.sh on`, then `./scripts/setup.sh`
+   (renders `rpcmiddleware.enable=true` into lnd.conf) and
+   `docker compose restart lnd`; wait for `$L getinfo`.
+2. `./scripts/bake-macaroon.sh` (bakes `channels.macaroon` and
+   `guard.macaroon` if missing), then `./scripts/migrate/maintenance.sh off`.
+3. In `.env`: `CHANNEL_DONATIONS=on` and `COMPOSE_PROFILES=channels`; then
+   `docker compose up -d` (starts the guard and the worker, and the API
+   with the channel routes). `docker compose logs donations-guard` says
+   "registered with lnd".
+
+```sh
+D="docker compose exec -T donations-channels /donations"
+$D orders list [--all]                  # the active ones (or all)
+$D orders show <id>                     # the order and its timeline
+$D orders retry <id>                    # try again now (a node that is back)
+$D orders fallback <id>                 # end it as a general donation
+```
+
+The monitor alerts when the worker stops passing, an order is stuck
+before its channel, a funding transaction is unconfirmed after 6 hours
+(bump it with `$L wallet bumpfee`), half of the 100 unpaid orders allowed
+are waiting, once when a donor needs to act, and at once if a channel we
+opened says it is a donation that has no such channel, or pushed coins to
+the peer. On either of the last two: `COMPOSE_PROFILES=` in `.env`,
+`docker compose stop donations-channels donations-guard`, and revoke the
+worker's macaroon (`$L deletemacaroonid 3`) before looking.
+
+Turning it off: `CHANNEL_DONATIONS=off` and `COMPOSE_PROFILES=` in `.env`,
+`docker compose stop donations-channels donations-guard`, and
+`docker compose up -d donations-api`. Orders in progress stay in the
+database; their leased coins return to lnd's wallet when the leases end
+(14 days), or at once with
+`$L wallet releaseoutput --lockid 958afdf67e885dc76265f3739ff7500f25f8efdb14e6d0b28d4ea01002c3971c <txid:index>`.
+
 ## 9. Routine
 
 | When | What |

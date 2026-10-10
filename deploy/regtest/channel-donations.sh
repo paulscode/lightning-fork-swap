@@ -83,8 +83,9 @@ common=(--network "$NET" -v "$work:/lnd:ro" -e LND_TLS_CERT=/lnd/tls.cert
 	-e LND_REST_URL=https://lnd-swap:8080 -e LND_GRPC=lnd-swap:10009)
 docker run -d --name lfswap-cd-guard "${common[@]}" -e GUARD_MACAROON=/lnd/guard.macaroon \
 	"$IMAGE" guard >/dev/null
-sleep 2
-docker logs lfswap-cd-guard 2>&1 | grep -q "registered with lnd" || { docker logs lfswap-cd-guard; fail "the guard did not register"; }
+registered() { docker logs lfswap-cd-guard 2>&1 | grep -q "registered with lnd"; }
+for _ in $(seq 1 30); do registered && break; sleep 1; done
+registered || { docker logs lfswap-cd-guard; fail "the guard did not register"; }
 ok "the guard registered with lnd"
 docker run -d --name lfswap-cd-channels "${common[@]}" -e CHANNELS_MACAROON=/lnd/channels.macaroon \
 	-e DONATIONS_DB_URL="postgres://donations_worker:$W@postgres:5432/donations?sslmode=disable" \

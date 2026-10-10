@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"fmt"
 	"log"
 	"net"
 	"strconv"
@@ -119,4 +120,70 @@ func runGuard(ctx context.Context, logger *log.Logger) error {
 	logger.Printf("guard: channels up to %d sat, fees up to %d sat/vB", p.MaxChannelSat, p.MaxFeeRate)
 	guard.Run(ctx, conn, p, logger)
 	return nil
+}
+
+func runOrders(ctx context.Context, args []string) error {
+	if len(args) == 0 {
+		return fmt.Errorf("usage: donations orders list [--all] | show ID | retry ID | fallback ID")
+	}
+	pool, err := pgxpool.New(ctx, env("DONATIONS_DB_URL", ""))
+	if err != nil {
+		return err
+	}
+	defer pool.Close()
+	s := &channels.Postgres{Pool: pool}
+	switch args[0] {
+	case "list":
+		all := len(args) > 1 && args[1] == "--all"
+		q := `SELECT id, state, node_pubkey, received_sat, capacity_sat, error_code, updated_at
+			FROM channel_orders`
+		if !all {
+			q += ` WHERE state NOT IN ('fell_back', 'closed', 'expired', 'rejected')`
+		}
+		rows, err := pool.Query(ctx, q+` ORDER BY created_at`)
+		if err != nil {
+			return err
+		}
+		defer rows.Close()
+		for rows.Next() {
+			var id, state, node, code string
+			var received, capacity int64
+			var updated time.Time
+			if err := rows.Scan(&id, &state, &node, &received, &capacity, &code, &updated); err != nil {
+				return err
+			}
+			fmt.Printf("%s  %-18s %s…  received %d  channel %d  %s  %s\n", id, state,
+				node[:16], received, capacity, code, updated.UTC().Format("2006-01-02 15:04"))
+		}
+		return rows.Err()
+	case "show":
+		if len(args) != 2 {
+			return fmt.Errorf("usage: donations orders show ID")
+		}
+		o, err := s.GetOrder(ctx, args[1])
+		if err != nil {
+			return err
+		}
+		events, err := s.Events(ctx, args[1])
+		if err != nil {
+			return err
+		}
+		o.SecretHash = ""
+		return printJSON(map[string]any{"order": o, "timeline": events})
+	case "retry", "fallback":
+		if len(args) != 2 {
+			return fmt.Errorf("usage: donations orders %s ID", args[0])
+		}
+		o, err := s.GetOrder(ctx, args[1])
+		if err != nil {
+			return err
+		}
+		if err := s.AddRequest(ctx, channels.Request{OrderID: o.ID, Kind: args[0],
+			Node: o.NodePubkey}); err != nil {
+			return err
+		}
+		fmt.Printf("asked the worker to %s %s (now %s)\n", args[0], o.ID, o.State)
+		return nil
+	}
+	return fmt.Errorf("unknown command %q", args[0])
 }

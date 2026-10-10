@@ -37,7 +37,7 @@ func policy() Policy {
 func goodOpen() *lnrpc.OpenChannelRequest {
 	return &lnrpc.OpenChannelRequest{
 		NodePubkey: peer, LocalFundingAmount: 2_000_000, SatPerVbyte: 3,
-		Memo: "donation:abc",
+		Memo: "donation:AbCdEfGhIjKlMnOpQrSt_-",
 		Outpoints: []*lnrpc.OutPoint{
 			{TxidStr: coinA, OutputIndex: 0}, {TxidStr: coinB, OutputIndex: 1}},
 	}
@@ -143,7 +143,8 @@ func TestUnknownFieldsAndTypesAreRefused(t *testing.T) {
 	}
 	op, _ := proto.Marshal(&lnrpc.OutPoint{TxidStr: coinA})
 	op = protowire.AppendVarint(protowire.AppendTag(op, 9, protowire.VarintType), 1)
-	b, _ := proto.Marshal(&lnrpc.OpenChannelRequest{NodePubkey: peer, LocalFundingAmount: 1, SatPerVbyte: 1})
+	b, _ := proto.Marshal(&lnrpc.OpenChannelRequest{NodePubkey: peer, LocalFundingAmount: 1, SatPerVbyte: 1,
+		Memo: "donation:AbCdEfGhIjKlMnOpQrSt_-"})
 	b = protowire.AppendBytes(protowire.AppendTag(b, 28, protowire.BytesType), op)
 	msg = &lnrpc.RPCMessage{MethodFullUri: "/lnrpc.Lightning/OpenChannelSync",
 		TypeName: "lnrpc.OpenChannelRequest", Serialized: b}

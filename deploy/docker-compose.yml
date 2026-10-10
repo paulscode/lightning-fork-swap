@@ -204,8 +204,73 @@ services:
     environment:
       DONATIONS_DB_URL: postgres://donations_api:${DONATIONS_API_DBPASSWORD:?run scripts/setup.sh}@postgres:5432/donations?sslmode=disable
       LISTEN: ":9010"
+      # on: the channel donation routes too (it may then insert an order or
+      # an edit request, and nothing else)
+      CHANNEL_DONATIONS: ${CHANNEL_DONATIONS:-off}
+      CHANNEL_MAX_SAT: ${CHANNEL_MAX_SAT:-}
+      CHANNEL_MAX_WUMBO_SAT: ${CHANNEL_MAX_WUMBO_SAT:-}
     ports:
       - "127.0.0.1:9010:9010"
+    logging: *logging
+    mem_limit: 64m
+
+  # Channel donations (profile "channels": COMPOSE_PROFILES=channels in
+  # .env). The guard is lnd's middleware for the worker's macaroon: it holds
+  # the only macaroon that may register one, apart from the worker, so a
+  # compromised worker cannot replace it with a permissive one.
+  donations-guard:
+    image: lfswap/donations:dev
+    profiles: [channels]
+    security_opt: [no-new-privileges:true]
+    read_only: true
+    restart: unless-stopped
+    command: ["guard"]
+    depends_on:
+      lnd: {condition: service_healthy}
+    environment:
+      LND_GRPC: lnd:10009
+      LND_REST_URL: https://lnd:8080
+      LND_TLS_CERT: /lnd/tls.cert
+      GUARD_MACAROON: /lnd/guard.macaroon
+      CHANNEL_MAX_SAT: ${CHANNEL_MAX_SAT:-}
+      CHANNEL_MAX_WUMBO_SAT: ${CHANNEL_MAX_WUMBO_SAT:-}
+    volumes:
+      - ${LFSWAP_ROOT:-/srv/lfswap}/lnd/tls.cert:/lnd/tls.cert:ro
+      - type: bind
+        source: ${LFSWAP_ROOT:-/srv/lfswap}/lnd/guard.macaroon
+        target: /lnd/guard.macaroon
+        read_only: true
+        bind: {create_host_path: false}
+    logging: *logging
+    mem_limit: 64m
+
+  # The channel donation worker: hands out addresses, opens the channels.
+  # No listening port; its macaroon works only while the guard is there.
+  donations-channels:
+    image: lfswap/donations:dev
+    profiles: [channels]
+    security_opt: [no-new-privileges:true]
+    read_only: true
+    restart: unless-stopped
+    command: ["channels"]
+    depends_on:
+      postgres: {condition: service_started}
+      lnd: {condition: service_healthy}
+      donations-guard: {condition: service_started}
+    environment:
+      DONATIONS_DB_URL: postgres://donations_worker:${DONATIONS_WORKER_DBPASSWORD:?run scripts/setup.sh}@postgres:5432/donations?sslmode=disable
+      LND_REST_URL: https://lnd:8080
+      LND_TLS_CERT: /lnd/tls.cert
+      CHANNELS_MACAROON: /lnd/channels.macaroon
+      CHANNEL_MAX_SAT: ${CHANNEL_MAX_SAT:-}
+      CHANNEL_MAX_WUMBO_SAT: ${CHANNEL_MAX_WUMBO_SAT:-}
+    volumes:
+      - ${LFSWAP_ROOT:-/srv/lfswap}/lnd/tls.cert:/lnd/tls.cert:ro
+      - type: bind
+        source: ${LFSWAP_ROOT:-/srv/lfswap}/lnd/channels.macaroon
+        target: /lnd/channels.macaroon
+        read_only: true
+        bind: {create_host_path: false}
     logging: *logging
     mem_limit: 64m
 

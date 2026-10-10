@@ -13,6 +13,7 @@ import (
 	"encoding/hex"
 	"errors"
 	"fmt"
+	"regexp"
 	"strings"
 	"sync"
 	"time"
@@ -125,6 +126,8 @@ func DefaultPolicy() Policy {
 		MaxLeaseSeconds: 14 * 24 * 3600}
 }
 
+var donationMemo = regexp.MustCompile(`^donation:[A-Za-z0-9_-]{22}$`)
+
 // ErrRefused prefixes every refusal.
 var ErrRefused = errors.New("refused by the donations guard")
 
@@ -227,8 +230,10 @@ func (p Policy) openChannel(ctx context.Context, r *lnrpc.OpenChannelRequest) er
 		return refuse("channel parameters must be lnd's defaults")
 	case len(r.NodePubkey) != 33 || r.NodePubkeyString != "":
 		return refuse("node by its 33-byte key only")
-	case len(r.Memo) > 500:
-		return refuse("memo too long")
+	case !donationMemo.MatchString(r.Memo):
+		// Every channel the worker opens says which donation it is: the
+		// monitor checks each against the orders
+		return refuse("memo must be donation:<order id>")
 	}
 	seen := map[string]bool{}
 	for _, op := range r.Outpoints {
