@@ -329,6 +329,7 @@ On a workstation with Docker, none of them touching production:
 deploy/nginx/test/run.sh                    # the nginx config, in the host's nginx 1.22.1
 python3 -m unittest discover -s deploy/monitor
 python3 -m unittest discover -s deploy/rebalance
+deploy/scripts/test/channel-donations-test.sh   # the channel donations switch
 (cd shim && go test -race ./...)
 (cd donations && go test ./...)             # DONATIONS_TEST_DB=postgres://... also tests the store
 (cd graph && go test ./...)                 # GRAPH_BIG=1: the 100,000-node budgets
