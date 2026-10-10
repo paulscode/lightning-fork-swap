@@ -459,6 +459,14 @@ scenarios.network = async () => {
   await page.waitForFunction((name) => document.querySelector('[data-testid=sky-panel] h2')?.textContent?.includes(name), target);
   await page.waitForTimeout(1500);
   await screenshot(page, 'network-selected');
+  // Escape goes home; arrows walk our node's neighbours
+  await page.keyboard.press('Escape');
+  await page.waitForFunction((name) => document.querySelector('[data-testid=sky-panel] h2')?.textContent?.includes(name), first);
+  await page.keyboard.press('ArrowRight');
+  await page.waitForFunction((name) => !document.querySelector('[data-testid=sky-panel] h2')?.textContent?.includes(name), first);
+  const neighbourOne = (await panel.locator('h2').textContent()).trim();
+  await page.keyboard.press('ArrowRight');
+  await page.waitForFunction((name) => !document.querySelector('[data-testid=sky-panel] h2')?.textContent?.includes(name), neighbourOne);
   await page.click('[data-testid=sky-home]');
   await page.waitForFunction((name) => document.querySelector('[data-testid=sky-panel] h2')?.textContent?.includes(name), first);
   assertNoProblems(problems, 'network');
