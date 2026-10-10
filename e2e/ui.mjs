@@ -484,6 +484,37 @@ scenarios.network = async () => {
   return `the sky of ${nodes} nodes drawn, ${first} first, ${target} found and selected, a phone with reduced motion`;
 };
 
+// The home page: the sky behind, the network's numbers, the swap card; on
+// a phone the sky band, then the card, then the words, nothing wider than
+// the screen. Needs graph files at /graph/ (as for network).
+scenarios.home = async () => {
+  const { context, page, problems } = await newPage({ viewport: { width: 1366, height: 860 } });
+  await page.goto(`${SITE}/`);
+  const stats = await page.locator('[data-testid=home-stats]').textContent({ timeout: 30_000 });
+  await page.waitForTimeout(1500);
+  await screenshot(page, 'home-desktop');
+  const card = await page.locator('#create-overlay').boundingBox();
+  const intro = await page.locator('[data-testid=home-intro]').boundingBox();
+  if (!(card.x > intro.x && Math.abs(card.y + card.height / 2 - (intro.y + intro.height / 2)) < 300)) {
+    throw new Error('desktop: the card is not beside the words');
+  }
+  assertNoProblems(problems, 'home');
+  await context.close();
+  const phone = await newPage({ ...devices['Pixel 7'] });
+  await phone.page.goto(`${SITE}/`);
+  await phone.page.locator('[data-testid=home-stats]').waitFor({ timeout: 30_000 });
+  const pcard = await phone.page.locator('#create-overlay').boundingBox();
+  const pintro = await phone.page.locator('[data-testid=home-intro]').boundingBox();
+  const ptap = await phone.page.locator('[data-testid=home-tap]').boundingBox();
+  if (!(ptap && pcard.y < pintro.y && pcard.y > ptap.y)) throw new Error('phone: not sky, card, words');
+  const width = await phone.page.evaluate(() => document.documentElement.scrollWidth);
+  if (width > phone.page.viewportSize().width) throw new Error(`phone: ${width} px wide`);
+  await screenshot(phone.page, 'home-phone');
+  assertNoProblems(phone.problems, 'home (phone)');
+  await phone.context.close();
+  return `home: ${stats.trim()}; card beside the words, on a phone below the sky`;
+};
+
 // --- run -------------------------------------------------------------------
 
 const only = process.argv.slice(2);
