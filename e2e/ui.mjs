@@ -10,13 +10,14 @@
 //   node ui.mjs reverse               one by name
 //
 // Chrome (channel "chrome") must be installed; screenshots go to
-// $UI_SHOTS (default /tmp/lfswap-ui).
+// $UI_SHOTS (default /tmp/lfswap-ui). The donate scenario also needs
+// VITE_DONATION_ADDRESS and VITE_OUR_NODE in the build (see it below).
 
 import { execFileSync } from 'node:child_process';
 import { mkdirSync, readFileSync } from 'node:fs';
 import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
-import { chromium } from 'playwright-core';
+import { chromium, devices } from 'playwright-core';
 
 const SITE = process.env.SITE ?? 'https://localhost:18443';
 const SHOTS = process.env.UI_SHOTS ?? '/tmp/lfswap-ui';
@@ -77,11 +78,12 @@ const browser = await chromium.launch({
   args: ['--ignore-certificate-errors'],
 });
 
-const newPage = async () => {
+const newPage = async (options = {}) => {
   const context = await browser.newContext({
     ignoreHTTPSErrors: true,
     acceptDownloads: true,
     viewport: { width: 1280, height: 1000 },
+    ...options,
   });
   const problems = [];
   await context.addInitScript(() => {
@@ -311,6 +313,79 @@ scenarios.rescue = async () => {
     throw new Error(`refunded ${refunded} sat of ${failedLocked}`);
   }
   return `refunded ${refunded} of ${failedLocked} sat of swap ${failedId} from the rescue page, with only the key file`;
+};
+
+// The donation window, on a desktop and on a phone, under the production
+// Content-Security-Policy, with an accessibility check. Needs a build with
+// VITE_DONATION_ADDRESS and VITE_OUR_NODE (the regtest swap node's address
+// and URI). Regtest has no explorer: the thank-you and the totals are left
+// to the unit tests.
+const axeSource = readFileSync(join(dirname(fileURLToPath(import.meta.url)), 'node_modules', 'axe-core', 'axe.min.js'), 'utf8');
+const accessibility = async (url, options = {}) => {
+  // axe is injected as a script: only in a context without the policy
+  const { context, page } = await newPage({ ...options, bypassCSP: true });
+  await page.goto(url);
+  await page.locator('#donate-modal').waitFor();
+  await page.addScriptTag({ content: axeSource });
+  const result = await page.evaluate(() =>
+    window.axe.run('#donate-modal', { runOnly: ['wcag2a', 'wcag2aa', 'wcag21a', 'wcag21aa'] }),
+  );
+  await context.close();
+  const serious = result.violations.filter((v) => v.impact === 'serious' || v.impact === 'critical');
+  if (serious.length > 0) {
+    throw new Error(`accessibility: ${serious.map((v) => `${v.id} (${v.nodes.length}): ${v.help}`).join('; ')}`);
+  }
+  return result.violations.length;
+};
+
+scenarios.donate = async () => {
+  const swapNode = lncli('lnd-swap', 'getinfo').identity_pubkey;
+  const { context, page, problems } = await newPage();
+  await page.goto(`${SITE}/donate`);
+  const onchain = page.locator('[data-testid=donate-onchain]');
+  await onchain.waitFor({ timeout: 30_000 });
+  const address = (await page.locator('[data-testid=donate-address]').textContent()).trim();
+  if (!/^bcrt1/.test(address)) throw new Error(`donation address ${address}`);
+  const qr = page.locator('#donate-modal #qrcode img');
+  await page.waitForFunction(() => document.querySelector('#donate-modal #qrcode img')?.src.startsWith('data:image/png'));
+  const plain = await qr.getAttribute('src');
+  await page.click('[data-testid=donate-preset-100000]');
+  await page.waitForFunction((before) => document.querySelector('#donate-modal #qrcode img')?.src !== before, plain);
+  await screenshot(page, 'donate-desktop');
+  if (await page.locator('#donate-modal').evaluate((e) => getComputedStyle(e).position) !== 'fixed') {
+    throw new Error('the donation window is not an overlay');
+  }
+
+  await page.click('[data-testid=donate-tab-channel]');
+  const channel = page.locator('[data-testid=donate-channel]');
+  await channel.waitFor();
+  const text = await channel.textContent();
+  if (!text.includes(`${swapNode}@`)) throw new Error(`the channel tab does not give the swap node: ${text.slice(0, 200)}`);
+  await screenshot(page, 'donate-channel');
+  await page.keyboard.press('Escape');
+  await page.locator('#donate-modal').waitFor({ state: 'detached' });
+  assertNoProblems(problems, 'donate');
+  await context.close();
+
+  // A phone: a bottom sheet, and a link that opens the wallet
+  const phone = await newPage({ ...devices['Pixel 7'] });
+  await phone.page.goto(`${SITE}/?donate=onchain`);
+  await phone.page.locator('[data-testid=donate-onchain]').waitFor({ timeout: 30_000 });
+  // Measured once the sheet has slid in
+  await phone.page.waitForFunction(() => document.getAnimations().every((a) => a.playState !== 'running'));
+  const pageWidth = await phone.page.evaluate(() => document.documentElement.scrollWidth);
+  if (pageWidth > phone.page.viewportSize().width) throw new Error(`the page is ${pageWidth} px wide on a phone`);
+  const box = await phone.page.locator('.donate-panel').boundingBox();
+  const height = phone.page.viewportSize().height;
+  if (Math.abs(box.y + box.height - height) > 2) throw new Error(`not a bottom sheet: ${JSON.stringify(box)} in ${height}`);
+  const wallet = await phone.page.locator('.donate-open-wallet').getAttribute('href');
+  if (!wallet?.startsWith(`bitcoin:${address}`)) throw new Error(`open in wallet: ${wallet}`);
+  await screenshot(phone.page, 'donate-phone');
+  assertNoProblems(phone.problems, 'donate (phone)');
+  await phone.context.close();
+
+  const minor = (await accessibility(`${SITE}/donate`)) + (await accessibility(`${SITE}/?donate=channel`, { ...devices['Pixel 7'] }));
+  return `donation window to ${address.slice(0, 12)}..., channel tab with ${swapNode.slice(0, 10)}..., a bottom sheet on a phone, no serious accessibility findings (${minor} minor)`;
 };
 
 // --- run -------------------------------------------------------------------

@@ -31,6 +31,7 @@ up)
 		-e "s#server 127.0.0.1:9001#server 127.0.0.1:19001#" \
 		-e "s#server 127.0.0.1:9004#server 127.0.0.1:19004#" \
 		-e "s#server 127.0.0.1:9005#server 127.0.0.1:19005#" \
+		-e "s#server 127.0.0.1:9010#server 127.0.0.1:19010#" \
 		-e "s#listen 443 ssl http2;#listen 127.0.0.1:18443 ssl http2;#" \
 		-e "s#listen 443 ssl default_server;#listen 127.0.0.1:18443 ssl default_server;#" \
 		-e "/listen \[::\]/d" \
