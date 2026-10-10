@@ -13,7 +13,11 @@ printf '#!/bin/sh\necho baked >> "%s/calls"\n' "$work" > "$work/deploy/scripts/b
 cat > "$work/bin/compose" <<STUB
 #!/bin/sh
 echo "compose \$*" >> "$work/calls"
-case "\$1" in logs) [ -f "$work/registered" ] && echo "registered with lnd for the caveat";; esac
+case "\$1" in
+logs) [ -f "$work/registered" ] && echo "registered with lnd for the caveat"
+      [ -f "$work/ended" ] && echo "stream ended: EOF";;
+ps) [ -f "$work/running" ] && echo 1234abcd;;
+esac
 exit 0
 STUB
 cat > "$work/bin/curl" <<STUB
@@ -30,7 +34,7 @@ fail() { echo "FAIL: $*" >&2; exit 1; }
 printf 'NETWORK=mainnet\nCOMPOSE_PROFILES=extra\n' > "$work/deploy/.env"
 
 # On: both keys, the services, the API recreated
-touch "$work/registered" "$work/available"
+touch "$work/registered" "$work/available" "$work/running"
 out=$(run on)
 grep -q "channel donations on" <<<"$out" || fail "on"
 env | grep -qx "CHANNEL_DONATIONS=on" || fail "CHANNEL_DONATIONS after on: $(env)"
@@ -47,6 +51,13 @@ echo 'rpcmiddleware.enable=true' > "$work/root/lnd/lnd.conf"
 out=$(run status)
 grep -q "guard: registered" <<<"$out" || fail "status: $out"
 grep -q "middleware chain on" <<<"$out" || fail "status lnd.conf: $out"
+
+# A stopped guard, or one whose stream ended, is not registered
+rm -f "$work/running"
+grep -q "guard: not registered" <<<"$(run status)" || fail "a stopped guard counted"
+touch "$work/running" "$work/ended"
+grep -q "guard: not registered" <<<"$(run status)" || fail "an ended stream counted"
+rm -f "$work/ended"
 
 # Off: keys back, services stopped, other profiles kept
 : > "$work/calls"

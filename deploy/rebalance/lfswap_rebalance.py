@@ -656,7 +656,8 @@ def main(argv, runner=None, now=None):
     if os.path.exists(os.path.join(root, "MIGRATED")):
         print(f"{stamp} this host was migrated away; nothing to move")
         return 0
-    if maintenance_on():
+    # Maintenance pauses moves; --status still tells
+    if maintenance_on() and "--status" not in argv:
         print(f"{stamp} maintenance mode: nothing moves")
         return 0
 

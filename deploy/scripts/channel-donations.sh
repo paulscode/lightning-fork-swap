@@ -45,7 +45,13 @@ profiles() {
 	echo "${out[*]}"
 }
 
-registered() { $COMPOSE logs --no-color donations-guard 2>&1 | grep -q "registered with lnd"; }
+# The guard runs and its last word on lnd is that it registered (not that
+# its stream ended)
+registered() {
+	[ -n "$($COMPOSE ps -q --status running donations-guard 2>/dev/null)" ] || return 1
+	$COMPOSE logs --no-color donations-guard 2>&1 |
+		grep -E "registered with lnd|stream ended" | tail -1 | grep -q "registered with lnd"
+}
 available() { curl -sf "$API/donate/v1/info" 2>/dev/null | grep -q '"available":true'; }
 
 status() {

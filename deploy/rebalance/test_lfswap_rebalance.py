@@ -465,6 +465,8 @@ class MainTest(unittest.TestCase):
         os.remove(os.path.join(self.root, "MIGRATED"))
         with mock.patch.object(r, "maintenance_on", lambda: True):
             r.main([], runner=world, now=NOW)
+            # --status still reports, and moves nothing
+            self.assertEqual(r.main(["--status"], runner=world, now=NOW), 0)
         self.assertEqual(world.sent, [])
 
     def test_bad_bands_refuse_to_run_and_say_so(self):
