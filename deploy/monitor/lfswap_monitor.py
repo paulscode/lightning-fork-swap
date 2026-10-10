@@ -700,6 +700,21 @@ def donation_lines(m, days):
     return lines
 
 
+def rebalance_block(env, root, days, now, telemetry):
+    """The on-chain rebalancer's moves, fees and time below the floors, when
+    it runs (deploy/rebalance)."""
+    if (env.get("REBALANCE_MODE") or "off") == "off":
+        return []
+    sys.path.insert(0, os.path.join(os.path.dirname(os.path.dirname(
+        os.path.abspath(__file__))), "rebalance"))
+    import lfswap_rebalance
+    state = lfswap_rebalance.load_state(
+        os.path.join(root, "rebalance", "state.json"))
+    lines = lfswap_rebalance.report_lines(state, days, now, telemetry, env)
+    lines[0] += f" ({env['REBALANCE_MODE']})"
+    return lines
+
+
 def telemetry_path(root):
     return os.path.join(root, "telemetry", "telemetry.db")
 
@@ -878,11 +893,15 @@ def main(argv):
             days = int(argv[argv.index("--days") + 1])
         monitor = Monitor(Runner(DEPLOY), env, now, network)
         lines = report(monitor, days)
+        t = None
         if os.path.exists(telemetry_path(root)):
             t = lfswap_telemetry.Telemetry(telemetry_path(root))
-            try:
+        try:
+            if t is not None:
                 lines += lfswap_telemetry.sizing_block(t, env, now)
-            finally:
+            lines += rebalance_block(env, root, days, now, t)
+        finally:
+            if t is not None:
                 t.close()
         text = "\n".join(lines)
         print(text)

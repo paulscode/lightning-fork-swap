@@ -440,6 +440,22 @@ class ReportTest(unittest.TestCase):
         self.assertNotIn("not judged", text)
 
 
+class RebalanceBlockTest(unittest.TestCase):
+    def test_only_when_the_rebalancer_runs(self):
+        with tempfile.TemporaryDirectory() as root:
+            os.makedirs(os.path.join(root, "rebalance"))
+            with open(os.path.join(root, "rebalance", "state.json"), "w") as f:
+                json.dump({"moves": [
+                    {"ts": NOW.timestamp() - 3600, "amount": 1_000_000,
+                     "source": "lnd", "dest": "hot", "rule": 1,
+                     "fee": 210}]}, f)
+            self.assertEqual(m.rebalance_block({}, root, 7, NOW, None), [])
+            lines = m.rebalance_block({"REBALANCE_MODE": "on"}, root, 7, NOW,
+                                      None)
+            self.assertEqual(lines[0], "Rebalancing (on)")
+            self.assertIn("1 move, 1,000,000 sat, fees 210 sat", lines[1])
+
+
 class PlanTest(unittest.TestCase):
     def test_new_repeated_and_cleared(self):
         t0 = NOW

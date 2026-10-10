@@ -48,6 +48,10 @@ install -m 600 "$STAGE/env" "$DEPLOY/.env"
 mkdir -p "$ROOT/boltz" "$ROOT/secrets" "$ROOT/lnd"
 install -m 600 "$STAGE/boltz-seed.dat" "$ROOT/boltz/seed.dat"
 cp -a "$STAGE/secrets/." "$ROOT/secrets/"
+if [ -f "$STAGE/rebalance-state.json" ]; then
+	install -d -m 700 "$ROOT/rebalance"
+	install -m 600 "$STAGE/rebalance-state.json" "$ROOT/rebalance/state.json"
+fi
 if [ -f "$STAGE/telemetry.db" ]; then
 	install -d -m 700 "$ROOT/telemetry"
 	install -m 600 "$STAGE/telemetry.db" "$ROOT/telemetry/telemetry.db"

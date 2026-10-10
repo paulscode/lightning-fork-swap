@@ -57,6 +57,14 @@ fi
 log "placing state"
 tar -C "$ROOT" --numeric-owner -xf "$STAGE/srv/state.tar"
 install -m 600 "$STAGE/deploy/.env" "$DEPLOY/.env"
+if [ -f "$STAGE/rebalance-state.json" ]; then
+	install -d -m 700 "$ROOT/rebalance"
+	install -m 600 "$STAGE/rebalance-state.json" "$ROOT/rebalance/state.json"
+fi
+if [ -f "$STAGE/telemetry.db" ]; then
+	install -d -m 700 "$ROOT/telemetry"
+	install -m 600 "$STAGE/telemetry.db" "$ROOT/telemetry/telemetry.db"
+fi
 if [ -n "$PUBLIC_IP_NEW" ]; then
 	sed -i "s/^PUBLIC_IP=.*/PUBLIC_IP=$PUBLIC_IP_NEW/" "$DEPLOY/.env"
 fi

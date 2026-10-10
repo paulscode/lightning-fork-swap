@@ -117,6 +117,13 @@ mkdir -p "$PAYLOAD/srv" "$PAYLOAD/etc" "$PAYLOAD/deploy"
 tar -C "$ROOT" --numeric-owner --exclude='boltz/*.log' --exclude='boltz/sidecar/*.log' \
 	-cf "$PAYLOAD/srv/state.tar" lnd boltz postgres secrets webapp "$KNOTS_NET/wallets"
 cp -a "$DEPLOY/.env" "$PAYLOAD/deploy/.env"
+# The rebalancer's state (a move may be in flight) and the telemetry (a
+# consistent copy: the monitor may be writing)
+if [ -f "$ROOT/rebalance/state.json" ]; then cp -a "$ROOT/rebalance/state.json" "$PAYLOAD/rebalance-state.json"; fi
+if [ -f "$ROOT/telemetry/telemetry.db" ]; then
+	python3 -c 'import sqlite3, sys; src = sqlite3.connect(sys.argv[1]); dst = sqlite3.connect(sys.argv[2]); src.backup(dst); dst.close()' \
+		"$ROOT/telemetry/telemetry.db" "$PAYLOAD/telemetry.db"
+fi
 if [ -d /etc/letsencrypt ]; then tar -C /etc --numeric-owner -cf "$PAYLOAD/etc/letsencrypt.tar" letsencrypt; fi
 if [ -f /etc/nginx/lfswap.htpasswd ]; then cp -a /etc/nginx/lfswap.htpasswd "$PAYLOAD/etc/"; fi
 # Whether the site is still behind the preview password (empty once public)

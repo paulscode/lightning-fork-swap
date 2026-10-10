@@ -133,6 +133,42 @@ to the service). Use your own wallets and nodes, never a user's.
 
 After closing or opening channels, copy `channel.backup` offline again.
 
+### Automatic moves between the two on-chain wallets
+
+`rebalance/lfswap_rebalance.py` (every 30 minutes) moves coins between the
+hot wallet and lnd's on-chain wallet when one runs low and the other has
+coins to spare, or when the hot wallet holds more than it can use. It does
+not touch channels: the table above stays a person's work.
+
+Each wallet has a floor, a target and a ceiling (`REBALANCE_*` in `.env`;
+lnd's are above its anchor reserve). The hot wallet's target never exceeds
+lnd's inbound capacity, all reverse swaps can use. A run makes at most one
+move, which fills the receiving wallet to its target without taking the
+other below its own, so the next run finds nothing to do until swaps have
+moved the balances past a floor or a ceiling again. Brakes: at least
+`REBALANCE_MIN_MOVE`, 12 hours between moves, two a day and half of both
+wallets a day at most (a bigger need is met over several days), fees at most
+`REBALANCE_FEE_CAP` sat/vB (an urgent move, the hot wallet below one
+maximum swap or lnd below its reserve, up to `REBALANCE_FEE_CEILING`), one
+move in flight at a time (bumped if unconfirmed after 6 blocks), and no hot
+wallet spend while a reverse swap is about to lock up. Coins only go to a
+fresh address the receiving wallet confirms as its own, or to
+`REBALANCE_COLD_ADDRESS` (off unless set, and refused unless it matches
+`REBALANCE_COLD_ADDRESS_SHA256`).
+
+```sh
+python3 rebalance/lfswap_rebalance.py --status     # balances, bands, what a run would do
+tail /srv/lfswap/rebalance/rebalance.log
+python3 rebalance/simulate.py --set REBALANCE_HOT_TARGET=8000000   # try numbers on simulated demand
+```
+
+Start with `REBALANCE_MODE=dry-run`: each decision goes to Telegram ("would
+move ...", once a day while it holds) and nothing moves. After a couple of
+weeks of sensible messages, set `on`. The weekly report has a "Rebalancing"
+block (moves, fees, time below each floor). A move that conflicts with
+another transaction stops all moves until you look and remove `"blocked"`
+from `/srv/lfswap/rebalance/state.json`.
+
 ## 5. Using fees to improve capacity
 
 Two kinds of fee, two levers:

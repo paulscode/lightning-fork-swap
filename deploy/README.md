@@ -111,7 +111,7 @@ claim, or paid while recorded as failed; backend log lines such as a lockup
 that may have been broadcast before an error; the wallet below
 `MONITOR_MIN_WALLET_SAT`; the disk over 90 %, the host stalling on IO or
 memory; a `channel.backup` the hourly copy missed; the TLS certificate close
-to expiry. With a donation address set: the donation services down, the
+to expiry. The rebalancer reports its own moves and problems the same way. With a donation address set: the donation services down, the
 donation watcher not passing for 30 minutes, and once each, a donation sent
 without replay protection, one replayed on the SHA256 chain, and one that
 could not be judged in a day. It also says once a day that it runs, so silence means it does not.
@@ -167,6 +167,13 @@ getnewaddress`. Fund lnd: `lncli newaddress p2tr`. Open a channel: `lncli
 openchannel --node_key <pubkey> --local_amt <sat>` (above 16,777,215 sat only
 with peers that accept large channels). When one side runs low, move funds
 the other way, or swap through the service itself.
+
+`rebalance/lfswap_rebalance.py` (every 30 minutes from
+`/etc/cron.d/lfswap-rebalance`) does the on-chain part by itself: between
+the hot wallet and lnd's on-chain wallet, within bands set in `.env`
+(`REBALANCE_*`), first in `dry-run` (it only says what it would move), then
+`on`. See `OPERATING.md` §4. Its state is in `/srv/lfswap/rebalance/` and
+travels with migrations and the offsite backup.
 
 ## Terms
 
@@ -300,10 +307,14 @@ On a workstation with Docker, none of them touching production:
 ```sh
 deploy/nginx/test/run.sh                    # the nginx config, in the host's nginx 1.22.1
 python3 -m unittest discover -s deploy/monitor
+python3 -m unittest discover -s deploy/rebalance
 (cd shim && go test -race ./...)
+(cd donations && go test ./...)             # DONATIONS_TEST_DB=postgres://... also tests the store
 deploy/regtest/bootstrap.sh                 # the service on regtest
 (cd e2e && node run.mjs)                    # swaps, refunds and failures through the API
-# the web app through the production nginx config, in Chrome:
+python3 deploy/rebalance/regtest.py         # the rebalancer with the regtest wallets
+# the web app through the production nginx config, in Chrome (the donate
+# scenario also needs VITE_DONATION_ADDRESS and VITE_OUR_NODE=pubkey@host:port):
 (cd webapp && bun run regtest && VITE_API_URL=https://localhost:18443 \
   npx vite build --outDir /tmp/lfs-ui-dist)
 deploy/regtest/ui-nginx.sh up /tmp/lfs-ui-dist

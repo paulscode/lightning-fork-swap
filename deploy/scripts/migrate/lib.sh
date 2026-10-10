@@ -50,6 +50,13 @@ install_crons() {
 		# The weekly report: balances, capacity, swaps and fees
 		echo "0 13 * * 1 root /usr/bin/python3 $DEPLOY/monitor/lfswap_monitor.py --report --send >> $ROOT/monitor/monitor.log 2>&1"
 	} > /etc/cron.d/lfswap-monitor
+	# The on-chain rebalancer; it does nothing while REBALANCE_MODE is off
+	mkdir -p "$ROOT/rebalance"
+	chmod 700 "$ROOT/rebalance"
+	echo "11,41 * * * * root /usr/bin/python3 $DEPLOY/rebalance/lfswap_rebalance.py >> $ROOT/rebalance/rebalance.log 2>&1" > /etc/cron.d/lfswap-rebalance
+	if [ "${REBALANCE_MODE:-off}" = off ]; then
+		log "REBALANCE_MODE is off in .env: the rebalancer is scheduled but moves nothing"
+	fi
 	if [ -z "${ALERT_WEBHOOK_URL:-}" ]; then
 		log "no ALERT_WEBHOOK_URL in .env: alerts are only written to $ROOT/monitor/monitor.log"
 	fi
@@ -59,11 +66,11 @@ install_crons() {
 		rm -f /etc/cron.d/lfswap-offsite
 		log "no BACKUP_AGE_RECIPIENT in .env: daily offsite backups are not scheduled"
 	fi
-	chmod 644 /etc/cron.d/lfswap-backup /etc/cron.d/lfswap-offsite /etc/cron.d/lfswap-monitor 2>/dev/null || true
+	chmod 644 /etc/cron.d/lfswap-backup /etc/cron.d/lfswap-offsite /etc/cron.d/lfswap-monitor /etc/cron.d/lfswap-rebalance 2>/dev/null || true
 }
 
 remove_crons() {
-	rm -f /etc/cron.d/lfswap-backup /etc/cron.d/lfswap-offsite /etc/cron.d/lfswap-monitor
+	rm -f /etc/cron.d/lfswap-backup /etc/cron.d/lfswap-offsite /etc/cron.d/lfswap-monitor /etc/cron.d/lfswap-rebalance
 }
 
 wait_for() {

@@ -54,6 +54,7 @@ if [ -f "$ROOT/telemetry/telemetry.db" ]; then
 	python3 -c 'import sqlite3, sys; src = sqlite3.connect(sys.argv[1]); dst = sqlite3.connect(sys.argv[2]); src.backup(dst); dst.close()' \
 		"$ROOT/telemetry/telemetry.db" "$P/telemetry.db"
 fi
+[ -f "$ROOT/rebalance/state.json" ] && cp "$ROOT/rebalance/state.json" "$P/rebalance-state.json"
 [ -d /etc/letsencrypt ] && tar -C /etc -cf "$P/letsencrypt.tar" letsencrypt
 [ -f /etc/nginx/lfswap.htpasswd ] && cp /etc/nginx/lfswap.htpasswd "$P/"
 [ -f /etc/nginx/lfswap-preview.conf ] && cp /etc/nginx/lfswap-preview.conf "$P/"
