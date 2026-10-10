@@ -388,6 +388,52 @@ scenarios.donate = async () => {
   return `donation window to ${address.slice(0, 12)}..., channel tab with ${swapNode.slice(0, 10)}..., a bottom sheet on a phone, no serious accessibility findings (${minor} minor)`;
 };
 
+// A channel donation from the browser, end to end: the switch, the node,
+// the terms, the proof of work, the donation's page through payment to an
+// open channel. Needs the channel donation services of
+// deploy/regtest/channel-donations.sh left running (KEEP=1 API_PORT=19010)
+// and a build with VITE_DONATION_ADDRESS.
+scenarios.channel = async () => {
+  const userKey = lncli('lnd-user', 'getinfo').identity_pubkey;
+  const { context, page, problems } = await newPage();
+  await page.goto(`${SITE}/donate`);
+  await page.locator('[data-testid=channel-switch]').check({ timeout: 30_000 });
+  await page.fill('[data-testid=channel-node]', userKey);
+  await page.locator('[data-testid=channel-accept]').check();
+  await screenshot(page, 'channel-form');
+  await page.click('[data-testid=channel-create]');
+  // The donation's page, or the form's error said at once
+  const outcome = await Promise.race([
+    page.waitForURL(/\/donate\/channel\/[A-Za-z0-9_-]{22}$/, { timeout: 60_000 }).then(() => 'page'),
+    page.locator('[data-testid=channel-error]').waitFor({ timeout: 60_000 }).then(() => 'error'),
+  ]);
+  if (outcome === 'error') {
+    throw new Error(`refused: ${await page.locator('[data-testid=channel-error]').textContent()}`);
+  }
+  const pay = page.locator('[data-testid=cd-pay]');
+  await pay.waitFor({ timeout: 30_000 });
+  const address = (await page.locator('[data-testid=cd-address]').textContent()).trim();
+  await screenshot(page, 'channel-awaiting');
+  knots('-rpcwallet=boltz', '-named', 'sendtoaddress', `address=${address}`, 'amount=0.02', 'fee_rate=2');
+  await page.getByText('Payment seen', { exact: true }).waitFor();
+  const current = () => page.locator('[data-testid=cd-steps] .current').textContent();
+  await waitFor('the payment to confirm and the channel to be sent', async () => {
+    mine(1);
+    return (await current()) === 'Channel transaction sent';
+  }, { timeoutMs: 120_000 });
+  await screenshot(page, 'channel-funding');
+  await waitFor('the channel to open', async () => {
+    mine(1);
+    return (await page.locator('[data-testid=cd-steps] li.done').count()) >= 6 &&
+      (await current()) === 'Channel opened';
+  }, { timeoutMs: 180_000 });
+  const capacity = await page.locator('[data-testid=cd-capacity]').textContent();
+  await screenshot(page, 'channel-open');
+  assertNoProblems(problems, 'channel');
+  await context.close();
+  return `a channel donation from the browser opened: ${capacity.trim()}`;
+};
+
 // --- run -------------------------------------------------------------------
 
 const only = process.argv.slice(2);

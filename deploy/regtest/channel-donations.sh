@@ -6,6 +6,9 @@
 # own macaroon, and lnd refusing that macaroon while the guard is away.
 #
 #   deploy/regtest/channel-donations.sh        (the regtest service up)
+#   KEEP=1 API_PORT=19010 deploy/regtest/channel-donations.sh
+#                      leaves the guard, worker and API running, the API
+#                      where ui-nginx.sh sends /donate/v1/ (for e2e/ui.mjs)
 #
 # Starts three containers (lfswap-cd-*) on the regtest network and a
 # donations database in the regtest Postgres; removes the containers at the
@@ -90,15 +93,16 @@ ok "the guard registered with lnd"
 docker run -d --name lfswap-cd-channels "${common[@]}" -e CHANNELS_MACAROON=/lnd/channels.macaroon \
 	-e DONATIONS_DB_URL="postgres://donations_worker:$W@postgres:5432/donations?sslmode=disable" \
 	"$IMAGE" channels >/dev/null
-docker run -d --name lfswap-cd-api --network "$NET" -p 127.0.0.1:59010:9010 \
+API_PORT=${API_PORT:-59010}
+docker run -d --name lfswap-cd-api --network "$NET" -p "127.0.0.1:$API_PORT:9010" \
 	-e CHANNEL_DONATIONS=on -e CHANNEL_POW_BITS=12 \
 	-e DONATIONS_DB_URL="postgres://donations_api:$A@postgres:5432/donations?sslmode=disable" \
 	"$IMAGE" api >/dev/null
 for _ in $(seq 1 30); do
-	curl -sf 127.0.0.1:59010/donate/v1/info | jq -e .available >/dev/null 2>&1 && break
+	curl -sf 127.0.0.1:$API_PORT/donate/v1/info | jq -e .available >/dev/null 2>&1 && break
 	sleep 1
 done
-curl -sf 127.0.0.1:59010/donate/v1/info | jq -e .available >/dev/null || { docker logs lfswap-cd-channels; fail "not available"; }
+curl -sf 127.0.0.1:$API_PORT/donate/v1/info | jq -e .available >/dev/null || { docker logs lfswap-cd-channels; fail "not available"; }
 ok "the API says channel donations are available"
 
 log "a channel donation to lnd-user"
@@ -106,7 +110,7 @@ USER_KEY=$(LU getinfo | jq -r .identity_pubkey)
 # The user's node is a peer of ours already: nothing to dial
 LS listpeers | jq -e --arg k "$USER_KEY" '.peers[] | select(.pub_key == $k)' >/dev/null ||
 	LS connect "$USER_KEY@lnd-user:9735" >/dev/null
-info=$(curl -sf 127.0.0.1:59010/donate/v1/info)
+info=$(curl -sf 127.0.0.1:$API_PORT/donate/v1/info)
 body=$(python3 - "$info" "$USER_KEY" <<'PY'
 import hashlib, json, sys
 info, key = json.loads(sys.argv[1]), sys.argv[2]
@@ -121,12 +125,12 @@ print(json.dumps({"node": key, "accepted": True, "disclaimerVersion": info["disc
                   "challenge": c, "nonce": str(n)}))
 PY
 )
-created=$(curl -sf -X POST -H 'Content-Type: application/json' --data "$body" 127.0.0.1:59010/donate/v1/channel-orders)
+created=$(curl -sf -X POST -H 'Content-Type: application/json' --data "$body" 127.0.0.1:$API_PORT/donate/v1/channel-orders)
 ID=$(jq -r .id <<<"$created")
 ADDR=$(jq -r .order.address <<<"$created")
 [ -n "$ADDR" ] && [ "$ADDR" != null ] || fail "no address: $created"
 ok "order $ID, pay to $ADDR"
-state() { curl -sf "127.0.0.1:59010/donate/v1/channel-orders/$ID" | jq -r .state; }
+state() { curl -sf "127.0.0.1:$API_PORT/donate/v1/channel-orders/$ID" | jq -r .state; }
 before=$(LU listchannels | jq '.channels | length')
 K -rpcwallet=boltz -named sendtoaddress address="$ADDR" amount=0.02 fee_rate=2 >/dev/null
 for _ in $(seq 1 20); do [ "$(state)" = payment_seen ] && break; sleep 1; done
@@ -134,7 +138,7 @@ for _ in $(seq 1 20); do [ "$(state)" = payment_seen ] && break; sleep 1; done
 ok "payment seen"
 mine 3
 for _ in $(seq 1 40); do [ "$(state)" = funding_broadcast ] && break; sleep 1; done
-order=$(curl -sf "127.0.0.1:59010/donate/v1/channel-orders/$ID")
+order=$(curl -sf "127.0.0.1:$API_PORT/donate/v1/channel-orders/$ID")
 [ "$(jq -r .state <<<"$order")" = funding_broadcast ] || { docker logs lfswap-cd-channels | tail; fail "not opened: $(jq -c '{state, errorCode}' <<<"$order")"; }
 POINT=$(jq -r .channelPoint <<<"$order")
 ok "funding published: $POINT, capacity $(jq .capacitySat <<<"$order")"
