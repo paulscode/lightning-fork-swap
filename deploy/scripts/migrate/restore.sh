@@ -124,7 +124,7 @@ wait_for "lnd" 120 sh -c "docker compose exec -T lnd lncli --network=$NETWORK ge
 
 log "the backend and the donation services, with macaroons of the restored lnd"
 "$DEPLOY/scripts/bake-macaroon.sh" --force
-dc up -d boltz donations-worker donations-api
+dc up -d boltz donations-worker donations-api graph
 wait_for "the backend" 60 curl -sf http://127.0.0.1:9001/version
 wait_for "the donations API" 60 curl -sf http://127.0.0.1:9010/donate/v1/health
 if [ "${CHANNEL_DONATIONS:-off}" = on ]; then dc up -d donations-guard donations-channels; fi

@@ -112,7 +112,7 @@ wait_for "Postgres" 60 sh -c "docker compose exec -T postgres pg_isready -U bolt
 # Both only add what a source from before donations did not have
 "$DEPLOY/scripts/init-donations-db.sh" >/dev/null
 "$DEPLOY/scripts/bake-macaroon.sh"
-dc up -d boltz donations-worker donations-api
+dc up -d boltz donations-worker donations-api graph
 wait_for "the backend" 60 curl -sf http://127.0.0.1:9001/version
 wait_for "the donations API" 60 curl -sf http://127.0.0.1:9010/donate/v1/health
 if [ "${CHANNEL_DONATIONS:-off}" = on ]; then dc up -d donations-guard donations-channels; fi
