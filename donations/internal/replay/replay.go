@@ -78,6 +78,11 @@ type Result struct {
 	ReplayedHeight int64 `json:"replayedHeight,omitempty"`
 }
 
+// MaxInputs is the most inputs a check looks up (a few explorer requests
+// each, again on every re-check); a donation with more is left "unknown"
+// for a look by hand.
+const MaxInputs = 100
+
 // Check judges a donation transaction.
 func Check(ctx context.Context, txid string, blake2b, sha256 Explorer) (Result, error) {
 	tx, err := blake2b.Tx(ctx, txid)
@@ -86,8 +91,17 @@ func Check(ctx context.Context, txid string, blake2b, sha256 Explorer) (Result, 
 	}
 
 	result := Result{Verdict: Unknown}
+	if len(tx.Vin) > MaxInputs {
+		result.Reason = fmt.Sprintf("%d inputs, more than are checked automatically (%d): look by hand", len(tx.Vin), MaxInputs)
+		return result, nil
+	}
 	postFork, protected, unknown := false, false, false
 	for _, vin := range tx.Vin {
+		if postFork || protected {
+			// Settled: one such input keeps the whole transaction off the
+			// SHA256 chain; the rest are not looked up
+			break
+		}
 		in := Input{Prevout: fmt.Sprintf("%s:%d", vin.Txid, vin.Vout)}
 		if vin.IsCoinbase || vin.Prevout == nil {
 			// New coins: they exist on this chain only

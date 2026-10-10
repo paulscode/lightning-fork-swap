@@ -12,6 +12,7 @@ import (
 	"net/http"
 	"regexp"
 	"strconv"
+	"sync"
 	"time"
 )
 
@@ -27,11 +28,42 @@ func ValidTxid(txid string) bool { return txidPattern.MatchString(txid) }
 type Client struct {
 	URLs []string
 	HTTP *http.Client
+	// At least this long between two requests: public explorers ban
+	// addresses that ask too fast, and a donation can have many inputs
+	Interval time.Duration
+
+	mu   sync.Mutex
+	next time.Time
 }
 
-// New returns a client with a 20 s timeout per request.
+// DefaultInterval paces requests to 4 a second.
+const DefaultInterval = 250 * time.Millisecond
+
+// New returns a client with a 20 s timeout per request, paced at
+// DefaultInterval.
 func New(urls ...string) *Client {
-	return &Client{URLs: urls, HTTP: &http.Client{Timeout: 20 * time.Second}}
+	return &Client{URLs: urls, HTTP: &http.Client{Timeout: 20 * time.Second},
+		Interval: DefaultInterval}
+}
+
+// wait holds a request until its turn.
+func (c *Client) wait(ctx context.Context) error {
+	c.mu.Lock()
+	now := time.Now()
+	at := c.next
+	if at.Before(now) {
+		at = now
+	}
+	c.next = at.Add(c.Interval)
+	c.mu.Unlock()
+	if d := time.Until(at); d > 0 {
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-time.After(d):
+		}
+	}
+	return nil
 }
 
 // Status is where a transaction is.
@@ -85,6 +117,9 @@ func (c *Client) get(ctx context.Context, path string, out any) error {
 	var errs []error
 	notFound := 0
 	for _, base := range c.URLs {
+		if err := c.wait(ctx); err != nil {
+			return err
+		}
 		req, err := http.NewRequestWithContext(ctx, http.MethodGet, base+path, nil)
 		if err != nil {
 			return err

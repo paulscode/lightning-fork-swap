@@ -7,11 +7,41 @@ import (
 	"net/http/httptest"
 	"strings"
 	"testing"
+	"time"
 )
 
 var txid = strings.Repeat("a", 64)
 
 func server(handler http.HandlerFunc) *httptest.Server { return httptest.NewServer(handler) }
+
+func TestRequestsArePaced(t *testing.T) {
+	var times []time.Time
+	s := server(func(w http.ResponseWriter, r *http.Request) {
+		times = append(times, time.Now())
+		_, _ = w.Write([]byte(`{"confirmed": true}`))
+	})
+	defer s.Close()
+	c := New(s.URL)
+	c.Interval = 40 * time.Millisecond
+	for i := 0; i < 4; i++ {
+		if _, err := c.TxStatus(context.Background(), txid); err != nil {
+			t.Fatal(err)
+		}
+	}
+	for i := 1; i < len(times); i++ {
+		if gap := times[i].Sub(times[i-1]); gap < 35*time.Millisecond {
+			t.Fatalf("request %d came %v after the one before", i, gap)
+		}
+	}
+	// A request that is waiting for its turn gives up with its context
+	c.Interval = time.Hour
+	_, _ = c.TxStatus(context.Background(), txid)
+	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Millisecond)
+	defer cancel()
+	if _, err := c.TxStatus(ctx, txid); !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("waited past its context: %v", err)
+	}
+}
 
 func TestFallsBackToTheNextExplorer(t *testing.T) {
 	down := server(func(w http.ResponseWriter, r *http.Request) {

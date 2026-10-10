@@ -16,9 +16,11 @@ type chain struct {
 	statuses  map[string]*esplora.Status
 	outspends map[string]*esplora.Outspend
 	fail      error
+	calls     int
 }
 
 func (c *chain) Tx(_ context.Context, txid string) (*esplora.Tx, error) {
+	c.calls++
 	if c.fail != nil {
 		return nil, c.fail
 	}
@@ -29,6 +31,7 @@ func (c *chain) Tx(_ context.Context, txid string) (*esplora.Tx, error) {
 }
 
 func (c *chain) TxStatus(_ context.Context, txid string) (*esplora.Status, error) {
+	c.calls++
 	if c.fail != nil {
 		return nil, c.fail
 	}
@@ -39,6 +42,7 @@ func (c *chain) TxStatus(_ context.Context, txid string) (*esplora.Status, error
 }
 
 func (c *chain) Outspend(_ context.Context, txid string, vout uint32) (*esplora.Outspend, error) {
+	c.calls++
 	if c.fail != nil {
 		return nil, c.fail
 	}
@@ -133,6 +137,36 @@ func TestCheck(t *testing.T) {
 				t.Fatal("at risk without the donor's addresses")
 			}
 		})
+	}
+}
+
+func TestCheckLooksUpNoMoreThanItNeeds(t *testing.T) {
+	ctx := context.Background()
+	preFork := int64(ForkHeight - 1)
+	// The first input settles it: the rest are not looked up
+	blake := blake2b(ForkHeight, preFork, vin(prevA, sig64), vin(prevB, sig64), vin(prevB, sig64))
+	sha := &chain{}
+	got, err := Check(ctx, donation, blake, sha)
+	if err != nil || got.Verdict != Protected {
+		t.Fatalf("%v %v", got.Verdict, err)
+	}
+	if blake.calls != 2 || sha.calls != 0 {
+		t.Fatalf("%d BLAKE2b and %d SHA256 requests", blake.calls, sha.calls)
+	}
+
+	// Too many inputs: left for a look by hand, nothing looked up
+	var many []esplora.Vin
+	for i := 0; i <= MaxInputs; i++ {
+		many = append(many, vin(prevA, sig64))
+	}
+	blake = blake2b(preFork, preFork, many...)
+	sha = &chain{}
+	got, err = Check(ctx, donation, blake, sha)
+	if err != nil || got.Verdict != Unknown || !strings.Contains(got.Reason, "by hand") {
+		t.Fatalf("%v (%s) %v", got.Verdict, got.Reason, err)
+	}
+	if blake.calls != 1 || sha.calls != 0 {
+		t.Fatalf("%d BLAKE2b and %d SHA256 requests", blake.calls, sha.calls)
 	}
 }
 
