@@ -98,9 +98,15 @@ knots -named loadwallet filename=boltz load_on_startup=true >/dev/null 2>&1 || t
 log "starting the shim, Tor and lnd"
 dc up -d shim tor lnd
 wait_for "lnd" 120 sh -c "docker compose exec -T lnd lncli --network=$NETWORK getinfo </dev/null | grep -Eq '\"synced_to_chain\": +true'"
-log "starting Postgres and the backend"
-dc up -d postgres boltz
+log "starting Postgres, the backend and the donation services"
+dc up -d postgres
+wait_for "Postgres" 60 sh -c "docker compose exec -T postgres pg_isready -U boltz </dev/null"
+# Both only add what a source from before donations did not have
+"$DEPLOY/scripts/init-donations-db.sh" >/dev/null
+"$DEPLOY/scripts/bake-macaroon.sh"
+dc up -d boltz donations-worker donations-api
 wait_for "the backend" 60 curl -sf http://127.0.0.1:9001/version
+wait_for "the donations API" 60 curl -sf http://127.0.0.1:9010/donate/v1/health
 
 install_crons
 

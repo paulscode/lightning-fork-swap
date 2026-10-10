@@ -31,6 +31,7 @@ about 1 GB between them once running.
    docker build -t lfswap/knots:29.4.2 knots
    docker build -t lfswap/tor:dev tor
    docker build -t lfswap/txindex-shim:dev ../shim
+   docker build -t lfswap/donations:dev ../donations
    # the backend image is built from the backend repository:
    #   docker build -f docker/boltz/Dockerfile --build-arg NODE_VERSION=24-bookworm-slim@sha256:d6aa754f16b3197301076f047b5def2f02ea1dbbc2ca920407d46d7ec7f87b20 \
    #     --build-arg SOURCE=local -t lfswap/boltz:dev .
@@ -45,10 +46,14 @@ about 1 GB between them once running.
    unless you run `firewall-confirm` from a new SSH session), then `tls`, then
    `nginx` (creates the preview password).
 5. `./scripts/init-wallets.sh`: the Knots wallet and the lnd wallet; seeds go
-   to `/srv/lfswap/secrets`. It also bakes the backend's lnd macaroon
-   (`scripts/bake-macaroon.sh`), limited to the calls the backend makes.
-6. `docker compose up -d` (Postgres, the shim and the backend). The backend
-   creates its own seed (`/srv/lfswap/boltz/seed.dat`) at first start.
+   to `/srv/lfswap/secrets`. It also bakes the lnd macaroons of the backend
+   and of the donation watcher (`scripts/bake-macaroon.sh`), each limited to
+   the calls that service makes.
+6. `docker compose up -d postgres && ./scripts/init-donations-db.sh`, then
+   `docker compose up -d` (the shim, the backend and the donation services).
+   The backend creates its own seed (`/srv/lfswap/boltz/seed.dat`) at first
+   start. Donations stay off until `DONATION_ADDRESS` is set (see "Donations"
+   in `OPERATING.md`).
 7. Put the web app's `dist/` (built with `bun run mainnet && bun run build`)
    in `/srv/lfswap/webapp`, owned by root:
    `rsync -a --delete --chown=root:root --chmod=D755,F644 --exclude '*.map'
@@ -106,7 +111,10 @@ claim, or paid while recorded as failed; backend log lines such as a lockup
 that may have been broadcast before an error; the wallet below
 `MONITOR_MIN_WALLET_SAT`; the disk over 90 %, the host stalling on IO or
 memory; a `channel.backup` the hourly copy missed; the TLS certificate close
-to expiry. It also says once a day that it runs, so silence means it does not.
+to expiry. With a donation address set: the donation services down, the
+donation watcher not passing for 30 minutes, and once each, a donation sent
+without replay protection, one replayed on the SHA256 chain, and one that
+could not be judged in a day. It also says once a day that it runs, so silence means it does not.
 
 Set `ALERT_WEBHOOK_URL` and `ALERT_WEBHOOK_KIND` in `.env` (see
 `.env.example`), then check delivery:

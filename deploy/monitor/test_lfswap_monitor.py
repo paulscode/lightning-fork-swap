@@ -68,6 +68,7 @@ class FakeRunner:
         self.files = files or {}
         self.disk = Usage(*disk)
         self.queries = []
+        self.databases = []
         self.calls = []
 
     def compose(self, *args, timeout=60):
@@ -80,6 +81,7 @@ class FakeRunner:
         if service == "postgres":
             query = args[-1]
             self.queries.append(query)
+            self.databases.append(args[args.index("-d") + 1])
             for fragment, out in self.outputs.get("sql", {}).items():
                 if fragment in query:
                     return out
@@ -247,6 +249,77 @@ class ChecksTest(unittest.TestCase):
         self.assertIn("submarine:paid-not-claimed:sub3", alerts)
         self.assertTrue(any("- 976000 <= 30" in q for q in runner.queries))
 
+    def test_donations_are_not_watched_without_an_address(self):
+        alerts, runner = run()
+        self.assertNotIn("donations", runner.databases)
+        self.assertFalse(any(k.startswith("container:donations")
+                             for k in alerts))
+
+    def donations(self, sql, ps_extra=True):
+        outputs = healthy()
+        if ps_extra:
+            outputs[("ps",)] += "\n" + "\n".join(
+                json.dumps({"Service": s, "State": "running"})
+                for s in m.DONATION_SERVICES)
+        outputs["sql"] = sql
+        return run(outputs, env={"DONATION_ADDRESS": "bc1pdonate"})
+
+    def test_a_watched_donation_service_that_is_down(self):
+        alerts, _ = self.donations(
+            {"last_pass": "2026-10-07T11:59:00Z\n"}, ps_extra=False)
+        self.assertIn("container:donations-worker", alerts)
+        self.assertIn("container:donations-api", alerts)
+
+    def test_a_healthy_donation_watcher_raises_nothing(self):
+        alerts, runner = self.donations(
+            {"last_pass": "2026-10-07T11:59:00Z\n"})
+        self.assertEqual(alerts, {})
+        self.assertIn("donations", runner.databases)
+
+    def test_a_watcher_that_stopped_passing(self):
+        alerts, _ = self.donations({"last_pass": "2026-10-07T11:00:00Z\n"})
+        self.assertIn("since 2026-10-07 11:00 UTC",
+                      alerts["donations:stale"].text)
+        self.assertFalse(alerts["donations:stale"].event)
+        alerts, _ = self.donations({})
+        self.assertIn("yet", alerts["donations:stale"].text)
+        alerts, _ = self.donations({"last_pass": "garbage\n"})
+        self.assertIn("donations:stale", alerts)
+
+    def test_the_stale_threshold_is_configurable(self):
+        outputs = healthy()
+        outputs[("ps",)] += "\n" + "\n".join(
+            json.dumps({"Service": s, "State": "running"})
+            for s in m.DONATION_SERVICES)
+        outputs["sql"] = {"last_pass": "2026-10-07T11:00:00Z\n"}
+        alerts, _ = run(outputs, env={
+            "DONATION_ADDRESS": "x", "MONITOR_DONATIONS_STALE_MINUTES": "90"})
+        self.assertNotIn("donations:stale", alerts)
+
+    def test_donations_at_risk_replayed_and_unknown_are_events(self):
+        tx = "ab" * 32
+        alerts, runner = self.donations({
+            "last_pass": "2026-10-07T11:59:00Z\n",
+            "verdict = 'at_risk'": f"{tx}|50000|bc1qa bc1qb\n",
+            "verdict = 'replayed'": f"{tx}|50000|976100\n",
+            "verdict = 'unknown'": f"{tx}|7000\n",
+        })
+        at_risk = alerts[f"donation:at-risk:{tx}"]
+        self.assertTrue(at_risk.event)
+        self.assertIn("50,000 sat", at_risk.text)
+        self.assertIn("bc1qa bc1qb", at_risk.text)
+        replayed = alerts[f"donation:replayed:{tx}"]
+        self.assertTrue(replayed.event)
+        self.assertIn("height 976100", replayed.text)
+        self.assertIn("SHA256 chain", replayed.text)
+        self.assertNotIn("Bitcoin", replayed.text + at_risk.text)
+        self.assertTrue(alerts[f"donation:unknown:{tx}"].event)
+        # Only recent ones: an event is remembered for a week
+        recent = [q for q in runner.queries if "verdict = " in q]
+        self.assertEqual(len(recent), 3)
+        for q in recent:
+            self.assertIn("days'", q)
+
     def test_log_lines_that_need_a_person(self):
         outputs = healthy()
         outputs[("logs", "shim")] = (
@@ -342,6 +415,29 @@ class ReportTest(unittest.TestCase):
         self.assertIn("net: 3,025 sat", text)
         self.assertIn("net (without routing income): 3,021 sat", text)
         self.assertTrue(any("interval '7 days'" in q for q in runner.queries))
+        self.assertNotIn("Donations", text)
+
+    def test_report_with_donations(self):
+        outputs = healthy()
+        outputs["sql"] = {
+            "FROM swaps WHERE status IN": "0|0|0|0|0|0\n",
+            "status = 'invoice.settled'": "0|0|0|0\n",
+            '"transactionId" IS NOT NULL': "0\n",
+            "FROM replay_checks WHERE first_seen >=": "2|150000\n",
+            "sum(amount_sat), 0) FROM replay_checks ": "5|1250000\n",
+            "GROUP BY verdict": "at_risk|1\nreplayed|2\n",
+        }
+        runner = FakeRunner(outputs)
+        lines = m.report(m.Monitor(runner, {"DONATION_ADDRESS": "x"}, NOW), 7)
+        text = "\n".join(lines)
+        self.assertIn("Donations\n  last 7 days: 150,000 sat in 2 "
+                      "transactions", text)
+        self.assertIn("since the start: 1,250,000 sat in 5 transactions",
+                      text)
+        self.assertIn("1 sent without replay protection", text)
+        self.assertIn("replay list --at-risk", text)
+        self.assertIn("2 replayed on the SHA256 chain", text)
+        self.assertNotIn("not judged", text)
 
 
 class PlanTest(unittest.TestCase):

@@ -62,6 +62,7 @@ if [ ! -f "$ROOT/lnd/data/chain/bitcoin/${NETWORK:-mainnet}/wallet.db" ]; then
 		{ echo "initwallet failed; the seed in $S/lnd-seed.txt was not used, run again" >&2; exit 1; }
 	echo "created the lnd wallet; its 24-word seed is in $S/lnd-seed.txt (no passphrase)"
 fi
-# The backend's own lnd macaroon, limited to what it calls
+# The backend's and the donation watcher's lnd macaroons, each limited to
+# what it calls
 ./scripts/bake-macaroon.sh
 ls -l "$S"

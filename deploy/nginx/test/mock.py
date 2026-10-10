@@ -1,6 +1,7 @@
 """Stand-ins for what nginx proxies to, for deploy/nginx/test/run.sh.
 
-Ports 9001 (backend), 9004 (WebSocket) and 9005 (sidecar) answer every
+Ports 9001 (backend), 9004 (WebSocket), 9005 (sidecar) and 9010 (the
+donations API) answer every
 request with what they received, as JSON, so a test can see exactly which
 path and headers reached them. Port 8443 is the explorer: HTTPS with a
 certificate for mempool.guide, answering with headers that must not reach a
@@ -72,7 +73,7 @@ def serve(port, handler, cert=None):
 
 if __name__ == "__main__":
     certs = sys.argv[1]
-    for port in (9001, 9004, 9005):
+    for port in (9001, 9004, 9005, 9010):
         serve(port, Echo)
     serve(8443, Explorer, (f"{certs}/explorer.crt", f"{certs}/explorer.key"))
     serve(9443, Explorer, (f"{certs}/untrusted.crt", f"{certs}/untrusted.key"))

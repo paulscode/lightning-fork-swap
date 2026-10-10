@@ -15,6 +15,11 @@ Configuration, from deploy/.env (all optional):
   MONITOR_MAX_TIP_AGE_MIN alert when the newest block is older (default 120)
   MONITOR_REPEAT_HOURS    repeat an alert that is still true (default 6)
   MONITOR_HEARTBEAT_HOURS a message that the monitor runs (default 24, 0 off)
+  DONATION_ADDRESS        set: also watch the donation services, and report
+                          donations sent without replay protection
+  MONITOR_DONATIONS_STALE_MINUTES
+                          alert when the donation watcher has not completed
+                          a pass for this long (default 30)
 
 State (what was sent, where the logs were read up to) is kept in
 $LFSWAP_ROOT/monitor/state.json.
@@ -59,6 +64,8 @@ import lfswap_telemetry  # noqa: E402
 DEPLOY = os.environ.get("LFSWAP_DEPLOY", "/opt/lfswap/deploy")
 
 SERVICES = ["knots", "shim", "tor", "lnd", "postgres", "boltz"]
+# Watched once a donation address is set (DONATION_ADDRESS in .env)
+DONATION_SERVICES = ["donations-worker", "donations-api"]
 
 # Lines in the backend's log that need a person. Each is reported once, when
 # it first appears.
@@ -207,9 +214,12 @@ class Monitor:
             "exec", "-T", "lnd", "lncli", f"--network={self.network}", *args
         )
 
-    def psql(self, query):
+    def donations_on(self):
+        return bool(self.env.get("DONATION_ADDRESS"))
+
+    def psql(self, query, database="boltz"):
         out = self.runner.compose(
-            "exec", "-T", "postgres", "psql", "-U", "boltz", "-d", "boltz",
+            "exec", "-T", "postgres", "psql", "-U", "boltz", "-d", database,
             "-At", "-F", "|", "-c", query,
         )
         return [line.split("|") for line in out.splitlines() if line]
@@ -227,7 +237,9 @@ class Monitor:
             parsed = json.loads(line)
             rows.extend(parsed if isinstance(parsed, list) else [parsed])
         state = {row.get("Service"): row.get("State") for row in rows}
-        for service in SERVICES:
+        services = SERVICES + (DONATION_SERVICES if self.donations_on()
+                               else [])
+        for service in services:
             if state.get(service) != "running":
                 self.add(
                     f"container:{service}",
@@ -382,6 +394,75 @@ class Monitor:
                 "its lockup",
             )
 
+    def check_donations(self):
+        """The donation watcher still works, and donations that were sent
+        without replay protection, or were replayed, reach Paul once."""
+        if not self.donations_on():
+            return
+        rows = self.psql("SELECT value FROM worker_state "
+                         "WHERE key = 'last_pass'", "donations")
+        last = None
+        if rows:
+            try:
+                last = datetime.datetime.fromisoformat(
+                    rows[0][0].replace("Z", "+00:00"))
+            except ValueError:
+                pass
+        stale = number(self.env, "MONITOR_DONATIONS_STALE_MINUTES", 30)
+        if last is None or (self.now - last).total_seconds() > stale * 60:
+            self.add(
+                "donations:stale",
+                "The donation watcher has not completed a pass "
+                + (f"since {last:%Y-%m-%d %H:%M} UTC" if last else "yet")
+                + ": donations are not being checked for replay protection",
+            )
+
+        # Each found within the last 3 days; events are remembered for a
+        # week, so each is sent once
+        for txid, amount, addresses in self.psql(
+            "SELECT txid, amount_sat, array_to_string(at_risk_addresses, ' ') "
+            "FROM replay_checks WHERE verdict = 'at_risk' "
+            "AND first_seen > now() - interval '3 days'", "donations"
+        ):
+            self.add(
+                f"donation:at-risk:{txid}",
+                f"Donation {txid} ({sats(amount)}) was sent without replay "
+                "protection: the donor's coins at "
+                f"{addresses or 'their addresses'} can be copied to the "
+                "SHA256 chain. Watch it with: donations replay show "
+                f"{txid}",
+                event=True,
+            )
+        # A replayed donation is final and not checked again: last_checked
+        # is when the replay was found
+        for txid, amount, height in self.psql(
+            "SELECT txid, amount_sat, coalesce(replayed_height, 0) "
+            "FROM replay_checks WHERE verdict = 'replayed' "
+            "AND last_checked > now() - interval '3 days'", "donations"
+        ):
+            self.add(
+                f"donation:replayed:{txid}",
+                f"Donation {txid} ({sats(amount)}) was replayed on the "
+                f"SHA256 chain (height {height}): the service now holds "
+                "that donor's SHA256-chain coins at the donation address. "
+                "Return them if the donor asks and proves ownership "
+                "(OPERATING.md, Donations)",
+                event=True,
+            )
+        for txid, amount in self.psql(
+            "SELECT txid, amount_sat FROM replay_checks "
+            "WHERE verdict = 'unknown' "
+            "AND first_seen < now() - interval '1 day' "
+            "AND first_seen > now() - interval '4 days'", "donations"
+        ):
+            self.add(
+                f"donation:unknown:{txid}",
+                f"Donation {txid} ({sats(amount)}) could not be judged for "
+                "replay protection in a day: look at it with donations "
+                f"replay show {txid}",
+                event=True,
+            )
+
     def check_logs(self, since):
         for service, label, patterns in (
             ("boltz", "Backend", LOG_PATTERNS),
@@ -472,6 +553,7 @@ class Monitor:
             ("lnd", self.check_lnd),
             ("pairs", self.check_pairs),
             ("swaps", self.check_swaps),
+            ("donations", self.check_donations),
             ("logs", lambda: self.check_logs(since)),
             ("host", lambda: self.check_host(root)),
             ("backup", lambda: self.check_backup(root)),
@@ -584,6 +666,37 @@ def report(monitor, days):
         else:
             lines.append(f"  net (without routing income): "
                          f"{sats(gained)}")
+
+    if m.donations_on():
+        lines.extend(donation_lines(m, days))
+    return lines
+
+
+def donation_lines(m, days):
+    """Donations received, and any to look at for replay protection."""
+    lines = ["Donations"]
+    for label, cond in (
+        (f"last {days} days",
+         f"WHERE first_seen >= now() - interval '{int(days)} days'"),
+        ("since the start", ""),
+    ):
+        count, total = m.psql(
+            "SELECT count(*), coalesce(sum(amount_sat), 0) "
+            f"FROM replay_checks {cond}", "donations")[0]
+        lines.append(f"  {label}: {sats(total)} in {int(count)} "
+                     + ("transaction" if int(count) == 1 else "transactions"))
+    verdicts = dict(m.psql(
+        "SELECT verdict, count(*) FROM replay_checks "
+        "WHERE verdict IN ('at_risk', 'replayed', 'unknown') "
+        "GROUP BY verdict", "donations"))
+    for verdict, text in (
+        ("at_risk", "sent without replay protection, still copyable"),
+        ("replayed", "replayed on the SHA256 chain (donor coins held)"),
+        ("unknown", "not judged (look at them)"),
+    ):
+        if int(verdicts.get(verdict, 0)):
+            lines.append(f"  {verdicts[verdict]} {text}: donations replay "
+                         f"list --{verdict.replace('_', '-')}")
     return lines
 
 

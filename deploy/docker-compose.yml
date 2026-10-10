@@ -157,6 +157,58 @@ services:
     logging: *logging
     mem_limit: 700m
 
+  # The donation watcher: finds donations in lnd's wallet and checks each
+  # for replay protection (../donations). Reads lnd with a macaroon that
+  # may only list transactions; owns the donations database.
+  donations-worker:
+    image: lfswap/donations:dev
+    build: ../donations
+    security_opt: [no-new-privileges:true]
+    read_only: true
+    restart: unless-stopped
+    command: ["worker"]
+    depends_on:
+      guard: {condition: service_completed_successfully}
+      postgres: {condition: service_started}
+      lnd: {condition: service_healthy}
+    environment:
+      DONATIONS_DB_URL: postgres://donations_worker:${DONATIONS_WORKER_DBPASSWORD:?run scripts/setup.sh}@postgres:5432/donations?sslmode=disable
+      LND_REST_URL: https://lnd:8080
+      LND_TLS_CERT: /lnd/tls.cert
+      LND_MACAROON: /lnd/donations.macaroon
+      DONATION_ADDRESSES: ${DONATION_ADDRESS:-}
+      # Esplora APIs; empty: mempool.guide, and mempool.space then
+      # blockstream.info (the donations service's defaults)
+      BLAKE2B_EXPLORERS: ${DONATIONS_BLAKE2B_EXPLORERS:-}
+      SHA256_EXPLORERS: ${DONATIONS_SHA256_EXPLORERS:-}
+    volumes:
+      - ${LFSWAP_ROOT:-/srv/lfswap}/lnd/tls.cert:/lnd/tls.cert:ro
+      - type: bind
+        source: ${LFSWAP_ROOT:-/srv/lfswap}/lnd/donations.macaroon
+        target: /lnd/donations.macaroon
+        read_only: true
+        bind: {create_host_path: false}
+    logging: *logging
+    mem_limit: 64m
+
+  # The donations API for the web app (/donate/v1/ through nginx): reads
+  # the database with a role that may only read; no macaroon
+  donations-api:
+    image: lfswap/donations:dev
+    security_opt: [no-new-privileges:true]
+    read_only: true
+    restart: unless-stopped
+    command: ["api"]
+    depends_on:
+      postgres: {condition: service_started}
+    environment:
+      DONATIONS_DB_URL: postgres://donations_api:${DONATIONS_API_DBPASSWORD:?run scripts/setup.sh}@postgres:5432/donations?sslmode=disable
+      LISTEN: ":9010"
+    ports:
+      - "127.0.0.1:9010:9010"
+    logging: *logging
+    mem_limit: 64m
+
 networks:
   default: {}
   # lnd and Tor only, no way out; a fixed subnet for torrc's SocksPolicy

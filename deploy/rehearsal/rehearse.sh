@@ -115,9 +115,30 @@ stage_setup() {
 	open_channels "$SRC"
 	svc "$SRC" "docker compose up -d postgres shim boltz >/dev/null 2>&1"
 	for _ in $(seq 1 30); do svc "$SRC" "curl -sf http://127.0.0.1:9001/version >/dev/null" && break; sleep 5; done
+	setup_donations
 	tunnel "$SRC"
 	client reverse
 	client submarine
+}
+
+# A donation address in lnd's wallet, the donation services, and one
+# donation on record, which every later stage must keep. No explorer
+# follows regtest: the checks find nothing (verdict unknown).
+donations_on_record() { svc "$1" "docker compose exec -T postgres psql -U boltz -d donations -Atc 'select count(*) from replay_checks'"; }
+setup_donations() {
+	log "setup: donations"
+	local addr
+	addr=$(svc "$SRC" "docker compose exec -T lnd lncli --network=regtest newaddress p2tr" | jq -r .address)
+	svc "$SRC" "sed -i 's/^DONATION_ADDRESS=.*/DONATION_ADDRESS=$addr/' .env && printf 'DONATIONS_BLAKE2B_EXPLORERS=http://127.0.0.1:9\nDONATIONS_SHA256_EXPLORERS=http://127.0.0.1:9\n' >> .env && ./scripts/init-donations-db.sh >/dev/null && docker compose up -d donations-worker donations-api >/dev/null 2>&1"
+	world "$WK -rpcwallet=miner sendtoaddress $addr 0.01 >/dev/null"
+	mine 1
+	for _ in $(seq 1 30); do
+		[ "$(donations_on_record "$SRC")" = 1 ] && break
+		sleep 3
+	done
+	[ "$(donations_on_record "$SRC")" = 1 ] || { echo "FAIL: the donation was not recorded" >&2; exit 1; }
+	svc "$SRC" "curl -sf http://127.0.0.1:9010/donate/v1/health >/dev/null" || { echo "FAIL: donations API" >&2; exit 1; }
+	echo "  a donation on record, the API answers"
 }
 
 stage_migrate() {
@@ -176,6 +197,10 @@ stage_disaster() {
 	[ "$(svc "$DST" "docker compose exec -T knots bitcoin-cli -datadir=/data -rpcwallet=boltz getbalances" | jq .mine.trusted)" = "$(jq .knots_wallet.trusted <<<"$before")" ] \
 		|| { echo "FAIL: Knots wallet balance differs" >&2; exit 1; }
 	echo "  Knots wallet balance as backed up"
+	[ "$(donations_on_record "$DST")" = "$(jq '.donations | length' <<<"$before")" ] \
+		|| { echo "FAIL: donations on record differ" >&2; exit 1; }
+	svc "$DST" "curl -sf http://127.0.0.1:9010/donate/v1/health >/dev/null" || { echo "FAIL: donations API" >&2; exit 1; }
+	echo "  donations on record as backed up"
 	# The peer still dials the lost host's address; point it at the new one,
 	# as gossip would, until it has done its part (closing the channels).
 	for _ in $(seq 1 20); do

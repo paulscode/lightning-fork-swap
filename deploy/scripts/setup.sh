@@ -16,8 +16,12 @@ if [ ! -f .env ]; then
 	cp .env.example .env
 	chmod 600 .env
 fi
-for var in LND_RPCPASSWORD BOLTZ_RPCPASSWORD SHIM_RPCPASSWORD POSTGRES_PASSWORD TOR_CONTROL_PASSWORD; do
-	if ! grep -q "^$var=." .env; then
+for var in LND_RPCPASSWORD BOLTZ_RPCPASSWORD SHIM_RPCPASSWORD POSTGRES_PASSWORD TOR_CONTROL_PASSWORD \
+	DONATIONS_WORKER_DBPASSWORD DONATIONS_API_DBPASSWORD; do
+	if ! grep -q "^$var=" .env; then
+		# A key the .env of an older install does not have
+		echo "$var=$(rand)" >> .env
+	elif ! grep -q "^$var=." .env; then
 		sed -i "s|^$var=.*|$var=$(rand)|" .env
 	fi
 done

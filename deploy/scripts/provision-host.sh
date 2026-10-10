@@ -108,6 +108,7 @@ echo "== images"
 docker build -q -t lfswap/knots:29.4.2 knots >/dev/null
 docker build -q -t lfswap/tor:dev tor >/dev/null
 docker build -q -t lfswap/txindex-shim:dev ../shim >/dev/null
+docker build -q -t lfswap/donations:dev ../donations >/dev/null
 docker image inspect lfswap/boltz:dev >/dev/null 2>&1 || \
 	echo "   the backend image is missing: docker save lfswap/boltz:dev | gzip | ssh root@THIS_HOST 'gunzip | docker load'"
 

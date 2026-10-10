@@ -76,6 +76,8 @@ class Allowlist(unittest.TestCase):
             ("GET", "/v2/chain/fees", 9001),
             ("POST", "/v2/chain/BTC/transaction", 9001),
             ("POST", "/v2/swap/restore", 9005),
+            ("GET", "/donate/v1/health", 9010),
+            ("GET", "/donate/v1/replay/" + "ab" * 32, 9010),
         ]:
             with self.subTest(method=method, path=path):
                 status, _, raw = request(method, path, body="{}"
@@ -98,10 +100,20 @@ class Allowlist(unittest.TestCase):
             ("GET", "/v2/lightning/BTC/node/02ab"),
             ("GET", "/v2/swap/status/extra"),
             ("GET", "/v2/referral"),
+            ("POST", "/donate/v1/replay/" + "ab" * 32),
+            ("GET", "/donate/v1/replay/" + "AB" * 32),
+            ("GET", "/donate/v1/replay/ab"),
+            ("GET", "/donate/v1/replays"),
+            ("GET", "/donate/v1/"),
         ]:
             with self.subTest(method=method, path=path):
                 status, _, _ = request(method, path)
                 self.assertEqual(status, 404)
+
+    def test_the_donate_page_is_the_app(self):
+        status, headers, raw = request("GET", "/donate")
+        self.assertEqual(status, 200)
+        self.assertIn(b"<title>app</title>", raw)
 
     def test_restore_is_post_only(self):
         status, _, _ = request("GET", "/v2/swap/restore")
@@ -219,6 +231,8 @@ class Explorer(unittest.TestCase):
     def test_only_the_paths_the_app_uses(self):
         for method, path in [
             ("GET", "/explorer/api/address/bc1qxy2kgdygjrsqtzq2n0yrf2493p83kkfjhx0wlh/utxo"),
+            ("GET", "/explorer/api/address/bc1qxy2kgdygjrsqtzq2n0yrf2493p83kkfjhx0wlh"),
+            ("GET", "/explorer/api/address/bc1qxy2kgdygjrsqtzq2n0yrf2493p83kkfjhx0wlh/txs/mempool"),
             ("GET", "/explorer/api/tx/abababababababababababababababababababababababababababababababab/hex"),
             ("GET", "/explorer/api/tx/abababababababababababababababababababababababababababababababab/status"),
             ("GET", "/explorer/api/tx/abababababababababababababababababababababababababababababababab/outspend/1"),
@@ -240,6 +254,9 @@ class Explorer(unittest.TestCase):
             ("GET", "/explorer/api/tx/ABABABABABABABABABABABABABABABABABABABABABABABABABABABABABABABAB/hex"),
             ("GET", "/explorer/api/tx/ab/hex"),
             ("GET", "/explorer/api/address/x/txs"),
+            ("GET", "/explorer/api/address/bc1qxy2kgdygjrsqtzq2n0yrf2493p83kkfjhx0wlh/txs"),
+            ("GET", "/explorer/api/address/bc1qxy2kgdygjrsqtzq2n0yrf2493p83kkfjhx0wlh/txs/chain"),
+            ("POST", "/explorer/api/address/bc1qxy2kgdygjrsqtzq2n0yrf2493p83kkfjhx0wlh"),
             ("GET", "/explorer/api/"),
         ]:
             with self.subTest(method=method, path=path):
@@ -261,6 +278,13 @@ class RateLimits(unittest.TestCase):
                     for _ in range(8)]
         self.assertIn(503, statuses)
         self.assertEqual(statuses[0], 200)
+
+
+    def test_the_donations_api_is_limited(self):
+        path = "/donate/v1/replay/" + "cd" * 32
+        statuses = [request("GET", path)[0] for _ in range(20)]
+        self.assertEqual(statuses[0], 200)
+        self.assertIn(503, statuses)
 
 
 class SharedPrefix(unittest.TestCase):

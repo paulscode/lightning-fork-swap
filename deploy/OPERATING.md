@@ -206,17 +206,127 @@ $K -named sendall recipients='["'$($K getnewaddress "" bech32m)'"]' \
   inputs='[{"txid":"<refund txid>","vout":<vout>}]' fee_rate=<sat/vB>
 ```
 
-## 8. Routine
+## 8. Donations
+
+Donations arrive at one address of lnd's on-chain wallet, so they are lnd's
+coins like any others. The promise on the site: they are used for
+liquidity and its on-chain fees only (channels, inbound, the fees of
+moving funds), and nothing is refunded. They are not earmarked: spend them
+as part of lnd's on-chain wallet.
+
+### Turning donations on
+
+```sh
+$L newaddress p2tr                      # once; this is the donation address
+```
+
+1. Put it in `.env` as `DONATION_ADDRESS=`, and build the web app with the
+   same address: `VITE_DONATION_ADDRESS=<address> bun run mainnet && bun run
+   build` (the donation window shows it; without it there is only the
+   "Open a channel" tab).
+2. `./scripts/init-donations-db.sh` (once; safe to run again) and
+   `./scripts/bake-macaroon.sh` (bakes `donations.macaroon`, which may only
+   list lnd's transactions, if it is missing).
+3. `docker compose up -d donations-worker donations-api`, then
+   `curl -s 127.0.0.1:9010/donate/v1/health`.
+
+The worker finds each transaction paying the address and checks whether it
+was sent with replay protection; the API tells the donation window what it
+found. The monitor alerts when either is down, when the worker stops
+passing, and once for each donation that needs a look; the weekly report
+has a "Donations" block.
+
+### Donations sent without replay protection
+
+Coins created before the fork (block 961640) exist on both chains. A wallet
+that does not sign with replay protection (the `SIGHASH_UNIFIED` bit)
+makes a transaction that is also valid on the SHA256 chain: anyone can copy
+it there, and the donor's SHA256-chain coins then land at our donation
+address on that chain. We never copy one ourselves. The worker records
+each donation's verdict:
+
+| Verdict | Meaning |
+| --- | --- |
+| `protected` | cannot be replayed (signed with the bit, or its coins do not exist on the SHA256 chain) |
+| `at_risk` | can be copied to the SHA256 chain now; rechecked hourly for 30 days, then daily for a year |
+| `replayed` | it was copied: we hold the donor's SHA256-chain coins at the donation address there |
+| `unknown` | scripts it cannot judge, or the explorers did not answer; rechecked, then look by hand |
+
+```sh
+D="docker compose exec -T donations-worker /donations"
+$D replay list                          # at_risk, replayed and unknown (--at-risk, --replayed, --unknown, --all)
+$D replay show <txid>                   # inputs, hash types, the donor's at-risk addresses
+$D replay note <txid> "<text>"          # contact, return txid, anything worth keeping
+$D check <txid>                         # check any transaction now, without recording it
+```
+
+### Giving SHA256-chain coins back (case by case)
+
+Nothing is promised; returns are a courtesy, decided case by case, and only
+after proof of ownership. Return the amount received on the SHA256 chain
+less the miner fee, once per donation transaction, and note it.
+
+1. **Proof.** The donor signs a message with the key of one of the
+   donation's input addresses (`$D replay show` lists them): BIP-322 for
+   SegWit and taproot addresses, the classic `signmessage` for legacy ones.
+   The message names the donation txid and the SHA256-chain address to
+   return to. Check it:
+   ```sh
+   $D replay verify <txid> <input address> "<message>" <signature>
+   ```
+2. **Spend our BLAKE2b side first.** The replayed transaction created the
+   same output on both chains. A return signed the ordinary way on the
+   SHA256 chain is also valid on the BLAKE2b chain while our output there
+   is unspent, so anyone could copy the return onto the BLAKE2b chain and
+   send our real donation to the donor. Check the BLAKE2b explorer
+   (`https://mempool.guide/api/tx/<txid>/outspend/<vout>`): if the output
+   is still unspent, move it within lnd first (lnd signs with replay
+   protection) and wait for a confirmation:
+   ```sh
+   $L sendcoins --utxo <txid>:<vout> --sweepall --addr $($L newaddress p2tr | jq -r .address) --sat_per_vbyte <n>
+   ```
+3. **The key, offline.** lnd signs everything with `SIGHASH_UNIFIED`, which
+   the SHA256 chain refuses, so the return is signed elsewhere. On an
+   offline machine, with lnd's seed (`/srv/lfswap/secrets/lnd-seed.txt`,
+   or the paper copy), derive the donation address's key. Its path is the
+   `derivation_path` that `$L wallet addresses list` shows for it (BIP86,
+   like `m/86'/0'/0'/0/3`). With
+   [chantools](https://github.com/lightninglabs/chantools):
+   ```sh
+   chantools derivekey --path "<derivation_path>"   # asks for the seed; prints the key (WIF)
+   ```
+4. **The return, on the SHA256 chain.** In a Bitcoin Core or Knots node of
+   the SHA256 chain (never one of the BLAKE2b chain), check the key first:
+   the descriptor `tr(<WIF>)` must give the donation address, or stop.
+   Then a wallet with that key alone:
+   ```sh
+   bitcoin-cli getdescriptorinfo "tr(<WIF>)"              # its public "descriptor" and the "checksum"
+   bitcoin-cli deriveaddresses "<public descriptor>"     # must be [ "<donation address>" ]
+   bitcoin-cli -named createwallet wallet_name=return blank=true
+   bitcoin-cli -rpcwallet=return importdescriptors '[{"desc": "<tr(WIF) with its checksum, from getdescriptorinfo>", "timestamp": <time of the replay block>}]'
+   bitcoin-cli -rpcwallet=return -named send outputs='{"<donor address>": <amount>}' \
+     inputs='[{"txid": "<donation txid>", "vout": <vout>}]' add_inputs=false \
+     subtract_fee_from_outputs='[0]' fee_rate=<sat/vB>
+   ```
+   Only that output: other donors' replayed coins at the same address stay
+   out of it (and each needs step 2 before it is ever spent).
+   Then `unloadwallet return`, delete the wallet and the key's notes, and
+   `$D replay note <txid> "returned <SHA256 txid> to <address>"`.
+
+The rest of the SHA256-chain coins (replays nobody asked about) stay where
+they are; the donation address is never reused for anything else.
+
+## 9. Routine
 
 | When | What |
 | --- | --- |
-| As it comes | Telegram alerts: each says what is wrong; the README's Alerts section lists them (a late refund: §7) |
+| As it comes | Telegram alerts: each says what is wrong; the README's Alerts section lists them (a late refund: §7; donations: §8) |
 | Weekly | the Monday report: rebalance (§4), adjust fees (§5) |
 | After any channel open or close | copy `channel.backup` offline |
 | Monthly, or as you like | take earnings out (§6) |
 | Before raising limits or the hot wallet | weeks without trouble |
 
-## 9. Before opening the service to users
+## 10. Before opening the service to users
 
 1. Funding as in §3: lnd's on-chain wallet, outbound channels, inbound, the
    hot wallet, the monitor floors.

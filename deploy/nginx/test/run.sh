@@ -46,7 +46,7 @@ render() {
 		-e "s#/etc/nginx/lfswap-maintenance.conf#/t/maintenance.conf#" \
 		-e "s#/etc/ssl/certs/ca-certificates.crt#/t/ca.crt#" \
 		-e "s#root /srv/lfswap/webapp;#root /t/webapp;#" \
-		-e "s#server 127.0.0.1:\(900[145]\)#server mock:\1#" \
+		-e "s#server 127.0.0.1:\(900[145]\|9010\)#server mock:\1#" \
 		-e "s#https://mempool.guide/api/#https://mempool.guide:$explorer_port/api/#" \
 		"$here/../lightningfork.conf"
 }

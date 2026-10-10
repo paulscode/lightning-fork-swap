@@ -91,6 +91,9 @@ fi
 # Swaps made after the backup used key indexes the restored database does
 # not know; new swaps must not use them again
 psql_q 'update keys set "highestUsedIndex" = "highestUsedIndex" + 1000' >/dev/null
+# The donations database came with the dump (a backup from before it
+# existed gets an empty one); its roles get the passwords of this .env
+"$DEPLOY/scripts/init-donations-db.sh" >/dev/null
 
 log "lnd, from its seed and channel.backup"
 dc up -d shim tor lnd
@@ -106,10 +109,11 @@ sed -E 's/^[0-9]+\. //' "$ROOT/secrets/lnd-seed.txt" | jq -R . | jq -sc \
 wait_for "lnd" 120 sh -c "docker compose exec -T lnd lncli --network=$NETWORK getinfo </dev/null | grep -Eq '\"synced_to_chain\": +true'"
 [ "$(lncli getinfo | jq -r .identity_pubkey)" = "$(jq -r .lnd_pubkey "$STAGE/manifest.json")" ] || die "lnd came back with a different identity"
 
-log "the backend, with a macaroon of the restored lnd"
+log "the backend and the donation services, with macaroons of the restored lnd"
 "$DEPLOY/scripts/bake-macaroon.sh" --force
-dc up -d boltz
+dc up -d boltz donations-worker donations-api
 wait_for "the backend" 60 curl -sf http://127.0.0.1:9001/version
+wait_for "the donations API" 60 curl -sf http://127.0.0.1:9010/donate/v1/health
 install_crons
 
 cat <<MSG
