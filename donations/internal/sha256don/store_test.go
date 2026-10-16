@@ -236,6 +236,35 @@ func TestPostgres(t *testing.T) {
 	if ls, _ := api.Locks(ctx, id); len(ls) != 1 || ls[0].Txid != strings.Repeat("1", 64) {
 		t.Fatalf("the request's locks: %+v", ls)
 	}
+	// The anchor chain: the confirmed lock's anchor is the next to spend,
+	// until a lock (not failed) spends it
+	if a, err := worker.Anchor(ctx); err != nil || a.ID != lid {
+		t.Fatalf("anchor %+v %v", a, err)
+	}
+	if np, _ := worker.NotPermanent(ctx); len(np) != 1 || np[0].ID != lid {
+		t.Fatalf("not permanent %+v", np)
+	}
+	next, err := worker.CreateLock(ctx, Lock{Txid: strings.Repeat("5", 64), Raw: "00", KeyIndex: 2,
+		State: Sent, AnchorVout: 1, AnchorIn: lid}, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := worker.Anchor(ctx); err == nil {
+		t.Fatal("an anchor spent by a lock in flight was offered")
+	}
+	_ = worker.EndLock(ctx, Lock{ID: next, State: FailedSend})
+	if a, _ := worker.Anchor(ctx); a.ID != lid {
+		t.Fatal("a failed lock kept the anchor")
+	}
+	if err := worker.SetPermanent(ctx, lid); err != nil {
+		t.Fatal(err)
+	}
+	if np, _ := worker.NotPermanent(ctx); len(np) != 0 {
+		t.Fatalf("still not permanent %+v", np)
+	}
+	if l, _ := api.GetLock(ctx, lid); !l.Permanent {
+		t.Fatal("not marked")
+	}
 
 	// Sweeps take confirmed, unswept locks, once
 	unswept, err := worker.Unswept(ctx)

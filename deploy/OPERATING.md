@@ -484,14 +484,17 @@ the SHA256 explorers, whose Bitcoin Core (30 or later) relays data outputs
 of this size; Knots does not by default. A lock no explorer takes is
 alerted and tried again an hour later. The data rules end on 1 September
 2027; from a month before, the worker makes no new lock, holds what would
-need one, and alerts once a day. From three months before, it also counts
-the locks whose BLAKE2b twin was never passed on: after that date such a
-lock could be mined on the BLAKE2b chain (its data output no longer
-refused) and take the twin to the hot wallet, then the sweep address,
-instead of to its donor. Before then, either pass those twins on by hand or
-send them back to their donors, or move the service to locks that do not
-depend on the data rules (a chained input that can never exist on the
-BLAKE2b chain).
+need one, and alerts once a day. Locks are chained: each carries an anchor output (1,000 sat, output 1) that
+the next lock spends, one lock in flight at a time. A lock is permanent
+once one of its inputs can never exist unspent on the BLAKE2b chain: a
+twin it locked was passed on (spent there), or its anchor came from a
+permanent lock. From then on every later lock is permanent too, data rules
+or not. From a month before the rules end, the worker locks only behind a
+permanent anchor. From three months before, it alerts once a day with the
+number of locks not yet permanent: after that date such a lock could be
+mined on the BLAKE2b chain and take its twin to the hot wallet, then the
+sweep address, instead of to its donor. Before then, pass those twins on
+by hand, or send them back to their donors. Sweeps never spend anchors.
 
 Payments under 5,000 sat to a request's address, on either chain, are
 kept as they are (state `kept`): never locked nor passed on. A request

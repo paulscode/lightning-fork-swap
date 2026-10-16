@@ -336,7 +336,8 @@ deploy/scripts/test/sha256-donations-test.sh    # the SHA256-chain donations swi
 (cd graph && go test ./...)                 # GRAPH_BIG=1: the 100,000-node budgets
 deploy/regtest/bootstrap.sh                 # the service on regtest
 deploy/regtest/sha256-donations-twochain.sh # SHA256-chain donations' forwards on two real
-                                            # regtest nodes sharing their first blocks
+                                            # regtest nodes sharing their first blocks;
+                                            # RDTS_EXPIRED=1: the anchors after the data rules
 (cd e2e && node run.mjs)                    # swaps, refunds and failures through the API
 python3 deploy/rebalance/regtest.py         # the rebalancer with the regtest wallets
 # the web app through the production nginx config, in Chrome (the donate

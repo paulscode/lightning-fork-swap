@@ -260,6 +260,9 @@ func (w *Worker) Pass(ctx context.Context) error {
 	if err := w.trackLocks(ctx); err != nil {
 		errs = append(errs, fmt.Errorf("following locks: %w", err))
 	}
+	if err := w.permanence(ctx, now); err != nil {
+		errs = append(errs, fmt.Errorf("permanence: %w", err))
+	}
 	if err := w.forward(ctx, now); err != nil {
 		errs = append(errs, fmt.Errorf("forwarding: %w", err))
 	}
@@ -924,52 +927,87 @@ func (w *Worker) alertOnce(ctx context.Context, now time.Time, key, text string)
 // can be passed on: what spends it there can never be valid on the SHA256
 // chain, where its coin is already spent.
 // RDTSWarning: from this long before the data rules end, an alert a day
-// counts the locks still exposed: a lock whose BLAKE2b twin was never
-// passed on can be mined on the BLAKE2b chain once the rules end (if that
-// twin exists or comes to exist there), taking the twin to our sweep
-// address instead of its donor.
+// counts the locks not yet permanent: such a lock could, once the rules
+// end, be mined on the BLAKE2b chain (if every coin it spends exists
+// there), taking a twin to our sweep address instead of its donor.
 const RDTSWarning = 90 * 24 * time.Hour
 
-func (w *Worker) exposure(ctx context.Context, now time.Time) {
-	if now.Before(w.RDTSUntil.Add(-RDTSWarning)) {
-		return
+// permanence marks the locks that can never be valid on the BLAKE2b
+// chain, whatever its data rules: one of their inputs can never exist
+// unspent there. That is a deposit whose BLAKE2b twin we passed on (spent
+// there, deep), or the anchor of a lock that is permanent itself; anchors
+// chain the locks, so one permanent lock makes every later one permanent.
+func (w *Worker) permanence(ctx context.Context, now time.Time) error {
+	locks, err := w.Store.NotPermanent(ctx)
+	if err != nil {
+		return err
 	}
 	locked, err := w.Store.DepositsIn(ctx, SHA256, Locked)
 	if err != nil {
-		return
+		return err
 	}
-	exposed := 0
-	for _, d := range locked {
-		all, err := w.Store.Deposits(ctx, d.RequestID)
-		if err != nil {
-			return
-		}
-		safe := false
-		for _, b := range all {
-			if b.Chain == BLAKE2b && b.Txid == d.Txid && b.Vout == d.Vout && b.State == Forwarded {
-				safe = true
+	permanent := map[int64]bool{}
+	left := 0
+	for _, l := range locks {
+		ok := false
+		if l.AnchorIn != 0 {
+			if permanent[l.AnchorIn] {
+				ok = true
+			} else if in, err := w.Store.GetLock(ctx, l.AnchorIn); err == nil && in.Permanent {
+				ok = true
 			}
 		}
-		if !safe {
-			exposed++
+		for _, d := range locked {
+			if ok || d.LockID != l.ID {
+				continue
+			}
+			all, err := w.Store.Deposits(ctx, d.RequestID)
+			if err != nil {
+				return err
+			}
+			for _, b := range all {
+				if b.Chain == BLAKE2b && b.Txid == d.Txid && b.Vout == d.Vout && b.State == Forwarded {
+					ok = true
+				}
+			}
 		}
+		if ok {
+			permanent[l.ID] = true
+			if err := w.Store.SetPermanent(ctx, l.ID); err != nil {
+				return err
+			}
+			continue
+		}
+		left++
 	}
-	if exposed > 0 {
+	if left > 0 && !now.Before(w.RDTSUntil.Add(-RDTSWarning)) {
 		w.alertOnce(ctx, now, "rdts-exposure", fmt.Sprintf(
-			"%d locked SHA256 donation(s) have no BLAKE2b twin passed on; their locks can be mined on the BLAKE2b chain after %s (see OPERATING, Locks)",
-			exposed, w.RDTSUntil.UTC().Format("2006-01-02")))
+			"%d lock(s) not yet permanent: they could be mined on the BLAKE2b chain after %s if their twins exist there (see OPERATING, Locks)",
+			left, w.RDTSUntil.UTC().Format("2006-01-02")))
 	}
+	return nil
 }
 
 func (w *Worker) lock(ctx context.Context, now time.Time) error {
-	w.exposure(ctx, now)
 	deposits, err := w.Store.DepositsIn(ctx, SHA256, Confirmed)
 	if err != nil || len(deposits) == 0 {
 		return err
 	}
-	if now.After(w.RDTSUntil.Add(-RDTSMargin)) {
+	// One lock at a time: each spends the anchor of the one before
+	if sent, err := w.Store.LocksIn(ctx, Sent); err != nil || len(sent) > 0 {
+		return err
+	}
+	var anchor *Lock
+	if a, err := w.Store.Anchor(ctx); err == nil {
+		anchor = &a
+	} else if !errors.Is(err, ErrNotFound) {
+		return err
+	}
+	if now.After(w.RDTSUntil.Add(-RDTSMargin)) && (anchor == nil || !anchor.Permanent) {
+		// Near the end of the data rules, only a permanent anchor keeps a
+		// new lock off the BLAKE2b chain
 		w.alertOnce(ctx, now, "rdts", fmt.Sprintf(
-			"no locks: the BLAKE2b chain's data rules end %s; donations wait (a new way to lock is needed)",
+			"no locks: the BLAKE2b chain's data rules end %s and no permanent anchor is there to chain to; donations wait",
 			w.RDTSUntil.UTC().Format("2006-01-02")))
 		return nil
 	}
@@ -1028,7 +1066,21 @@ func (w *Worker) lock(ctx context.Context, now time.Time) error {
 	if err != nil {
 		return err
 	}
-	s, err := SignLock(w.Keys, coins, uint32(j), rate, w.Params)
+	var anchorCoin *Coin
+	if anchor != nil {
+		spend, err := w.Sha256.Outspend(ctx, anchor.Txid, uint32(anchor.AnchorVout))
+		if err != nil {
+			return nil // next pass
+		}
+		if spend.Spent {
+			w.alertOnce(ctx, now, "anchor-spent", fmt.Sprintf(
+				"the anchor %s:%d was spent by %s, not by a lock of ours: not locking", anchor.Txid, anchor.AnchorVout, spend.Txid))
+			return nil
+		}
+		anchorCoin = &Coin{Txid: anchor.Txid, Vout: uint32(anchor.AnchorVout), ValueSat: AnchorSat,
+			KeyIndex: uint32(anchor.KeyIndex), Branch: Locks}
+	}
+	s, err := SignLock(w.Keys, coins, uint32(j), anchorCoin, rate, w.Params)
 	if errors.Is(err, ErrTooSmall) {
 		// More may come; an hour's wait spares the explorers meanwhile
 		_ = w.Store.SetSetting(ctx, "last_lock_wait", now.UTC().Format(time.RFC3339))
@@ -1047,7 +1099,11 @@ func (w *Worker) lock(ctx context.Context, now time.Time) error {
 		w.alertOnce(ctx, now, "lock-taken", "not locking: the BLAKE2b node would take the lock "+s.Txid)
 		return nil
 	}
-	l := Lock{Txid: s.Txid, Raw: s.Raw, KeyIndex: j, ValueSat: s.AmountSat, FeeSat: s.FeeSat, State: Sent}
+	l := Lock{Txid: s.Txid, Raw: s.Raw, KeyIndex: j, ValueSat: s.AmountSat, FeeSat: s.FeeSat,
+		State: Sent, AnchorVout: 1}
+	if anchor != nil {
+		l.AnchorIn = anchor.ID
+	}
 	id, err := w.Store.CreateLock(ctx, l, ids)
 	if err != nil {
 		return err

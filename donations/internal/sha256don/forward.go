@@ -129,6 +129,9 @@ func signWith(keys *Keys, coins []Coin, dest string, feeRate float64, params *ch
 		feeRate = 1
 	}
 	fee := int64(math.Ceil(float64(vsize) * feeRate))
+	for _, out := range extra {
+		total -= out.Value // what the extra outputs carry
+	}
 	if total-fee < MinForwardSat {
 		return nil, ErrTooSmall
 	}
@@ -206,12 +209,20 @@ var LockData = []byte(fmt.Sprintf("%-100s",
 // takes while its data rules hold.
 const MaxRDTSDataScript = 83
 
-// SignLock builds and signs the lock of coins on the SHA256 chain: one output
-// to the hot wallet's lock address j, less the fee, and LockData, which the
-// BLAKE2b chain refuses. Signed the ordinary way and verified under the
+// AnchorSat is what a lock's anchor output carries: enough to be spent,
+// passed on from lock to lock.
+const AnchorSat = 1000
+
+// SignLock builds and signs the lock of coins on the SHA256 chain, its
+// outputs all at the hot wallet's lock address j: the coins less the fee
+// (output 0), an anchor (output 1, AnchorSat) for the next lock to spend,
+// and LockData (output 2), which the BLAKE2b chain's data rules refuse.
+// anchor, when not nil, is the previous lock's anchor, spent as one more
+// input: a lock can then exist on the BLAKE2b chain only if that one can,
+// whatever the data rules. Signed the ordinary way and verified under the
 // SHA256 chain's rules.
-func SignLock(keys *Keys, coins []Coin, j uint32, feeRate float64, params *chaincfg.Params) (*Signed, error) {
-	dest, _, err := keys.AddressAt(Locks, j)
+func SignLock(keys *Keys, coins []Coin, j uint32, anchor *Coin, feeRate float64, params *chaincfg.Params) (*Signed, error) {
+	dest, script, err := keys.AddressAt(Locks, j)
 	if err != nil {
 		return nil, err
 	}
@@ -229,8 +240,12 @@ func SignLock(keys *Keys, coins []Coin, j uint32, feeRate float64, params *chain
 		}
 		return nil
 	}
-	return signWith(keys, coins, dest, feeRate, params, txscript.SigHashDefault, check,
-		wire.NewTxOut(0, data))
+	all := coins
+	if anchor != nil {
+		all = append(append([]Coin{}, coins...), *anchor)
+	}
+	return signWith(keys, all, dest, feeRate, params, txscript.SigHashDefault, check,
+		wire.NewTxOut(AnchorSat, script), wire.NewTxOut(0, data))
 }
 
 // BreaksRDTS: the transaction has an output the BLAKE2b chain's data rules

@@ -75,6 +75,12 @@ type Store interface {
 	// Confirmed locks whose output no sweep spends
 	Unswept(ctx context.Context) ([]Lock, error)
 	Locks(ctx context.Context, requestID string) ([]Lock, error)
+	// The anchor the next lock spends: the latest confirmed lock's whose
+	// anchor no lock (not failed) spends yet; ErrNotFound when none
+	Anchor(ctx context.Context) (Lock, error)
+	// Confirmed locks not yet known to be permanent, oldest first
+	NotPermanent(ctx context.Context) ([]Lock, error)
+	SetPermanent(ctx context.Context, id int64) error
 	// Records a sweep of locks' outputs and marks them, at once
 	CreateSweep(ctx context.Context, s Sweep, lockIDs []int64) (int64, error)
 	SaveSweep(ctx context.Context, s Sweep) error
@@ -168,6 +174,9 @@ CREATE TABLE IF NOT EXISTS sha256_locks (
     created_at timestamptz NOT NULL DEFAULT now()
 );
 ALTER TABLE sha256_deposits ADD COLUMN IF NOT EXISTS lock_id bigint REFERENCES sha256_locks (id);
+ALTER TABLE sha256_locks ADD COLUMN IF NOT EXISTS anchor_vout int NOT NULL DEFAULT -1;
+ALTER TABLE sha256_locks ADD COLUMN IF NOT EXISTS anchor_in bigint REFERENCES sha256_locks (id);
+ALTER TABLE sha256_locks ADD COLUMN IF NOT EXISTS permanent boolean NOT NULL DEFAULT false;
 ALTER TABLE sha256_deposits ADD COLUMN IF NOT EXISTS hold text NOT NULL DEFAULT '';
 ALTER TABLE sha256_deposits ADD COLUMN IF NOT EXISTS hold_checked timestamptz;
 CREATE TABLE IF NOT EXISTS sha256_settings (key text PRIMARY KEY, value text NOT NULL);
@@ -494,7 +503,7 @@ func (p *Postgres) EndForward(ctx context.Context, f Forward) error {
 }
 
 const lockColumns = `id, txid, raw, key_index, value_sat, fee_sat, state, confirmations,
-    error, coalesce(sweep_id, 0), created_at`
+    error, coalesce(sweep_id, 0), created_at, anchor_vout, coalesce(anchor_in, 0), permanent`
 
 func (p *Postgres) locks(ctx context.Context, where string, args ...any) ([]Lock, error) {
 	rows, err := p.Pool.Query(ctx, `SELECT `+lockColumns+` FROM sha256_locks `+where, args...)
@@ -506,7 +515,8 @@ func (p *Postgres) locks(ctx context.Context, where string, args ...any) ([]Lock
 	for rows.Next() {
 		var l Lock
 		if err := rows.Scan(&l.ID, &l.Txid, &l.Raw, &l.KeyIndex, &l.ValueSat, &l.FeeSat,
-			&l.State, &l.Confirmations, &l.Error, &l.SweepID, &l.CreatedAt); err != nil {
+			&l.State, &l.Confirmations, &l.Error, &l.SweepID, &l.CreatedAt,
+			&l.AnchorVout, &l.AnchorIn, &l.Permanent); err != nil {
 			return nil, err
 		}
 		out = append(out, l)
@@ -592,9 +602,13 @@ func (p *Postgres) CreateLock(ctx context.Context, l Lock, depositIDs []int64) (
 	}
 	defer func() { _ = tx.Rollback(ctx) }()
 	var id int64
+	var anchorIn any
+	if l.AnchorIn != 0 {
+		anchorIn = l.AnchorIn
+	}
 	if err := tx.QueryRow(ctx, `INSERT INTO sha256_locks (txid, raw, key_index, value_sat,
-        fee_sat, state) VALUES ($1, $2, $3, $4, $5, $6) RETURNING id`,
-		l.Txid, l.Raw, l.KeyIndex, l.ValueSat, l.FeeSat, l.State).Scan(&id); err != nil {
+        fee_sat, state, anchor_vout, anchor_in) VALUES ($1, $2, $3, $4, $5, $6, $7, $8) RETURNING id`,
+		l.Txid, l.Raw, l.KeyIndex, l.ValueSat, l.FeeSat, l.State, l.AnchorVout, anchorIn).Scan(&id); err != nil {
 		return 0, err
 	}
 	tag, err := tx.Exec(ctx, `UPDATE sha256_deposits SET state = $2, lock_id = $3
@@ -637,6 +651,28 @@ func (p *Postgres) EndLock(ctx context.Context, l Lock) error {
 		return err
 	}
 	return tx.Commit(ctx)
+}
+
+func (p *Postgres) Anchor(ctx context.Context) (Lock, error) {
+	ls, err := p.locks(ctx, `WHERE state = $1 AND anchor_vout >= 0 AND NOT EXISTS
+        (SELECT 1 FROM sha256_locks n WHERE n.anchor_in = sha256_locks.id AND n.state <> $2)
+        ORDER BY id DESC LIMIT 1`, Done, FailedSend)
+	if err != nil {
+		return Lock{}, err
+	}
+	if len(ls) == 0 {
+		return Lock{}, ErrNotFound
+	}
+	return ls[0], nil
+}
+
+func (p *Postgres) NotPermanent(ctx context.Context) ([]Lock, error) {
+	return p.locks(ctx, `WHERE state = $1 AND NOT permanent ORDER BY id`, Done)
+}
+
+func (p *Postgres) SetPermanent(ctx context.Context, id int64) error {
+	_, err := p.Pool.Exec(ctx, `UPDATE sha256_locks SET permanent = true WHERE id = $1`, id)
+	return err
 }
 
 func (p *Postgres) LocksIn(ctx context.Context, state string) ([]Lock, error) {
@@ -1194,6 +1230,50 @@ func (m *Memory) EndLock(ctx context.Context, l Lock) error {
 			d.State = Locked
 		} else {
 			d.State, d.LockID = Confirmed, 0
+		}
+	}
+	return nil
+}
+
+func (m *Memory) Anchor(_ context.Context) (Lock, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	for i := len(m.locks) - 1; i >= 0; i-- {
+		l := m.locks[i]
+		if l.State != Done || l.AnchorVout < 0 {
+			continue
+		}
+		taken := false
+		for _, n := range m.locks {
+			if n.AnchorIn == l.ID && n.State != FailedSend {
+				taken = true
+			}
+		}
+		if !taken {
+			return *l, nil
+		}
+	}
+	return Lock{}, ErrNotFound
+}
+
+func (m *Memory) NotPermanent(_ context.Context) ([]Lock, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	var out []Lock
+	for _, l := range m.locks {
+		if l.State == Done && !l.Permanent {
+			out = append(out, *l)
+		}
+	}
+	return out, nil
+}
+
+func (m *Memory) SetPermanent(_ context.Context, id int64) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	for _, l := range m.locks {
+		if l.ID == id {
+			l.Permanent = true
 		}
 	}
 	return nil

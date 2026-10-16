@@ -145,19 +145,25 @@ func TestSignsForTheSHA256Chain(t *testing.T) {
 
 func TestALockIsSHA256OnlyByConsensus(t *testing.T) {
 	k := vectorKeys(t)
-	s, err := SignLock(k, coins(), 7, 3, &chaincfg.MainNetParams)
+	s, err := SignLock(k, coins(), 7, nil, 3, &chaincfg.MainNetParams)
 	if err != nil {
 		t.Fatal(err)
 	}
 	tx := decode(t, s.Raw)
-	if len(tx.TxOut) != 2 {
+	if len(tx.TxOut) != 3 {
 		t.Fatalf("outputs %d", len(tx.TxOut))
 	}
 	_, lockScript, _ := k.AddressAt(Locks, 7)
 	if !bytes.Equal(tx.TxOut[0].PkScript, lockScript) || tx.TxOut[0].Value != s.AmountSat {
 		t.Fatal("the lock does not pay the hot wallet's lock address")
 	}
-	data := tx.TxOut[1]
+	if !bytes.Equal(tx.TxOut[1].PkScript, lockScript) || tx.TxOut[1].Value != AnchorSat {
+		t.Fatalf("anchor %+v", tx.TxOut[1])
+	}
+	if s.AmountSat+AnchorSat+s.FeeSat != 100_000 {
+		t.Fatalf("%+v", s)
+	}
+	data := tx.TxOut[2]
 	if data.Value != 0 || data.PkScript[0] != txscript.OP_RETURN || len(data.PkScript) != 103 ||
 		!bytes.Contains(data.PkScript, []byte("invalid on the BLAKE2b chain by design")) {
 		t.Fatalf("data output %x", data.PkScript)
@@ -184,5 +190,32 @@ func TestALockIsSHA256OnlyByConsensus(t *testing.T) {
 	small.TxOut[0].PkScript = big
 	if !BreaksRDTS(small) {
 		t.Fatal("an 84-byte OP_RETURN")
+	}
+}
+
+func TestALockSpendsThePreviousAnchor(t *testing.T) {
+	k := vectorKeys(t)
+	first, err := SignLock(k, coins(), 0, nil, 3, &chaincfg.MainNetParams)
+	if err != nil {
+		t.Fatal(err)
+	}
+	anchor := Coin{Txid: first.Txid, Vout: 1, ValueSat: AnchorSat, KeyIndex: 0, Branch: Locks}
+	next, err := SignLock(k, coins()[:1], 1, &anchor, 3, &chaincfg.MainNetParams)
+	if err != nil {
+		t.Fatal(err)
+	}
+	tx := decode(t, next.Raw)
+	if len(tx.TxIn) != 2 || tx.TxIn[1].PreviousOutPoint.String() != first.Txid+":1" {
+		t.Fatalf("inputs %+v", tx.TxIn)
+	}
+	if next.AmountSat+AnchorSat+next.FeeSat != 60_000+AnchorSat {
+		t.Fatalf("%+v", next)
+	}
+	f := fetcherFor(t, k, coins()[:1])
+	_, ls, _ := k.AddressAt(Locks, 0)
+	h, _ := chainhash.NewHashFromStr(first.Txid)
+	f.(*txscript.MultiPrevOutFetcher).AddPrevOut(*wire.NewOutPoint(h, 1), wire.NewTxOut(AnchorSat, ls))
+	if err := CheckSHA256(tx, f); err != nil {
+		t.Fatal(err)
 	}
 }

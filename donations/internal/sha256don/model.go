@@ -122,6 +122,14 @@ type Lock struct {
 	Error         string
 	SweepID       int64
 	CreatedAt     time.Time
+	// Its anchor output (1), or -1 for a lock made before anchors
+	AnchorVout int
+	// The lock whose anchor it spends, 0 for none
+	AnchorIn int64
+	// It can never be valid on the BLAKE2b chain, whatever the data rules:
+	// an input of it can never exist unspent there (a twin passed on, or
+	// the anchor of a lock that is permanent too)
+	Permanent bool
 }
 
 // Sweep is a transaction on the SHA256 chain sending locks' outputs on to

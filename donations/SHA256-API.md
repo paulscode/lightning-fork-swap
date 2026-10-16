@@ -207,8 +207,8 @@ check it yourself on any explorer:
    SHA256 explorer it uses, again at the moment it forwards. So no version
    of your forward can
    ever be valid on the SHA256 chain: its coin is already spent there.
-3. The lock has an output the BLAKE2b chain's consensus refuses: an
-   OP_RETURN of 103 bytes, over the 83 its data rules allow, which reads
+3. The lock has an output the BLAKE2b chain's consensus refuses (output
+   2): an OP_RETURN of 103 bytes, over the 83 its data rules allow, which reads
    "Lightning Fork Swap lock: invalid on the BLAKE2b chain by design". So
    the lock can never be mined on the BLAKE2b chain, and never compete
    there with your forward.
@@ -229,12 +229,19 @@ SHA256 chain:
 
 Until then it is held, and `hold` says why.
 
-The BLAKE2b chain's data rules end on 1 September 2027. From a month before,
-the service makes no new locks and holds what would need one. Locks made
-before stay valid. A lock whose BLAKE2b twin was never passed on (a deposit
-held or kept) could, after that date, be mined on the BLAKE2b chain and take
-that twin to the service's own wallet instead of to its donor; the service
-alerts its operator about any such lock from three months before.
+Each lock also carries a small anchor output, and the next lock spends it.
+A lock can exist on the BLAKE2b chain only if every coin it spends does,
+so once one lock can never be there (because a twin it spent on the SHA256
+chain was passed on, which spends that twin on the BLAKE2b chain), no lock
+after it in the chain can be either, whatever happens to the data rules.
+
+The BLAKE2b chain's data rules end on 1 September 2027. From a month
+before, the service makes a new lock only behind such a permanent anchor,
+and holds what would need another. A lock made before that and not yet
+permanent (the first ones in the chain, if their twins were never passed
+on) could, after that date, be mined on the BLAKE2b chain and take its twin
+to the service's wallet instead of its donor; the service alerts its
+operator about any such lock from three months before.
 
 ## Asking for a copy
 

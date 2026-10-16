@@ -974,13 +974,93 @@ func TestLocksExposedAtTheEndOfTheDataRulesAreAlerted(t *testing.T) {
 	h.pass(t)
 	h.sha.confirm(txid(h.sha.broadcast[0]), 95)
 	h.pass(t) // locked; its twin never appears on the BLAKE2b chain
-	if strings.Contains(logged.String(), "no BLAKE2b twin") {
+	if strings.Contains(logged.String(), "not yet permanent") {
 		t.Fatal("alerted long before the end")
 	}
 	h.w.RDTSUntil = h.clock.Add(60 * 24 * time.Hour)
 	h.pass(t)
 	h.pass(t)
-	if n := strings.Count(logged.String(), "1 locked SHA256 donation(s) have no BLAKE2b twin"); n != 1 {
+	if n := strings.Count(logged.String(), "1 lock(s) not yet permanent"); n != 1 {
 		t.Fatalf("alerted %d times: %s", n, logged.String())
+	}
+}
+
+// chainOfTwo: a first donation locked (6 deep) with its twin forwarded or
+// not, then a second donation locked behind the first lock's anchor
+func chainOfTwo(t *testing.T, forwardFirst bool) (*harness, Request, []Lock) {
+	t.Helper()
+	h := newHarness(t)
+	r := h.request(t, "req-1", dest, false)
+	h.sha.pay(txA, r.Address, 50_000, 98, "bc1qdonor")
+	if forwardFirst {
+		h.node.put(t, h.w.Keys, 0, txA, 1, 50_000, 6)
+	}
+	h.pass(t)
+	first := txid(h.sha.broadcast[0])
+	h.sha.confirm(first, 95)
+	h.pass(t) // locked; forwarded if its twin is there
+	if forwardFirst {
+		fwd, _ := h.store.ForwardsIn(context.Background(), Sent)
+		if len(fwd) != 1 {
+			t.Fatalf("forwards %d", len(fwd))
+		}
+		delete(h.node.utxos, txA+":1")
+		h.node.utxos[fwd[0].Txid+":0"].Confirmations = 6
+		h.pass(t) // forwarded, deep: the first lock is permanent
+	}
+	h.sha.pay(txB, r.Address, 40_000, 98, "bc1qdonor")
+	h.pass(t)
+	if len(h.sha.broadcast) != 2 {
+		t.Fatalf("locks %d", len(h.sha.broadcast))
+	}
+	second := decode(t, h.sha.broadcast[1])
+	if len(second.TxIn) != 2 || second.TxIn[1].PreviousOutPoint.String() != first+":1" {
+		t.Fatalf("the second lock does not spend the first's anchor: %+v", second.TxIn)
+	}
+	h.sha.confirm(second.TxHash().String(), 95)
+	h.pass(t)
+	var locks []Lock
+	for _, st := range []string{Done} {
+		ls, _ := h.store.LocksIn(context.Background(), st)
+		locks = append(locks, ls...)
+	}
+	return h, r, locks
+}
+
+func TestOnePermanentLockMakesTheNextOnesPermanent(t *testing.T) {
+	_, _, locks := chainOfTwo(t, true)
+	if len(locks) != 2 || !locks[0].Permanent || !locks[1].Permanent || locks[1].AnchorIn != locks[0].ID {
+		t.Fatalf("%+v", locks)
+	}
+}
+
+func TestALockWhoseTwinWasNotPassedOnIsNotPermanent(t *testing.T) {
+	_, _, locks := chainOfTwo(t, false)
+	if len(locks) != 2 || locks[0].Permanent || locks[1].Permanent {
+		t.Fatalf("%+v", locks)
+	}
+}
+
+func TestNearTheEndOfTheDataRulesOnlyAPermanentAnchorLocks(t *testing.T) {
+	for _, permanent := range []bool{true, false} {
+		h, r, _ := chainOfTwo(t, permanent)
+		h.w.RDTSUntil = h.clock.Add(10 * 24 * time.Hour)
+		h.sha.pay(strings.Repeat("c", 64), r.Address, 30_000, 98, "bc1qdonor")
+		h.pass(t)
+		if got := len(h.sha.broadcast) == 3; got != permanent {
+			t.Fatalf("permanent anchor %v: locked %v", permanent, got)
+		}
+	}
+}
+
+func TestOneLockAtATime(t *testing.T) {
+	h := newHarness(t)
+	r := h.request(t, "req-1", dest, false)
+	h.sha.pay(txA, r.Address, 50_000, 98, "bc1qdonor")
+	h.pass(t)
+	h.sha.pay(txB, r.Address, 40_000, 98, "bc1qdonor")
+	h.pass(t)
+	if len(h.sha.broadcast) != 1 {
+		t.Fatalf("a second lock while the first is in flight: %d", len(h.sha.broadcast))
 	}
 }

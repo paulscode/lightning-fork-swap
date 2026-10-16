@@ -6,6 +6,9 @@
 # taken by the BLAKE2b node and refused by the SHA256 one.
 #
 #   deploy/regtest/sha256-donations-twochain.sh
+#   RDTS_EXPIRED=1 deploy/regtest/sha256-donations-twochain.sh
+#                   the same with the BLAKE2b node's data rules already
+#                   ended: anchors keep locks off the BLAKE2b chain
 #
 # SHA256_BITCOIND: a SHA256-chain node (bitcoin-cli next to it): Knots'
 # policy series on Core (knots-sha256), relaying data outputs up to 200
@@ -22,6 +25,13 @@ SHA256_BITCOIND=${SHA256_BITCOIND:-/mnt/Black/knots-sha256-framework/build/ks-31
 SHA256_CLI=$(dirname "$SHA256_BITCOIND")/bitcoin-cli
 KNOTS_IMAGE=${KNOTS_IMAGE:-lfswap/knots:29.4.2}
 name=lfswap-twochain-$$
+# When the BLAKE2b node's data rules end: as on mainnet, or long ago
+rdts_expiry=1819843200
+test=TestTwoChains
+if [ -n "${RDTS_EXPIRED:-}" ]; then
+	rdts_expiry=1600000000
+	test=TestTwoChainsAfterTheDataRules
+fi
 work=$(mktemp -d)
 sha_pid=
 cleanup() {
@@ -35,7 +45,7 @@ trap cleanup EXIT
 
 docker run -d --rm --name "$name" --network host "$KNOTS_IMAGE" \
 	-regtest -server -listen=1 -port=19444 -rpcport=19443 -rpcbind=127.0.0.1 -rpcallowip=127.0.0.1 \
-	-rpcuser=lab -rpcpassword=lab -testactivationheight=blake2b@20 -rdtsexpiry=1819843200 \
+	-rpcuser=lab -rpcpassword=lab -testactivationheight=blake2b@20 -rdtsexpiry="$rdts_expiry" \
 	-fallbackfee=0.0002 -disablewallet=0 -listenonion=0 -dnsseed=0 -fixedseeds=0 >/dev/null
 mkdir -p "$work/sha"
 "$SHA256_BITCOIND" -regtest -datadir="$work/sha" -server -listen=1 -port=19544 -rpcport=19543 \
@@ -71,4 +81,4 @@ echo "two chains: shared to 19, BLAKE2b at $(b getblockcount), SHA256 at $(s get
 
 cd "$repo/donations"
 TWOCHAIN_BLAKE2B=http://lab:lab@127.0.0.1:19443 TWOCHAIN_SHA256=http://lab:lab@127.0.0.1:19543 \
-	go test -count=1 -run TestTwoChains -v ./internal/sha256don
+	TWOCHAIN_RDTS_EXPIRED=${RDTS_EXPIRED:-} go test -count=1 -run "^$test\$" -v ./internal/sha256don

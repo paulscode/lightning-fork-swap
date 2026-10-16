@@ -120,7 +120,7 @@ func TestTwoChains(t *testing.T) {
 	// it for its data output while its coin is unspent there, and will not
 	// mine it (consensus, not only relay)
 	lockCoins := []Coin{{Txid: txid, Vout: uint32(vout), ValueSat: coin.ValueSat, KeyIndex: 0}}
-	lock, err := SignLock(keys, lockCoins, 0, 2, params)
+	lock, err := SignLock(keys, lockCoins, 0, nil, 2, params)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -236,4 +236,126 @@ func resign(t *testing.T, keys *Keys, raw string, value int64, script []byte, ha
 	var buf bytes.Buffer
 	_ = tx.Serialize(&buf)
 	return hex.EncodeToString(buf.Bytes())
+}
+
+// TestTwoChainsAfterTheDataRules runs with the BLAKE2b node's data rules
+// expired (TWOCHAIN_RDTS_EXPIRED=1, set by the script's RDTS_EXPIRED mode):
+// a lock's data output no longer keeps it off the BLAKE2b chain. An
+// unanchored lock of a twin left unspent there can then be mined there;
+// a lock chained behind a permanent one (its anchor from a lock whose twin
+// was passed on) cannot.
+func TestTwoChainsAfterTheDataRules(t *testing.T) {
+	if os.Getenv("TWOCHAIN_RDTS_EXPIRED") == "" {
+		t.Skip("run by deploy/regtest/sha256-donations-twochain.sh with RDTS_EXPIRED=1")
+	}
+	ctx := context.Background()
+	b2b, sha := client(t, os.Getenv("TWOCHAIN_BLAKE2B"), ""), client(t, os.Getenv("TWOCHAIN_SHA256"), "")
+	donor, miner := client(t, os.Getenv("TWOCHAIN_SHA256"), "donor"), client(t, os.Getenv("TWOCHAIN_SHA256"), "miner")
+	params := &chaincfg.RegressionNetParams
+	seed, _ := hex.DecodeString(vectorSeed)
+	keys, _ := NewKeys(seed, params)
+	var minerAddr string
+	call(t, miner, "getnewaddress", nil, &minerAddr)
+	var mined []string
+
+	// Three donations to request addresses 0, 1, 2, copied over by the
+	// network, confirmed on both chains
+	type donation struct {
+		coin Coin
+		raw  string
+	}
+	var ds []donation
+	for i := uint32(0); i < 3; i++ {
+		addr, script, _ := keys.Address(i)
+		var id string
+		call(t, donor, "sendtoaddress", []any{addr, 1.0}, &id)
+		var got struct {
+			Hex string `json:"hex"`
+		}
+		call(t, donor, "gettransaction", []any{id}, &got)
+		tx := decodeHex(t, got.Hex)
+		for v, out := range tx.TxOut {
+			if bytes.Equal(out.PkScript, script) {
+				ds = append(ds, donation{Coin{Txid: id, Vout: uint32(v), ValueSat: out.Value, KeyIndex: i}, got.Hex})
+			}
+		}
+	}
+	call(t, sha, "generatetoaddress", []any{1, minerAddr}, &mined)
+	for _, d := range ds {
+		if _, err := b2b.Send(ctx, d.raw); err != nil {
+			t.Fatalf("the copy: %v", err)
+		}
+	}
+	call(t, b2b, "generatetoaddress", []any{6, minerAddr}, &mined)
+
+	// The danger: donation 0 locked without an anchor; its twin unspent on
+	// the BLAKE2b chain. With the data rules gone, the BLAKE2b chain mines it
+	l0, err := SignLock(keys, []Coin{ds[0].coin}, 0, nil, 2, params)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := sha.Send(ctx, l0.Raw); err != nil {
+		t.Fatal(err)
+	}
+	var block any
+	if err := b2b.Call(ctx, "generateblock", []any{minerAddr, []string{l0.Raw}}, &block); err != nil {
+		t.Fatalf("expected the BLAKE2b chain to mine an unanchored lock once the data rules end: %v", err)
+	}
+	t.Log("without its data rules, the BLAKE2b chain mines an unanchored lock of an unspent twin")
+
+	// The fix: donation 1 locked (lock 1), its twin passed on, so lock 1
+	// can never be on the BLAKE2b chain; donation 2 locked behind lock 1's
+	// anchor (lock 2). Its own twin is unspent there, yet lock 2 cannot be
+	// mined: its anchor does not exist there
+	l1, err := SignLock(keys, []Coin{ds[1].coin}, 1, nil, 2, params)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := sha.Send(ctx, l1.Raw); err != nil {
+		t.Fatal(err)
+	}
+	call(t, sha, "generatetoaddress", []any{6, minerAddr}, &mined)
+	var ret string
+	call(t, miner, "getnewaddress", nil, &ret)
+	f1, err := Sign(keys, []Coin{ds[1].coin}, ret, 2, params)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := b2b.Send(ctx, f1.Raw); err != nil {
+		t.Fatal(err)
+	}
+	call(t, b2b, "generatetoaddress", []any{6, minerAddr}, &mined)
+
+	anchor := Coin{Txid: l1.Txid, Vout: 1, ValueSat: AnchorSat, KeyIndex: 1, Branch: Locks}
+	l2, err := SignLock(keys, []Coin{ds[2].coin}, 2, &anchor, 2, params)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if acc, err := sha.TestAccept(ctx, l2.Raw); err != nil || !acc.Allowed {
+		t.Fatalf("the SHA256 node on the anchored lock: %+v %v", acc, err)
+	}
+	if c, _ := b2b.TxOut(ctx, ds[2].coin.Txid, ds[2].coin.Vout, true); c == nil {
+		t.Fatal("donation 2's twin is not unspent on the BLAKE2b chain")
+	}
+	for _, pkg := range [][]string{{l2.Raw}, {l1.Raw, l2.Raw}} {
+		err := b2b.Call(ctx, "generateblock", []any{minerAddr, pkg}, &block)
+		if err == nil {
+			t.Fatalf("the BLAKE2b chain mined the anchored lock (with %d transactions)", len(pkg))
+		}
+		t.Logf("the BLAKE2b chain refuses the anchored lock (%d tx): %v", len(pkg), err)
+	}
+
+	// The control: donation 2 locked without the anchor would be mined
+	bare, err := SignLock(keys, []Coin{ds[2].coin}, 3, nil, 2, params)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if acc, err := b2b.TestAccept(ctx, bare.Raw); err != nil {
+		t.Fatal(err)
+	} else {
+		t.Logf("the same lock without the anchor, on the BLAKE2b node's mempool: allowed=%v %s", acc.Allowed, acc.Reason)
+	}
+	if err := b2b.Call(ctx, "generateblock", []any{minerAddr, []string{bare.Raw}}, &block); err != nil {
+		t.Fatalf("control: the unanchored lock of donation 2 should be minable: %v", err)
+	}
 }
