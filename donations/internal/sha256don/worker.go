@@ -192,9 +192,9 @@ func (w *Worker) Pass(ctx context.Context) error {
 	if err := w.track(ctx); err != nil {
 		errs = append(errs, fmt.Errorf("following forwards: %w", err))
 	}
-	if len(errs) == 0 {
-		_ = w.Store.SetSetting(ctx, SettingLastPass, now.UTC().Format(time.RFC3339))
-	}
+	// Alive and handing out addresses: what the API and the monitor ask.
+	// A request whose explorer failed is looked at again next pass.
+	_ = w.Store.SetSetting(ctx, SettingLastPass, now.UTC().Format(time.RFC3339))
 	return errors.Join(errs...)
 }
 

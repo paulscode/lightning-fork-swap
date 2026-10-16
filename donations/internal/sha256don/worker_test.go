@@ -397,3 +397,18 @@ func TestOldRequestsAreLookedAtLessOften(t *testing.T) {
 		}
 	}
 }
+
+func TestAFailingExplorerDoesNotPauseTheService(t *testing.T) {
+	h := newHarness(t)
+	h.request(t, "req-1", "", false)
+	h.sha.byAddress = nil
+	h.sha.fail = errors.New("mempool.space down")
+	h.clock = h.clock.Add(time.Minute)
+	if err := h.w.Pass(context.Background()); err == nil {
+		t.Fatal("the failure was not reported")
+	}
+	last, _ := h.store.Setting(context.Background(), SettingLastPass)
+	if last != h.clock.UTC().Format(time.RFC3339) {
+		t.Fatalf("last pass %q", last)
+	}
+}
