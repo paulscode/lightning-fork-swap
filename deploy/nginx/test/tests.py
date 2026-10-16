@@ -82,6 +82,10 @@ class Allowlist(unittest.TestCase):
             ("POST", "/donate/v1/channel-orders", 9010),
             ("GET", "/donate/v1/channel-orders/AbCdEfGhIjKlMnOpQrSt_-", 9010),
             ("PATCH", "/donate/v1/channel-orders/AbCdEfGhIjKlMnOpQrSt_-/node", 9010),
+            ("GET", "/donate/v1/sha256/info", 9010),
+            ("POST", "/donate/v1/sha256", 9010),
+            ("GET", "/donate/v1/sha256/AbCdEfGhIjKlMnOpQrSt_-", 9010),
+            ("POST", "/donate/v1/sha256/AbCdEfGhIjKlMnOpQrSt_-/tx", 9010),
         ]:
             with self.subTest(method=method, path=path):
                 status, _, raw = request(method, path, body="{}"
@@ -114,6 +118,10 @@ class Allowlist(unittest.TestCase):
             ("POST", "/donate/v1/channel-orders/AbCdEfGhIjKlMnOpQrSt_-"),
             ("PATCH", "/donate/v1/channel-orders/AbCdEfGhIjKlMnOpQrSt_-"),
             ("GET", "/donate/v1/channel-orders/short"),
+            ("GET", "/donate/v1/sha256"),
+            ("DELETE", "/donate/v1/sha256/AbCdEfGhIjKlMnOpQrSt_-"),
+            ("GET", "/donate/v1/sha256/AbCdEfGhIjKlMnOpQrSt_-/tx"),
+            ("POST", "/donate/v1/sha256/short/tx"),
             ("PUT", "/donate/v1/channel-orders/AbCdEfGhIjKlMnOpQrSt_-/node"),
         ]:
             with self.subTest(method=method, path=path):
@@ -331,7 +339,7 @@ class RateLimits(unittest.TestCase):
     def test_a_big_body_is_refused(self):
         status, _, _ = request("PATCH",
                                "/donate/v1/channel-orders/AbCdEfGhIjKlMnOpQrSt_-/node",
-                               body="x" * 5000)
+                               body="x" * 17000)
         self.assertEqual(status, 413)
 
     def test_the_donations_api_is_limited(self):

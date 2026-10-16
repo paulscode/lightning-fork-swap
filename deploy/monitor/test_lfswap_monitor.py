@@ -405,6 +405,61 @@ class ChecksTest(unittest.TestCase):
         for key in ("channels:unknown:dd:0", "channels:push:ee:0"):
             self.assertTrue(alerts[key].event)
 
+    def sha256(self, sql, extra_ps=True):
+        outputs = healthy()
+        if extra_ps:
+            outputs[("ps",)] += "\n" + "\n".join(
+                json.dumps({"Service": s, "State": "running"})
+                for s in m.SHA256_SERVICES)
+        outputs["sql"] = {"FROM sha256_settings": "2026-10-07T11:58:00Z\n", **sql}
+        outputs[("logs", "donations-sha256")] = sql.pop("logs", "")
+        return run(outputs, env={"SHA256_DONATIONS": "on"})
+
+    def test_sha256_donations_off_by_default(self):
+        alerts, runner = run()
+        self.assertFalse(any("sha256_" in q for q in runner.queries))
+        self.assertFalse(any(c[-1] == "donations-sha256" for c in runner.calls))
+
+    def test_a_healthy_sha256_worker(self):
+        alerts, runner = self.sha256({})
+        self.assertEqual(alerts, {})
+        self.assertIn("donations-sha256",
+                      [c[-1] for c in runner.calls if c[0] == "logs"])
+
+    def test_sha256_worker_down_or_stale(self):
+        alerts, _ = self.sha256({}, extra_ps=False)
+        self.assertIn("container:donations-sha256", alerts)
+        alerts, _ = self.sha256({"FROM sha256_settings": "2026-10-07T11:30:00Z\n"})
+        self.assertIn("since 2026-10-07 11:30 UTC", alerts["sha256:stale"].text)
+
+    def test_sha256_donations_forwards_and_copies_are_events(self):
+        tx = "ab" * 32
+        alerts, _ = self.sha256({
+            "state = 'confirmed' AND first_seen": f"req1|{tx}|1|50000\n",
+            "FROM sha256_forwards": f"{'cd' * 32}|49000|bc1qdest|sent|\n"
+                                    f"{'ef' * 32}|7000|bc1qdest|failed|min relay fee not met\n",
+            "copy_state = 'copied'": f"req1|{tx}\n",
+            "logs": "2026/10/07 11:59:00 ALERT: forward x refused by our node: y\n",
+        })
+        donation = alerts[f"sha256:donation:{tx}:1"]
+        self.assertTrue(donation.event)
+        self.assertIn("50,000 sat", donation.text)
+        self.assertIn("SHA256-chain donation", donation.text)
+        self.assertIn("bc1qdest", alerts[f"sha256:forward:{'cd' * 32}"].text)
+        self.assertIn("min relay fee", alerts[f"sha256:forward-failed:{'ef' * 32}"].text)
+        self.assertTrue(alerts[f"sha256:copied:{tx}"].event)
+        self.assertTrue(any(a.text.startswith("SHA256 donations: ") and "ALERT" in a.text
+                            for a in alerts.values()))
+        for a in alerts.values():
+            self.assertNotIn("Bitcoin", a.text)
+
+    def test_a_large_sha256_balance(self):
+        alerts, _ = self.sha256({"coalesce(sum(value_sat), 0)": "6000000\n"})
+        self.assertIn("6,000,000 sat", alerts["sha256:balance"].text)
+        self.assertFalse(alerts["sha256:balance"].event)
+        alerts, _ = self.sha256({"coalesce(sum(value_sat), 0)": "4000000\n"})
+        self.assertNotIn("sha256:balance", alerts)
+
     def test_log_lines_that_need_a_person(self):
         outputs = healthy()
         outputs[("logs", "shim")] = (

@@ -209,6 +209,10 @@ services:
       CHANNEL_DONATIONS: ${CHANNEL_DONATIONS:-off}
       CHANNEL_MAX_SAT: ${CHANNEL_MAX_SAT:-}
       CHANNEL_MAX_WUMBO_SAT: ${CHANNEL_MAX_WUMBO_SAT:-}
+      # on: the SHA256-chain donation routes too (it may then insert a
+      # request or a hint, and nothing else)
+      SHA256_DONATIONS: ${SHA256_DONATIONS:-off}
+      SHA256_MAX_PER_DAY: ${SHA256_MAX_PER_DAY:-}
     ports:
       - "127.0.0.1:9010:9010"
     logging: *logging
@@ -242,6 +246,39 @@ services:
       - ${LFSWAP_ROOT:-/srv/lfswap}/graph-state:/state
     logging: *logging
     mem_limit: 256m
+
+  # SHA256-chain donations (profile "sha256"; scripts/sha256-donations.sh
+  # turns them on): each request an address of its own seed; what reaches
+  # it on the BLAKE2b chain is passed on, signed so that it can't be copied
+  # to the SHA256 chain. Knots as a user that may read the chain and relay,
+  # no wallet call; no lnd macaroon; no listening port.
+  donations-sha256:
+    image: lfswap/donations:dev
+    profiles: [sha256]
+    security_opt: [no-new-privileges:true]
+    read_only: true
+    restart: unless-stopped
+    command: ["sha256"]
+    depends_on:
+      postgres: {condition: service_started}
+      knots: {condition: service_started}
+    environment:
+      DONATIONS_DB_URL: postgres://donations_worker:${DONATIONS_WORKER_DBPASSWORD:?run scripts/setup.sh}@postgres:5432/donations?sslmode=disable
+      SHA256_SEED_FILE: /secrets/sha256-donations.seed
+      KNOTS_RPC_URL: http://knots:8332
+      KNOTS_RPC_USER: donations
+      KNOTS_RPC_PASSWORD: ${DONATIONS_RPCPASSWORD:?run scripts/setup.sh}
+      DONATION_ADDRESSES: ${DONATION_ADDRESS:-}
+      BLAKE2B_EXPLORERS: ${DONATIONS_BLAKE2B_EXPLORERS:-}
+      SHA256_EXPLORERS: ${DONATIONS_SHA256_EXPLORERS:-}
+    volumes:
+      - type: bind
+        source: ${LFSWAP_ROOT:-/srv/lfswap}/secrets/sha256-donations.seed
+        target: /secrets/sha256-donations.seed
+        read_only: true
+        bind: {create_host_path: false}
+    logging: *logging
+    mem_limit: 64m
 
   # Channel donations (profile "channels": COMPOSE_PROFILES=channels in
   # .env). The guard is lnd's middleware for the worker's macaroon: it holds

@@ -75,6 +75,11 @@ func (c *Client) call(ctx context.Context, method string, params []any, out any)
 	return dec.Decode(out)
 }
 
+// Call makes any call (tests use it to mine and to run wallets).
+func (c *Client) Call(ctx context.Context, method string, params []any, out any) error {
+	return c.call(ctx, method, params, out)
+}
+
 // Sats reads an amount in BTC, as Knots writes it, exactly.
 func Sats(n json.Number) (int64, error) {
 	r, ok := new(big.Rat).SetString(string(n))

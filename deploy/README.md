@@ -330,10 +330,13 @@ deploy/nginx/test/run.sh                    # the nginx config, in the host's ng
 python3 -m unittest discover -s deploy/monitor
 python3 -m unittest discover -s deploy/rebalance
 deploy/scripts/test/channel-donations-test.sh   # the channel donations switch
+deploy/scripts/test/sha256-donations-test.sh    # the SHA256-chain donations switch
 (cd shim && go test -race ./...)
-(cd donations && go test ./...)             # DONATIONS_TEST_DB=postgres://... also tests the store
+(cd donations && go test ./...)             # DONATIONS_TEST_DB=postgres://... also tests the stores
 (cd graph && go test ./...)                 # GRAPH_BIG=1: the 100,000-node budgets
 deploy/regtest/bootstrap.sh                 # the service on regtest
+deploy/regtest/sha256-donations-twochain.sh # SHA256-chain donations' forwards on two real
+                                            # regtest nodes sharing their first blocks
 (cd e2e && node run.mjs)                    # swaps, refunds and failures through the API
 python3 deploy/rebalance/regtest.py         # the rebalancer with the regtest wallets
 # the web app through the production nginx config, in Chrome (the donate

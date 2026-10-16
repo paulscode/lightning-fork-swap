@@ -18,7 +18,18 @@
 //	donations replay verify TXID ADDRESS MESSAGE SIGNATURE
 //	                     check a donor's proof that ADDRESS (one of the
 //	                     transaction's inputs) is theirs
-//	donations check TXID check a transaction now, print the result
+//	donations check [--sha256] TXID
+//	                     check a transaction now, print the result; with
+//	                     --sha256, a SHA256-chain transaction: whether it
+//	                     could also be valid on the BLAKE2b chain
+//	donations sha256     run SHA256-chain donations (DONATIONS_DB_URL,
+//	                     SHA256_SEED_FILE, KNOTS_RPC_URL, KNOTS_RPC_USER,
+//	                     KNOTS_RPC_PASSWORD[_FILE], SHA256_LND_ADDRESS or
+//	                     the first of DONATION_ADDRESSES); the API serves
+//	                     them with SHA256_DONATIONS=on
+//	donations sha256 list [--all] | show ID | export [--private]
+//	                     requests with deposits (or all), one in full, the
+//	                     wallet as a descriptor for another wallet
 //	donations orders list [--all] | show ID | retry ID | fallback ID
 //	                     channel donations: list the active ones (or all),
 //	                     show one with its timeline, try one again now, or
@@ -86,7 +97,7 @@ func main() {
 
 func run(ctx context.Context, args []string, logger *log.Logger) error {
 	if len(args) == 0 {
-		return errors.New("usage: donations worker|api|channels|guard|replay|check")
+		return errors.New("usage: donations worker|api|channels|guard|sha256|replay|check")
 	}
 	switch args[0] {
 	case "worker":
@@ -95,14 +106,27 @@ func run(ctx context.Context, args []string, logger *log.Logger) error {
 		return runChannels(ctx, logger)
 	case "guard":
 		return runGuard(ctx, logger)
+	case "sha256":
+		if len(args) > 1 {
+			return runSHA256CLI(ctx, args[1:])
+		}
+		return runSHA256(ctx, logger)
 	case "api":
 		return runAPI(ctx, logger)
 	case "check":
-		if len(args) != 2 {
-			return errors.New("usage: donations check TXID")
+		usage := errors.New("usage: donations check [--sha256] TXID")
+		if len(args) < 2 || len(args) > 3 || (len(args) == 3 && args[1] != "--sha256") {
+			return usage
 		}
 		blake2b, sha256 := explorers()
-		result, err := replay.Check(ctx, args[1], blake2b, sha256)
+		check := replay.Check
+		if len(args) == 3 {
+			// A SHA256-chain transaction: could it be valid on the BLAKE2b chain?
+			check = func(ctx context.Context, txid string, a, b replay.Explorer) (replay.Result, error) {
+				return replay.CheckSHA256(ctx, txid, b, a)
+			}
+		}
+		result, err := check(ctx, args[len(args)-1], blake2b, sha256)
 		if err != nil {
 			return err
 		}
@@ -173,6 +197,10 @@ func runAPI(ctx context.Context, logger *log.Logger) error {
 	if env("CHANNEL_DONATIONS", "off") == "on" {
 		more = append(more, channelAPI(db.Pool))
 		logger.Print("channel donations on")
+	}
+	if env("SHA256_DONATIONS", "off") == "on" {
+		more = append(more, sha256API(db.Pool))
+		logger.Print("SHA256 donations on")
 	}
 	server := &http.Server{
 		Addr:              env("LISTEN", ":9010"),

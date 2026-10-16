@@ -17,7 +17,7 @@ if [ ! -f .env ]; then
 	chmod 600 .env
 fi
 for var in LND_RPCPASSWORD BOLTZ_RPCPASSWORD SHIM_RPCPASSWORD POSTGRES_PASSWORD TOR_CONTROL_PASSWORD \
-	DONATIONS_WORKER_DBPASSWORD DONATIONS_API_DBPASSWORD; do
+	DONATIONS_WORKER_DBPASSWORD DONATIONS_API_DBPASSWORD DONATIONS_RPCPASSWORD; do
 	if ! grep -q "^$var=" .env; then
 		# A key the .env of an older install does not have
 		echo "$var=$(rand)" >> .env
@@ -77,8 +77,20 @@ PY
 }
 RPCAUTH_LINES="$(rpcauth lnd "$LND_RPCPASSWORD")
 $(rpcauth boltz "$BOLTZ_RPCPASSWORD")
-$(rpcauth shim "$SHIM_RPCPASSWORD")"
+$(rpcauth shim "$SHIM_RPCPASSWORD")
+$(rpcauth donations "$DONATIONS_RPCPASSWORD")"
 export RPCAUTH_LINES
+
+# The SHA256-chain donations' own seed: made once, never replaced (it holds
+# their coins on both chains); readable by the donations image's user only.
+# backup-secrets.sh and the offsite backup take it with the rest.
+SEED=$ROOT/secrets/sha256-donations.seed
+if [ ! -s "$SEED" ]; then
+	(umask 077 && head -c 32 /dev/urandom | od -An -tx1 | tr -d ' \n' > "$SEED.tmp" && echo >> "$SEED.tmp")
+	mv "$SEED.tmp" "$SEED"
+fi
+chown 65532:65532 "$SEED" 2>/dev/null || true
+chmod 400 "$SEED"
 
 # Tor wants its control password hashed (its salted, iterated SHA-1, as
 # tor --hash-password makes it). Here, not by a tor binary, so that the

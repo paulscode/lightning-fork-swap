@@ -17,6 +17,8 @@ Configuration, from deploy/.env (all optional):
   MONITOR_HEARTBEAT_HOURS a message that the monitor runs (default 24, 0 off)
   DONATION_ADDRESS        set: also watch the donation services, and report
                           donations sent without replay protection
+  MONITOR_SHA256_MAX_SAT  alert when the SHA256-donation wallet holds more
+                          on the SHA256 chain (default 5,000,000)
   MONITOR_DONATIONS_STALE_MINUTES
                           alert when the donation watcher has not completed
                           a pass for this long (default 30)
@@ -68,6 +70,10 @@ SERVICES = ["knots", "shim", "tor", "lnd", "postgres", "boltz", "graph"]
 DONATION_SERVICES = ["donations-worker", "donations-api"]
 # And once channel donations are on (CHANNEL_DONATIONS=on)
 CHANNEL_SERVICES = ["donations-channels", "donations-guard"]
+# And SHA256-chain donations (SHA256_DONATIONS=on)
+SHA256_SERVICES = ["donations-sha256"]
+# Its log lines that need a person (the worker marks them)
+SHA256_LOG_PATTERNS = [r"\bALERT:"]
 
 # Lines in the backend's log that need a person. Each is reported once, when
 # it first appears.
@@ -222,6 +228,9 @@ class Monitor:
     def channels_on(self):
         return self.env.get("CHANNEL_DONATIONS") == "on"
 
+    def sha256_on(self):
+        return self.env.get("SHA256_DONATIONS") == "on"
+
     def psql(self, query, database="boltz"):
         out = self.runner.compose(
             "exec", "-T", "postgres", "psql", "-U", "boltz", "-d", database,
@@ -244,7 +253,8 @@ class Monitor:
         state = {row.get("Service"): row.get("State") for row in rows}
         services = SERVICES + (DONATION_SERVICES if self.donations_on()
                                else []) + (CHANNEL_SERVICES
-                                           if self.channels_on() else [])
+                                           if self.channels_on() else []) + (
+            SHA256_SERVICES if self.sha256_on() else [])
         for service in services:
             if state.get(service) != "running":
                 self.add(
@@ -469,6 +479,81 @@ class Monitor:
                 event=True,
             )
 
+    def check_sha256_donations(self):
+        """The SHA256-donation worker passes; each donation, forward and copy
+        reaches Paul once; what the SHA256 chain gave is not left to pile up
+        in a hot wallet."""
+        if not self.sha256_on():
+            return
+        rows = self.psql("SELECT value FROM sha256_settings "
+                         "WHERE key = 'last_pass'", "donations")
+        last = None
+        if rows:
+            try:
+                last = datetime.datetime.fromisoformat(
+                    rows[0][0].replace("Z", "+00:00"))
+            except ValueError:
+                pass
+        if last is None or (self.now - last).total_seconds() > 15 * 60:
+            self.add(
+                "sha256:stale",
+                "The SHA256-donation worker has not completed a pass "
+                + (f"since {last:%Y-%m-%d %H:%M} UTC" if last else "yet")
+                + ": deposits are not being looked for, nor passed on",
+            )
+        for request, txid, vout, amount in self.psql(
+            "SELECT request_id, txid, vout, value_sat FROM sha256_deposits "
+            "WHERE chain = 'sha256' AND state = 'confirmed' "
+            "AND first_seen > now() - interval '3 days'", "donations"
+        ):
+            self.add(
+                f"sha256:donation:{txid}:{vout}",
+                f"SHA256-chain donation of {sats(amount)} ({txid}:{vout}, "
+                f"request {request})",
+                event=True,
+            )
+        for txid, amount, dest, state, error in self.psql(
+            "SELECT txid, amount_sat, dest, state, error FROM sha256_forwards "
+            "WHERE created_at > now() - interval '3 days'", "donations"
+        ):
+            if state == "failed":
+                self.add(
+                    f"sha256:forward-failed:{txid}",
+                    f"A forward of {sats(amount)} to {dest} was refused by "
+                    f"our node ({error}); its coins wait for the next pass",
+                    event=True,
+                )
+            else:
+                self.add(
+                    f"sha256:forward:{txid}",
+                    f"Passed on {sats(amount)} of BLAKE2b coins to {dest} "
+                    f"({txid})",
+                    event=True,
+                )
+        for request, txid in self.psql(
+            "SELECT request_id, txid FROM sha256_deposits "
+            "WHERE chain = 'sha256' AND copy_state = 'copied' "
+            "AND first_seen > now() - interval '3 days'", "donations"
+        ):
+            self.add(
+                f"sha256:copied:{txid}",
+                f"Copied {txid} to the BLAKE2b chain (request {request}, "
+                "asked for with its inputs' proofs)",
+                event=True,
+            )
+        rows = self.psql(
+            "SELECT coalesce(sum(value_sat), 0) FROM sha256_deposits "
+            "WHERE chain = 'sha256' AND state = 'confirmed'", "donations")
+        held = int(rows[0][0]) if rows else 0
+        limit = number(self.env, "MONITOR_SHA256_MAX_SAT", 5_000_000)
+        if held > limit:
+            self.add(
+                "sha256:balance",
+                f"The SHA256-donation wallet holds {sats(held)} on the SHA256 "
+                f"chain, above {sats(limit)}: move it to cold storage "
+                "(OPERATING.md, SHA256-chain donations)",
+            )
+
     def check_channel_donations(self):
         """The channel worker works; orders are not stuck; and every channel
         we opened as a donation is one, with nothing pushed."""
@@ -551,10 +636,14 @@ class Monitor:
                              event=True)
 
     def check_logs(self, since):
-        for service, label, patterns in (
+        watched = [
             ("boltz", "Backend", LOG_PATTERNS),
             ("shim", "Shim", SHIM_LOG_PATTERNS),
-        ):
+        ]
+        if self.sha256_on():
+            watched.append(("donations-sha256", "SHA256 donations",
+                            SHA256_LOG_PATTERNS))
+        for service, label, patterns in watched:
             out = self.runner.compose(
                 "logs", "--no-color", "--no-log-prefix", "--since", since,
                 service, timeout=120,
@@ -661,6 +750,7 @@ class Monitor:
             ("swaps", self.check_swaps),
             ("donations", self.check_donations),
             ("channel donations", self.check_channel_donations),
+            ("SHA256 donations", self.check_sha256_donations),
             ("logs", lambda: self.check_logs(since)),
             ("host", lambda: self.check_host(root)),
             ("backup", lambda: self.check_backup(root)),

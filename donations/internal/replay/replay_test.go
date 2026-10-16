@@ -315,3 +315,18 @@ func TestNextCheck(t *testing.T) {
 		}
 	}
 }
+
+func TestCheckSHA256NamesTheChainsTheOtherWay(t *testing.T) {
+	// A SHA256-chain transaction from coins mined after the fork there
+	sha := &chain{parents: true, txs: map[string]*esplora.Tx{donation: {Txid: donation,
+		Vin: []esplora.Vin{vin(prevA, sig64)}}},
+		statuses: map[string]*esplora.Status{prevA: {Confirmed: true, BlockHeight: ForkHeight + 3}}}
+	got, err := CheckSHA256(context.Background(), donation, sha, &chain{})
+	if err != nil || got.Verdict != Protected {
+		t.Fatalf("%v %v", got.Verdict, err)
+	}
+	if !strings.Contains(got.Reason, "never exist on the BLAKE2b chain") ||
+		!strings.Contains(got.Reason, "mined after the fork") {
+		t.Fatalf("reason: %s", got.Reason)
+	}
+}

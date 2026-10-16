@@ -14,6 +14,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"strings"
 	"time"
 
 	"github.com/paulscode/lightning-fork-swap/donations/internal/esplora"
@@ -213,6 +214,17 @@ func protectionOf(vin esplora.Vin) sighash.Protection {
 		return sighash.Unknown
 	}
 	return read.Protection
+}
+
+// CheckSHA256 judges a transaction of the SHA256 chain the other way
+// round: whether it could also be valid on the BLAKE2b chain. The same
+// rules hold in both directions; the reason names the chains accordingly,
+// and Input.Sha256 then tells where each coin stands on the BLAKE2b chain.
+func CheckSHA256(ctx context.Context, txid string, sha256, blake2b Explorer) (Result, error) {
+	result, err := Check(ctx, txid, sha256, blake2b)
+	swap := strings.NewReplacer("SHA256", "BLAKE2b", "BLAKE2b", "SHA256")
+	result.Reason = swap.Replace(result.Reason)
+	return result, err
 }
 
 // Check judges a donation transaction.

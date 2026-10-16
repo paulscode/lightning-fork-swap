@@ -8,6 +8,7 @@ import (
 	"strconv"
 	"time"
 
+	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
 
 	"github.com/paulscode/lightning-fork-swap/donations/internal/channels"
@@ -61,18 +62,19 @@ func runChannels(ctx context.Context, logger *log.Logger) error {
 	w := &channels.Worker{Store: &channels.Postgres{Pool: db.Pool}, Lnd: client,
 		Rules: rules(), Now: time.Now, Logger: logger}
 	wake := make(chan struct{}, 1)
-	go listen(ctx, db.Pool, wake, logger)
+	go listen(ctx, db.Pool, "channel_orders", wake, logger)
 	logger.Print("channel donations: running")
 	w.Run(ctx, 15*time.Second, wake)
 	return nil
 }
 
-// listen wakes the worker when the API adds an order or an edit.
-func listen(ctx context.Context, pool *pgxpool.Pool, wake chan<- struct{}, logger *log.Logger) {
+// listen wakes a worker when the API notifies channel (a new order, an
+// edit, a request or a hint).
+func listen(ctx context.Context, pool *pgxpool.Pool, channel string, wake chan<- struct{}, logger *log.Logger) {
 	for ctx.Err() == nil {
 		conn, err := pool.Acquire(ctx)
 		if err == nil {
-			_, err = conn.Exec(ctx, "LISTEN channel_orders")
+			_, err = conn.Exec(ctx, "LISTEN "+pgx.Identifier{channel}.Sanitize())
 			for err == nil {
 				_, err = conn.Conn().WaitForNotification(ctx)
 				if err == nil {

@@ -407,6 +407,84 @@ opened says it is a donation that has no such channel, or pushed coins to
 the peer. On either of the last two: `./scripts/channel-donations.sh off`,
 and revoke the worker's macaroon (`$L deletemacaroonid 3`) before looking.
 
+### SHA256-chain donations
+
+An API (`/donate/v1/sha256`, described in `donations/SHA256-API.md`)
+through which anyone, usually another tool, donates coins on the SHA256
+chain. Each request gets an address of its own. What the SHA256 chain pays
+it is kept, in a hot wallet for now. What reaches the same address on the
+BLAKE2b chain is passed on once it is 6 blocks deep: to the request's
+return address if it gave one, or else, together with the others, to
+`DONATION_ADDRESS` in lnd's wallet as a liquidity donation. Coins usually
+reach the BLAKE2b chain by themselves: a transaction valid on both chains
+is relayed on both, since they share peers. They do whenever every coin it
+spends exists on both chains (coins from before the fork, or made by
+transactions that were themselves copied) and none of its signatures
+opts out. A donor whose coins were already protected sends their BLAKE2b
+coins separately, and those are passed on the same way.
+
+Every forward is signed with `SIGHASH_UNIFIED`, and before it is relayed
+each input is checked to pass the BLAKE2b chain's rules and to fail the
+SHA256 chain's. Without that, the forward could be copied to the SHA256
+chain, where the same coins are the donation, and would hand the donation
+to the return address.
+
+A request may ask (`"replay": true`, with a return address) for the
+donation to be copied to the BLAKE2b chain when it has not got there by
+itself. The worker does that only with a BIP322 proof from each of the
+donation's input addresses, never for an earlier transaction (that would
+move someone else's coins), and only after checking that it is not there
+already.
+
+What keeps it safe: the worker (`donations-sha256`) signs with a seed of
+its own, `$LFSWAP_ROOT/secrets/sha256-donations.seed`, and logs in to Knots
+as `donations`, which may read the chain and relay transactions and call
+nothing of any wallet: the hot wallet for swaps is out of its reach. It has
+no listening port and no lnd macaroon. The public API holds no key; it
+inserts a request or a hint into the database and nothing else.
+
+It is off by default. Knots must know the `donations` user: run
+`./scripts/setup.sh` (it also makes the seed, once), then restart Knots
+once, with swaps paused (`./scripts/migrate/maintenance.sh on`, restart,
+wait for lnd and the backend to reconnect, `off`). Then:
+
+```sh
+./scripts/sha256-donations.sh status    # Knots' config, the seed, the worker, the API
+./scripts/sha256-donations.sh on        # starts the worker, adds the routes; refuses (and
+                                        # stays off) if the worker cannot reach Knots
+./scripts/sha256-donations.sh off       # stops it, takes the routes away
+```
+
+**Keep a copy of the seed offline** before the first donation: it holds the
+SHA256-chain donations, and the BLAKE2b coins waiting to be passed on.
+`backup-secrets.sh` and the offsite backup take it with the other secrets;
+also print it, or write it down (`cat $LFSWAP_ROOT/secrets/sha256-donations.seed`).
+
+```sh
+S="docker compose exec -T donations-sha256 /donations"
+$S sha256 list [--all]                  # requests with deposits (or all)
+$S sha256 show <id>                     # one request: deposits, forwards, copies
+$S sha256 export                        # the wallet as a descriptor (public)
+$S sha256 export --private              # the same with its private key, for
+                                        # a SHA256-chain wallet (Sparrow)
+```
+
+**Spending the SHA256-chain coins by hand.** A wallet on the SHA256 chain
+signs the ordinary way, so what it sends could also be valid on the
+BLAKE2b chain, where it would spend the same coins if they are there. Before
+spending a donation's coins, make sure that cannot happen: either its
+BLAKE2b twin was already passed on (`sha256 show` lists the forward), or
+the donation can never reach the BLAKE2b chain (`$S check --sha256 <txid>`
+follows its ancestry: `protected` means it cannot), or the spend also spends a coin that
+exists on the SHA256 chain only, such as one mined after the fork, which
+keeps the whole transaction off the BLAKE2b chain.
+
+The monitor alerts when the worker stops passing, sends a message for each
+SHA256-chain donation, each forward and each copy, one when a forward is
+refused by our node, and one while the SHA256-chain coins held pass
+`MONITOR_SHA256_MAX_SAT` (5,000,000 sat): time to move them to cold
+storage.
+
 ## 9. Routine
 
 | When | What |
