@@ -3,6 +3,7 @@ package replay
 import (
 	"context"
 	"errors"
+	"fmt"
 	"strings"
 	"testing"
 	"time"
@@ -17,6 +18,9 @@ type chain struct {
 	outspends map[string]*esplora.Outspend
 	fail      error
 	calls     int
+	// Parents known only by a status are transactions mined from new
+	// coins (the BLAKE2b side's shorthand)
+	parents bool
 }
 
 func (c *chain) Tx(_ context.Context, txid string) (*esplora.Tx, error) {
@@ -26,6 +30,10 @@ func (c *chain) Tx(_ context.Context, txid string) (*esplora.Tx, error) {
 	}
 	if tx, ok := c.txs[txid]; ok {
 		return tx, nil
+	}
+	if s, ok := c.statuses[txid]; ok && c.parents {
+		return &esplora.Tx{Txid: txid, Status: *s,
+			Vin: []esplora.Vin{{IsCoinbase: true}}}, nil
 	}
 	return nil, esplora.ErrNotFound
 }
@@ -67,7 +75,7 @@ func vin(prev string, witness ...string) esplora.Vin {
 }
 
 func blake2b(prevAHeight, prevBHeight int64, vins ...esplora.Vin) *chain {
-	return &chain{
+	return &chain{parents: true,
 		txs: map[string]*esplora.Tx{donation: {Txid: donation, Vin: vins}},
 		statuses: map[string]*esplora.Status{
 			prevA: {Confirmed: true, BlockHeight: prevAHeight},
@@ -88,6 +96,20 @@ func TestCheck(t *testing.T) {
 		{"a post-fork coin protects the whole transaction",
 			blake2b(preFork, ForkHeight, vin(prevA, sig64), vin(prevB, sig64)),
 			&chain{}, Protected},
+		{"a post-fork coin whose parent was copied to the SHA256 chain protects nothing",
+			blake2b(preFork, ForkHeight, vin(prevA, sig64), vin(prevB, sig64)),
+			&chain{txs: map[string]*esplora.Tx{prevB: {Txid: prevB,
+				Status: esplora.Status{Confirmed: true, BlockHeight: 970000}}}}, AtRisk},
+		{"a post-fork coin whose parent waits in a SHA256 mempool protects nothing",
+			blake2b(ForkHeight, ForkHeight, vin(prevA, sig64)),
+			&chain{txs: map[string]*esplora.Tx{prevA: {Txid: prevA}}}, AtRisk},
+		{"a status the SHA256 explorer gives for any txid is not a parent",
+			blake2b(ForkHeight, ForkHeight, vin(prevA, sig64)),
+			&chain{statuses: map[string]*esplora.Status{
+				prevA: {Confirmed: false}}}, Protected},
+		{"a post-fork coin, the SHA256 explorers down: unknown",
+			blake2b(ForkHeight, ForkHeight, vin(prevA, sig64)),
+			&chain{fail: errors.New("down")}, Unknown},
 		{"one unified signature protects it",
 			blake2b(preFork, preFork, vin(prevA, sig64), vin(prevB, sig65u)),
 			&chain{}, Protected},
@@ -114,8 +136,8 @@ func TestCheck(t *testing.T) {
 		{"an unreadable input: unknown",
 			blake2b(preFork, preFork, vin(prevA, "zz")),
 			&chain{}, Unknown},
-		{"an unconfirmed parent is post-fork",
-			&chain{txs: map[string]*esplora.Tx{donation: {Txid: donation,
+		{"an unconfirmed parent from new coins can't be there",
+			&chain{parents: true, txs: map[string]*esplora.Tx{donation: {Txid: donation,
 				Vin: []esplora.Vin{vin(prevA, sig64)}}},
 				statuses: map[string]*esplora.Status{prevA: {Confirmed: false}}},
 			&chain{}, Protected},
@@ -150,7 +172,8 @@ func TestCheckLooksUpNoMoreThanItNeeds(t *testing.T) {
 	if err != nil || got.Verdict != Protected {
 		t.Fatalf("%v %v", got.Verdict, err)
 	}
-	if blake.calls != 2 || sha.calls != 0 {
+	// The donation and its first parent here; the parent's absence there
+	if blake.calls != 2 || sha.calls != 1 {
 		t.Fatalf("%d BLAKE2b and %d SHA256 requests", blake.calls, sha.calls)
 	}
 
@@ -193,8 +216,73 @@ func TestCheckNeedsTheDonation(t *testing.T) {
 	}
 	b := blake2b(ForkHeight-1, 0, vin(prevA, sig64))
 	delete(b.statuses, prevA)
-	if _, err := Check(context.Background(), donation, b, &chain{}); err == nil {
-		t.Fatal("a parent the explorer does not know was judged")
+	got, err := Check(context.Background(), donation, b, &chain{})
+	if err != nil || got.Verdict != Unknown {
+		t.Fatalf("a parent the explorer does not know: %v %v", got.Verdict, err)
+	}
+}
+
+// ancestry builds, on the BLAKE2b chain, a donation spending a coin made
+// after the fork by a chain of n transactions that starts from a coin made
+// before it (prevB); sig signs every one of them
+func ancestry(n int, sig string) (*chain, []string) {
+	b := &chain{txs: map[string]*esplora.Tx{}, statuses: map[string]*esplora.Status{}}
+	b.txs[prevB] = &esplora.Tx{Txid: prevB,
+		Status: esplora.Status{Confirmed: true, BlockHeight: ForkHeight - 5}}
+	ids := []string{}
+	from := prevB
+	for i := 0; i < n; i++ {
+		id := fmt.Sprintf("%064x", i+1)
+		b.txs[id] = &esplora.Tx{Txid: id, Vin: []esplora.Vin{vin(from, sig)},
+			Status: esplora.Status{Confirmed: true, BlockHeight: ForkHeight + int64(i)}}
+		ids = append(ids, id)
+		from = id
+	}
+	b.txs[donation] = &esplora.Tx{Txid: donation, Vin: []esplora.Vin{vin(from, sig64)}}
+	return b, ids
+}
+
+func TestCheckFollowsTheAncestry(t *testing.T) {
+	ctx := context.Background()
+
+	// Three transactions after the fork, none on the SHA256 chain yet, all
+	// copyable: the donation can follow them there
+	b, _ := ancestry(3, sig64)
+	got, err := Check(ctx, donation, b, &chain{})
+	if err != nil || got.Verdict != AtRisk || got.Inputs[0].Sha256 != "copyable" {
+		t.Fatalf("copyable ancestry: %v (%s) %+v %v", got.Verdict, got.Reason, got.Inputs, err)
+	}
+
+	// One of them signed unified: it can never get there, nor can we
+	b, ids := ancestry(3, sig64)
+	b.txs[ids[1]].Vin[0].Witness = []string{sig65u}
+	got, _ = Check(ctx, donation, b, &chain{})
+	if got.Verdict != Protected || !strings.Contains(got.Reason, "UNIFIED") {
+		t.Fatalf("a unified ancestor: %v (%s)", got.Verdict, got.Reason)
+	}
+
+	// The coin from before the fork was spent on the SHA256 chain by
+	// something else: the ancestry can't be copied
+	b, _ = ancestry(3, sig64)
+	got, _ = Check(ctx, donation, b, &chain{outspends: map[string]*esplora.Outspend{
+		prevB: {Spent: true, Txid: other}}})
+	if got.Verdict != Protected || !strings.Contains(got.Reason, "another transaction") {
+		t.Fatalf("a moved early coin: %v (%s)", got.Verdict, got.Reason)
+	}
+
+	// The middle one already copied there: from it on, the coins exist
+	b, ids = ancestry(3, sig64)
+	got, _ = Check(ctx, donation, b, &chain{txs: map[string]*esplora.Tx{
+		ids[1]: {Txid: ids[1], Status: esplora.Status{Confirmed: true}}}})
+	if got.Verdict != AtRisk {
+		t.Fatalf("a copied ancestor: %v (%s)", got.Verdict, got.Reason)
+	}
+
+	// Longer than is followed: unknown, never protected
+	b, _ = ancestry(MaxAncestors+5, sig64)
+	got, _ = Check(ctx, donation, b, &chain{})
+	if got.Verdict != Unknown || !strings.Contains(got.Reason, "by hand") {
+		t.Fatalf("a long ancestry: %v (%s)", got.Verdict, got.Reason)
 	}
 }
 

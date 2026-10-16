@@ -4,7 +4,10 @@
 //
 // A transaction is valid there only if every input's signatures lack
 // SIGHASH_UNIFIED and every coin it spends exists, unspent, on the SHA256
-// chain: coins created before the fork height, not yet moved there.
+// chain. Coins created before the fork height exist there until moved; a
+// coin created after it exists there too when the transaction that made it
+// was copied there (its whole ancestry valid on both chains back to coins
+// from before the split), so its height alone settles nothing.
 package replay
 
 import (
@@ -62,7 +65,9 @@ type Input struct {
 	Protection sighash.Protection `json:"protection"`
 	// Whether the spent coin was created before the fork (exists on both)
 	PreFork bool `json:"preFork"`
-	// On the SHA256 chain: "unspent", "spent:<txid>", "" when not looked up
+	// On the SHA256 chain: "unspent", "spent:<txid>", "copyable" (not
+	// there, but every transaction back to the split could be copied
+	// there first), "" when not looked up
 	Sha256 string `json:"sha256,omitempty"`
 }
 
@@ -83,6 +88,133 @@ type Result struct {
 // for a look by hand.
 const MaxInputs = 100
 
+// MaxAncestors is the most earlier transactions a check reads while
+// following coins created after the fork back toward the split; past it
+// the check is left "unknown" rather than called protected.
+const MaxAncestors = 60
+
+// Where a coin stands with respect to the SHA256 chain
+type reach int
+
+const (
+	reachUnknown reach = iota
+	// It exists there (created there; spent or not is a separate question)
+	reachThere
+	// Not there, but the transactions that lead to it could all be copied
+	// there, after which it would exist there unspent
+	reachCopyable
+	// It can never exist there
+	reachNever
+)
+
+// walk follows a transaction's ancestry on the BLAKE2b chain to decide
+// whether its coins exist, or could come to exist, on the SHA256 chain.
+type walk struct {
+	ctx             context.Context
+	blake2b, sha256 Explorer
+	txs             map[string]reachOf
+	reads           int
+}
+
+type reachOf struct {
+	reach  reach
+	why    string
+	height int64 // on the BLAKE2b chain; 0 when unconfirmed or unread
+}
+
+// tx decides for a whole transaction: whether its outputs exist there.
+func (w *walk) tx(txid string) reachOf {
+	if r, ok := w.txs[txid]; ok {
+		return r
+	}
+	r := w.read(txid)
+	w.txs[txid] = r
+	return r
+}
+
+func (w *walk) read(txid string) reachOf {
+	if w.reads >= MaxAncestors {
+		return reachOf{reach: reachUnknown, why: "its ancestry is too long to follow automatically: look by hand"}
+	}
+	w.reads++
+	tx, err := w.blake2b.Tx(w.ctx, txid)
+	if err != nil || tx == nil {
+		return reachOf{reach: reachUnknown, why: "the BLAKE2b-chain explorers did not answer"}
+	}
+	var height int64
+	if tx.Status.Confirmed {
+		height = tx.Status.BlockHeight
+		if height < ForkHeight {
+			return reachOf{reach: reachThere, why: "created before the fork", height: height}
+		}
+	}
+	// After the fork: there if it was copied there. The whole transaction,
+	// not its status: explorers answer a status for transactions they don't
+	// know as unconfirmed
+	there, err := w.sha256.Tx(w.ctx, txid)
+	switch {
+	case err == nil && there != nil:
+		return reachOf{reach: reachThere, why: "copied to the SHA256 chain", height: height}
+	case !errors.Is(err, esplora.ErrNotFound):
+		return reachOf{reach: reachUnknown, why: "the SHA256-chain explorers did not answer", height: height}
+	}
+	// Not there: could it be copied? Signatures first, they cost nothing
+	unknown := ""
+	for _, vin := range tx.Vin {
+		if vin.IsCoinbase || vin.Prevout == nil {
+			return reachOf{reach: reachNever, why: "it descends from coins mined after the fork", height: height}
+		}
+		switch protectionOf(vin) {
+		case sighash.Protected:
+			return reachOf{reach: reachNever, why: "an earlier transaction is signed with SIGHASH_UNIFIED", height: height}
+		case sighash.Unknown:
+			unknown = "an earlier transaction's signatures could not be read"
+		}
+	}
+	for _, vin := range tx.Vin {
+		c, why := w.coin(vin.Txid, vin.Vout, txid)
+		switch c {
+		case reachNever:
+			return reachOf{reach: reachNever, why: why, height: height}
+		case reachUnknown:
+			unknown = why
+		}
+	}
+	if unknown != "" {
+		return reachOf{reach: reachUnknown, why: unknown, height: height}
+	}
+	return reachOf{reach: reachCopyable, why: "every transaction back to coins from before the fork could be copied", height: height}
+}
+
+// coin decides for one coin, as spent by spender: there and unspent (or
+// spent by the spender itself) is there; spent there by something else
+// can never serve the spender.
+func (w *walk) coin(txid string, vout uint32, spender string) (reach, string) {
+	r := w.tx(txid)
+	if r.reach != reachThere {
+		return r.reach, r.why
+	}
+	spend, err := w.sha256.Outspend(w.ctx, txid, vout)
+	switch {
+	case err != nil:
+		return reachUnknown, "the SHA256-chain explorers did not answer"
+	case spend.Spent && spend.Txid != spender:
+		return reachNever, "an earlier coin was spent on the SHA256 chain by another transaction"
+	}
+	return reachThere, r.why
+}
+
+func protectionOf(vin esplora.Vin) sighash.Protection {
+	read, err := sighash.Read(sighash.Input{
+		ScriptType: vin.Prevout.Type, Witness: vin.Witness,
+		ScriptSig: vin.ScriptSig,
+	})
+	if err != nil {
+		return sighash.Unknown
+	}
+	return read.Protection
+}
+
 // Check judges a donation transaction.
 func Check(ctx context.Context, txid string, blake2b, sha256 Explorer) (Result, error) {
 	tx, err := blake2b.Tx(ctx, txid)
@@ -95,25 +227,22 @@ func Check(ctx context.Context, txid string, blake2b, sha256 Explorer) (Result, 
 		result.Reason = fmt.Sprintf("%d inputs, more than are checked automatically (%d): look by hand", len(tx.Vin), MaxInputs)
 		return result, nil
 	}
-	postFork, protected, unknown := false, false, false
+
+	// The donation's own signatures first: they cost nothing
+	unknown := ""
 	for _, vin := range tx.Vin {
-		if postFork || protected {
-			// Settled: one such input keeps the whole transaction off the
-			// SHA256 chain; the rest are not looked up
-			break
-		}
 		in := Input{Prevout: fmt.Sprintf("%s:%d", vin.Txid, vin.Vout)}
 		if vin.IsCoinbase || vin.Prevout == nil {
 			// New coins: they exist on this chain only
 			in.ScriptType = "coinbase"
 			result.Inputs = append(result.Inputs, in)
-			postFork = true
-			continue
+			result.Verdict = Protected
+			result.Reason = "spends coins the SHA256 chain does not have"
+			return result, nil
 		}
 		in.Address = vin.Prevout.Address
 		in.Value = vin.Prevout.Value
 		in.ScriptType = vin.Prevout.Type
-
 		read, err := sighash.Read(sighash.Input{
 			ScriptType: vin.Prevout.Type, Witness: vin.Witness,
 			ScriptSig: vin.ScriptSig,
@@ -125,33 +254,51 @@ func Check(ctx context.Context, txid string, blake2b, sha256 Explorer) (Result, 
 		for _, t := range read.HashTypes {
 			in.HashTypes = append(in.HashTypes, fmt.Sprintf("0x%02x", t))
 		}
-
-		status, err := blake2b.TxStatus(ctx, vin.Txid)
-		if err != nil {
-			return Result{}, fmt.Errorf("reading %s: %w", vin.Txid, err)
-		}
-		in.PreFork = status.Confirmed && status.BlockHeight < ForkHeight
-		if !in.PreFork {
-			postFork = true
-		}
+		result.Inputs = append(result.Inputs, in)
 		switch read.Protection {
 		case sighash.Protected:
-			protected = true
+			result.Verdict = Protected
+			result.Reason = "signed with SIGHASH_UNIFIED"
+			return result, nil
 		case sighash.Unknown:
-			unknown = true
+			unknown = "some inputs' signatures could not be read"
 		}
-		result.Inputs = append(result.Inputs, in)
 	}
 
-	switch {
-	case postFork:
-		result.Verdict = Protected
-		result.Reason = "spends coins created after the fork, which the SHA256 chain does not have"
-		return result, nil
-	case protected:
-		result.Verdict = Protected
-		result.Reason = "signed with SIGHASH_UNIFIED"
-		return result, nil
+	// Then the coins it spends: one that can never exist on the SHA256
+	// chain keeps the whole transaction off it
+	w := &walk{ctx: ctx, blake2b: blake2b, sha256: sha256, txs: map[string]reachOf{}}
+	moved, copyable := false, false
+	for i, vin := range tx.Vin {
+		r := w.tx(vin.Txid)
+		in := &result.Inputs[i]
+		in.PreFork = r.height > 0 && r.height < ForkHeight
+		switch r.reach {
+		case reachNever:
+			result.Verdict = Protected
+			result.Reason = "spends coins that can never exist on the SHA256 chain: " + r.why
+			return result, nil
+		case reachUnknown:
+			unknown = r.why
+			continue
+		case reachCopyable:
+			in.Sha256 = "copyable"
+			copyable = true
+			continue
+		}
+		spend, err := sha256.Outspend(ctx, vin.Txid, vin.Vout)
+		switch {
+		case err != nil:
+			unknown = "the SHA256-chain explorers did not answer"
+		case !spend.Spent:
+			in.Sha256 = "unspent"
+		case spend.Txid == txid:
+			// Copied, perhaps not yet confirmed
+			in.Sha256 = "spent:" + spend.Txid
+		default:
+			in.Sha256 = "spent:" + spend.Txid
+			moved = true
+		}
 	}
 
 	addresses := map[string]bool{}
@@ -163,35 +310,17 @@ func Check(ctx context.Context, txid string, blake2b, sha256 Explorer) (Result, 
 	}
 
 	// Already copied over?
-	status, err := sha256.TxStatus(ctx, txid)
-	switch {
-	case err == nil && status.Confirmed:
-		result.Verdict = Replayed
-		result.ReplayedHeight = status.BlockHeight
-		result.Reason = "the same transaction is confirmed on the SHA256 chain"
-		return result, nil
-	case err != nil && !errors.Is(err, esplora.ErrNotFound):
-		result.Reason = "the SHA256-chain explorers did not answer"
-		return result, nil
-	}
-
-	moved := false
-	for i, in := range result.Inputs {
-		prev, vout := splitPrevout(in.Prevout)
-		spend, err := sha256.Outspend(ctx, prev, vout)
-		if err != nil {
+	if !copyable {
+		status, err := sha256.TxStatus(ctx, txid)
+		switch {
+		case err == nil && status.Confirmed:
+			result.Verdict = Replayed
+			result.ReplayedHeight = status.BlockHeight
+			result.Reason = "the same transaction is confirmed on the SHA256 chain"
+			return result, nil
+		case err != nil && !errors.Is(err, esplora.ErrNotFound):
 			result.Reason = "the SHA256-chain explorers did not answer"
 			return result, nil
-		}
-		switch {
-		case !spend.Spent:
-			result.Inputs[i].Sha256 = "unspent"
-		case spend.Txid == txid:
-			// In a SHA256 mempool: copied, not yet confirmed
-			result.Inputs[i].Sha256 = "spent:" + spend.Txid
-		default:
-			result.Inputs[i].Sha256 = "spent:" + spend.Txid
-			moved = true
 		}
 	}
 
@@ -199,9 +328,12 @@ func Check(ctx context.Context, txid string, blake2b, sha256 Explorer) (Result, 
 	case moved:
 		result.Verdict = TwinMoved
 		result.Reason = "the coins on the SHA256 chain were moved by another transaction"
-	case unknown:
+	case unknown != "":
 		result.Verdict = Unknown
-		result.Reason = "some inputs' signatures could not be read"
+		result.Reason = unknown
+	case copyable:
+		result.Verdict = AtRisk
+		result.Reason = "not replay-protected, and the transactions before it could be copied to the SHA256 chain first"
 	default:
 		result.Verdict = AtRisk
 		result.Reason = "not replay-protected, and the coins still exist unspent on the SHA256 chain"

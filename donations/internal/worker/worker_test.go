@@ -30,11 +30,19 @@ type chain struct {
 	fail   error
 }
 
-func (c *chain) Tx(context.Context, string) (*esplora.Tx, error) {
+func (c *chain) Tx(_ context.Context, txid string) (*esplora.Tx, error) {
 	if c.fail != nil {
 		return nil, c.fail
 	}
-	return c.tx, nil
+	if c.tx != nil && c.tx.Txid == txid {
+		return c.tx, nil
+	}
+	if s, ok := c.status[txid]; ok {
+		// A parent known by its status: mined from new coins
+		return &esplora.Tx{Txid: txid, Status: *s,
+			Vin: []esplora.Vin{{IsCoinbase: true}}}, nil
+	}
+	return nil, esplora.ErrNotFound
 }
 func (c *chain) TxStatus(_ context.Context, txid string) (*esplora.Status, error) {
 	if c.fail != nil {
