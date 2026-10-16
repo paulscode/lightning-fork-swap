@@ -473,16 +473,30 @@ $S sha256 export --private              # the same with its private key, for
 the SHA256 chain into the hot wallet (the seed's second branch,
 `m/86'/0'/0'/1/j`) in a lock: a transaction with a 103-byte OP_RETURN,
 which the BLAKE2b chain's data rules (RDTS) refuse in consensus. A
-BLAKE2b deposit is passed on only after its SHA256 twin's lock is 3 deep
-(or, with no twin, once its history proves it can never appear on the
-SHA256 chain). Then nothing that spends it, however it is signed, by us
+BLAKE2b deposit is passed on only after its SHA256 twin's lock is 6 deep,
+checked again at that moment with every SHA256 explorer configured
+(`DONATIONS_SHA256_EXPLORERS`; all must agree); or, with no twin, once the
+transaction that paid it cannot be valid on the SHA256 chain, as signed
+(its scripts are run under both chains' rules) or by its history. Then nothing that spends it, however it is signed, by us
 included, can ever be valid on the SHA256 chain, and anyone can check that
 with the lock's txid, which the API gives. The worker relays locks through
 the SHA256 explorers, whose Bitcoin Core (30 or later) relays data outputs
 of this size; Knots does not by default. A lock no explorer takes is
 alerted and tried again an hour later. The data rules end on 1 September
 2027; from a month before, the worker makes no new lock, holds what would
-need one, and alerts once a day.
+need one, and alerts once a day. From three months before, it also counts
+the locks whose BLAKE2b twin was never passed on: after that date such a
+lock could be mined on the BLAKE2b chain (its data output no longer
+refused) and take the twin to the hot wallet, then the sweep address,
+instead of to its donor. Before then, either pass those twins on by hand or
+send them back to their donors, or move the service to locks that do not
+depend on the data rules (a chained input that can never exist on the
+BLAKE2b chain).
+
+Payments under 5,000 sat to a request's address, on either chain, are
+kept as they are (state `kept`): never locked nor passed on. A request
+takes at most 50 deposits, and a lock, forward or sweep at most 100
+inputs (the rest wait for the next).
 
 **Daily sweeps.** With `SHA256_SWEEP_ADDRESS` set in `.env` (an address
 of yours on the SHA256 chain), the worker sends the locks' outputs there

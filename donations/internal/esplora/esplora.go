@@ -111,6 +111,8 @@ type Tx struct {
 type Outspend struct {
 	Spent bool   `json:"spent"`
 	Txid  string `json:"txid"`
+	// Where the spending transaction is; nil when the explorer gives none
+	Status *Status `json:"status"`
 }
 
 const maxBody = 4 << 20
@@ -224,22 +226,47 @@ func (c *Client) Outspend(ctx context.Context, txid string, vout uint32) (*Outsp
 
 var addressPattern = regexp.MustCompile(`^[a-zA-Z0-9]{14,90}$`)
 
-// AddressTxs reads the latest transactions paying or spending an address,
-// unconfirmed first (Esplora gives up to 50 of each).
+// MaxAddressPages is the most pages of confirmed transactions read for an
+// address (25 each, after the first answer's).
+const MaxAddressPages = 10
+
+// AddressTxs reads the transactions paying or spending an address:
+// unconfirmed ones and the latest confirmed (Esplora's first answer), then
+// older confirmed pages, up to MaxAddressPages, so that many payments to an
+// address cannot push one out of view.
 func (c *Client) AddressTxs(ctx context.Context, address string) ([]Tx, error) {
 	if !addressPattern.MatchString(address) {
 		return nil, fmt.Errorf("not an address: %q", address)
 	}
-	var txs []Tx
-	if err := c.get(ctx, "/address/"+address+"/txs", &txs); err != nil {
-		return nil, err
-	}
-	for _, tx := range txs {
-		if !ValidTxid(tx.Txid) {
-			return nil, fmt.Errorf("explorer gave a malformed transaction")
+	var all []Tx
+	path := "/address/" + address + "/txs"
+	for page := 0; page <= MaxAddressPages; page++ {
+		var txs []Tx
+		if err := c.get(ctx, path, &txs); err != nil {
+			if page > 0 && errors.Is(err, ErrNotFound) {
+				break
+			}
+			return nil, err
 		}
+		last := ""
+		confirmed := 0
+		for _, tx := range txs {
+			if !ValidTxid(tx.Txid) {
+				return nil, fmt.Errorf("explorer gave a malformed transaction")
+			}
+			all = append(all, tx)
+			if tx.Status.Confirmed {
+				last = tx.Txid
+				confirmed++
+			}
+		}
+		// A full page of confirmed ones may have more behind it
+		if confirmed < 25 || last == "" {
+			break
+		}
+		path = "/address/" + address + "/txs/chain/" + last
 	}
-	return txs, nil
+	return all, nil
 }
 
 var hexPattern = regexp.MustCompile(`^([0-9a-f]{2})+$`)

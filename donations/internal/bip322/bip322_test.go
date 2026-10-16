@@ -11,6 +11,7 @@ import (
 	"github.com/btcsuite/btcd/btcec/v2/ecdsa"
 	"github.com/btcsuite/btcd/btcutil"
 	"github.com/btcsuite/btcd/chaincfg"
+	"github.com/btcsuite/btcd/txscript"
 	"github.com/btcsuite/btcd/wire"
 )
 
@@ -89,5 +90,59 @@ func TestMalformed(t *testing.T) {
 		if err := Verify(c.address, "m", c.signature, nil); err == nil {
 			t.Errorf("%q %q verified", c.address, c.signature)
 		}
+	}
+}
+
+// signNested makes a BIP-322 "simple" signature for a P2SH-P2WPKH address,
+// the way a wallet does
+func signNested(t *testing.T, priv *btcec.PrivateKey, message string) (string, string) {
+	t.Helper()
+	pub := priv.PubKey().SerializeCompressed()
+	redeem, _ := txscript.NewScriptBuilder().AddOp(txscript.OP_0).AddData(btcutil.Hash160(pub)).Script()
+	addr, err := btcutil.NewAddressScriptHash(redeem, &chaincfg.MainNetParams)
+	if err != nil {
+		t.Fatal(err)
+	}
+	pkScript, _ := txscript.PayToAddrScript(addr)
+	toSpend := wire.NewMsgTx(0)
+	scriptSig, _ := txscript.NewScriptBuilder().AddOp(txscript.OP_0).AddData(MessageHash(message)).Script()
+	toSpend.AddTxIn(&wire.TxIn{PreviousOutPoint: wire.OutPoint{Index: 0xffffffff}, SignatureScript: scriptSig})
+	toSpend.AddTxOut(wire.NewTxOut(0, pkScript))
+	toSign := wire.NewMsgTx(0)
+	push, _ := txscript.NewScriptBuilder().AddData(redeem).Script()
+	toSign.AddTxIn(&wire.TxIn{PreviousOutPoint: wire.OutPoint{Hash: toSpend.TxHash(), Index: 0},
+		SignatureScript: push})
+	opReturn, _ := txscript.NewScriptBuilder().AddOp(txscript.OP_RETURN).Script()
+	toSign.AddTxOut(wire.NewTxOut(0, opReturn))
+	fetcher := txscript.NewCannedPrevOutputFetcher(pkScript, 0)
+	w, err := txscript.WitnessSignature(toSign, txscript.NewTxSigHashes(toSign, fetcher), 0, 0,
+		redeem, txscript.SigHashAll, priv, true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var buf bytes.Buffer
+	_ = wire.WriteVarInt(&buf, 0, uint64(len(w)))
+	for _, item := range w {
+		_ = wire.WriteVarBytes(&buf, 0, item)
+	}
+	return addr.EncodeAddress(), base64.StdEncoding.EncodeToString(buf.Bytes())
+}
+
+func TestNestedSegWit(t *testing.T) {
+	priv, _ := btcec.PrivKeyFromBytes(bytes.Repeat([]byte{5}, 32))
+	addr, sig := signNested(t, priv, "Hello World")
+	if addr[0] != '3' {
+		t.Fatalf("address %s", addr)
+	}
+	if err := Verify(addr, "Hello World", sig, nil); err != nil {
+		t.Fatal(err)
+	}
+	if err := Verify(addr, "Hello world", sig, nil); err == nil {
+		t.Fatal("another message verified")
+	}
+	other, _ := btcec.PrivKeyFromBytes(bytes.Repeat([]byte{6}, 32))
+	otherAddr, _ := signNested(t, other, "Hello World")
+	if err := Verify(otherAddr, "Hello World", sig, nil); err == nil {
+		t.Fatal("another address verified")
 	}
 }

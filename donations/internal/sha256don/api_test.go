@@ -206,3 +206,34 @@ func TestTheViewShowsTheLock(t *testing.T) {
 		t.Fatalf("%v", sha)
 	}
 }
+
+func TestOurOwnAddressesAreNoReturnAddress(t *testing.T) {
+	h := newAPI(t)
+	_, body := h.create(t, "", false)
+	id := body["id"].(string)
+	_ = h.store.Assign(context.Background(), id, func(int64) (string, error) {
+		return "bc1p5cyxnuxmeuwuvkwfem96lqzszd02n6xdcjrs20cac6yqjjwudpxqkedrcr", nil
+	})
+	code, body := h.create(t, "bc1p5cyxnuxmeuwuvkwfem96lqzszd02n6xdcjrs20cac6yqjjwudpxqkedrcr", false)
+	if code != 422 || body["code"] != "bad_address" {
+		t.Fatalf("%d %v", code, body)
+	}
+}
+
+func TestHintsAreLimitedPerTransaction(t *testing.T) {
+	h := newAPI(t)
+	_, body := h.create(t, dest, true)
+	path := "/donate/v1/sha256/" + body["id"].(string) + "/tx"
+	for i := 0; i < MaxHintsPerTx; i++ {
+		if code, _ := h.do(t, "POST", path, map[string]any{"txid": txA}); code != 202 {
+			t.Fatalf("hint %d: %d", i, code)
+		}
+	}
+	if code, body := h.do(t, "POST", path, map[string]any{"txid": txA}); code != 422 || body["code"] != "too_many_hints" {
+		t.Fatalf("%d %v", code, body)
+	}
+	// Another transaction still has room
+	if code, _ := h.do(t, "POST", path, map[string]any{"txid": txB}); code != 202 {
+		t.Fatalf("other tx: %d", code)
+	}
+}

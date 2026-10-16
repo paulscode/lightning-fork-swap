@@ -74,6 +74,25 @@ func verifySimple(addr btcutil.Address, message string, sig []byte) error {
 		Sequence:         0,
 		Witness:          witness,
 	})
+	// Nested SegWit (P2SH-P2WPKH, "3..."): the redeem script is the
+	// witness program of the key the witness gives, pushed in scriptSig
+	if sh, ok := addr.(*btcutil.AddressScriptHash); ok {
+		if len(witness) != 2 || len(witness[1]) != 33 {
+			return errors.New("not a nested P2WPKH signature")
+		}
+		redeem, err := txscript.NewScriptBuilder().AddOp(txscript.OP_0).
+			AddData(btcutil.Hash160(witness[1])).Script()
+		if err != nil {
+			return err
+		}
+		if !bytes.Equal(btcutil.Hash160(redeem), sh.ScriptAddress()) {
+			return errors.New("the key does not match the address")
+		}
+		if toSign.TxIn[0].SignatureScript, err = txscript.NewScriptBuilder().
+			AddData(redeem).Script(); err != nil {
+			return err
+		}
+	}
 	opReturn, _ := txscript.NewScriptBuilder().AddOp(txscript.OP_RETURN).Script()
 	toSign.AddTxOut(wire.NewTxOut(0, opReturn))
 

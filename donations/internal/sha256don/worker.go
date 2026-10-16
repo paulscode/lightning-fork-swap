@@ -12,6 +12,7 @@ import (
 	"time"
 
 	"github.com/btcsuite/btcd/chaincfg"
+	"github.com/btcsuite/btcd/txscript"
 	"github.com/btcsuite/btcd/wire"
 
 	"github.com/paulscode/lightning-fork-swap/donations/internal/bip322"
@@ -79,6 +80,21 @@ type Worker struct {
 	// When the BLAKE2b chain's data rules (RDTS) end; locks are made only
 	// until RDTSMargin before it. Zero: RDTSExpiry.
 	RDTSUntil time.Time
+
+	// A lock counts at this depth on the SHA256 chain; before a forward,
+	// every one of Verifiers (each a single SHA256 explorer; empty: Sha256)
+	// must agree that the twin is spent by the lock this deep
+	LockConfs int64
+	Verifiers []Explorer
+	// Outputs under MinDepositSat are kept, never locked nor passed on; a
+	// request takes at most MaxDeposits; a transaction spends at most
+	// MaxTxInputs
+	MinDepositSat int64
+	MaxDeposits   int
+	MaxTxInputs   int
+
+	checks      map[string]replay.Result // this pass's
+	failedAlone map[string]time.Time     // outpoints whose forward failed in a batch
 }
 
 // RDTSExpiry is when the BLAKE2b chain's data rules end on mainnet
@@ -88,6 +104,14 @@ var RDTSExpiry = time.Unix(1819756800, 0)
 
 // RDTSMargin: no new lock this close to the end of the data rules.
 const RDTSMargin = 30 * 24 * time.Hour
+
+// Lock and limit defaults
+const (
+	DefaultLockConfs     = 6
+	DefaultMinDepositSat = 5_000
+	DefaultMaxDeposits   = 50
+	DefaultMaxTxInputs   = 100
+)
 
 // Sweep defaults
 const (
@@ -143,6 +167,24 @@ func (w *Worker) defaults() {
 	if w.RDTSUntil.IsZero() {
 		w.RDTSUntil = RDTSExpiry
 	}
+	if w.LockConfs == 0 {
+		w.LockConfs = DefaultLockConfs
+	}
+	if len(w.Verifiers) == 0 {
+		w.Verifiers = []Explorer{w.Sha256}
+	}
+	if w.MinDepositSat == 0 {
+		w.MinDepositSat = DefaultMinDepositSat
+	}
+	if w.MaxDeposits == 0 {
+		w.MaxDeposits = DefaultMaxDeposits
+	}
+	if w.MaxTxInputs == 0 {
+		w.MaxTxInputs = DefaultMaxTxInputs
+	}
+	if w.failedAlone == nil {
+		w.failedAlone = map[string]time.Time{}
+	}
 	if w.Logger == nil {
 		w.Logger = log.Default()
 	}
@@ -179,22 +221,6 @@ func PollEvery(age time.Duration) time.Duration {
 	return -1
 }
 
-func (w *Worker) due(ctx context.Context, r Request, now time.Time) bool {
-	if r.LastPolled == nil {
-		return true
-	}
-	// A donor told us their transaction since the last look
-	if hints, err := w.Store.Hints(ctx, r.ID, ""); err == nil {
-		for _, h := range hints {
-			if h.At.After(*r.LastPolled) {
-				return true
-			}
-		}
-	}
-	every := PollEvery(now.Sub(r.CreatedAt))
-	return every >= 0 && now.Sub(*r.LastPolled) >= every
-}
-
 // Pass does one round.
 func (w *Worker) Pass(ctx context.Context) error {
 	w.defaults()
@@ -203,20 +229,16 @@ func (w *Worker) Pass(ctx context.Context) error {
 		return fmt.Errorf("assigning addresses: %w", err)
 	}
 	var errs []error
-	requests, err := w.Store.Assigned(ctx)
+	w.checks = map[string]replay.Result{}
+	requests, err := w.Store.Due(ctx, now, w.MaxPolls)
 	if err != nil {
 		return err
 	}
 	var shaTip int64
-	polls := 0
 	for _, r := range requests {
-		if polls >= w.MaxPolls || ctx.Err() != nil {
+		if ctx.Err() != nil {
 			break
 		}
-		if !w.due(ctx, r, now) {
-			continue
-		}
-		polls++
 		if shaTip == 0 {
 			if shaTip, err = w.Sha256.TipHeight(ctx); err != nil {
 				errs = append(errs, fmt.Errorf("SHA256 tip: %w", err))
@@ -225,8 +247,9 @@ func (w *Worker) Pass(ctx context.Context) error {
 		}
 		if err := w.poll(ctx, r, shaTip); err != nil {
 			errs = append(errs, fmt.Errorf("request %s: %w", r.ID, err))
-			continue
 		}
+		// Looked at, even when it failed: a request whose look keeps
+		// failing must not keep the others from theirs
 		if err := w.Store.Polled(ctx, r.ID, now); err != nil {
 			errs = append(errs, err)
 		}
@@ -293,16 +316,25 @@ func (w *Worker) poll(ctx context.Context, r Request, shaTip int64) error {
 			if out.Address != r.Address || out.Value <= 0 {
 				continue
 			}
+			op := fmt.Sprintf("%s:%d", tx.Txid, i)
+			if !w.room(known, SHA256, op) {
+				continue
+			}
 			confs := int64(0)
 			if tx.Status.Confirmed && tx.Status.BlockHeight > 0 {
 				confs = shaTip - tx.Status.BlockHeight + 1
 			}
+			state := Seen
+			if out.Value < w.MinDepositSat {
+				state = Kept // dust: never locked
+			}
 			d, err := w.Store.PutDeposit(ctx, Deposit{RequestID: r.ID, Chain: SHA256,
 				Txid: tx.Txid, Vout: uint32(i), ValueSat: out.Value,
-				Confirmations: confs, State: Seen})
+				Confirmations: confs, State: state})
 			if err != nil {
 				return err
 			}
+			known = append(known, d)
 			seenSha[d.Outpoint()] = true
 			if d.State == Seen && confs >= w.Sha256Confs {
 				d.State = Confirmed
@@ -315,6 +347,24 @@ func (w *Worker) poll(ctx context.Context, r Request, shaTip int64) error {
 	}
 	for _, d := range known {
 		if d.Chain == SHA256 && d.State == Seen && !seenSha[d.Outpoint()] {
+			// Not in the listing (which a flood of payments can push it
+			// out of): gone only if the transaction itself is gone
+			tx, err := w.Sha256.Tx(ctx, d.Txid)
+			if err == nil && tx != nil {
+				if tx.Status.Confirmed && tx.Status.BlockHeight > 0 {
+					d.Confirmations = shaTip - tx.Status.BlockHeight + 1
+					if d.Confirmations >= w.Sha256Confs {
+						d.State = Confirmed
+					}
+				}
+				if err := w.Store.SaveDeposit(ctx, d); err != nil {
+					return err
+				}
+				continue
+			}
+			if !errors.Is(err, esplora.ErrNotFound) {
+				continue
+			}
 			// An unconfirmed payment that left: replaced, or dropped
 			d.Missing++
 			if d.Missing >= missingLimit {
@@ -354,8 +404,8 @@ func (w *Worker) poll(ctx context.Context, r Request, shaTip int64) error {
 		}
 	}
 	for _, d := range shaDeposits {
-		if d.Chain == BLAKE2b && (d.State == Seen || d.State == Ready) {
-			add(d.Txid, d.Vout)
+		if d.Chain == BLAKE2b && (d.State == Seen || d.State == Ready || d.State == Gone) {
+			add(d.Txid, d.Vout) // gone ones too: they come back if they reappear
 		}
 	}
 	_, script, err := w.Keys.Address(uint32(r.KeyIndex))
@@ -379,13 +429,21 @@ func (w *Worker) poll(ctx context.Context, r Request, shaTip int64) error {
 		if out == nil || out.ScriptPubKey != ours || out.ValueSat <= 0 {
 			continue
 		}
+		if !w.room(shaDeposits, BLAKE2b, k) {
+			continue
+		}
 		found[k] = true
+		state := Seen
+		if out.ValueSat < w.MinDepositSat {
+			state = Kept // dust: never passed on
+		}
 		d, err := w.Store.PutDeposit(ctx, Deposit{RequestID: r.ID, Chain: BLAKE2b,
 			Txid: txid, Vout: vout, ValueSat: out.ValueSat,
-			Confirmations: out.Confirmations, State: Seen})
+			Confirmations: out.Confirmations, State: state})
 		if err != nil {
 			return err
 		}
+		shaDeposits = append(shaDeposits, d)
 		if d.State == Seen && out.Confirmations >= w.Blake2bConfs {
 			d.State = Ready
 			if err := w.Store.SaveDeposit(ctx, d); err != nil {
@@ -419,6 +477,24 @@ func (w *Worker) poll(ctx context.Context, r Request, shaTip int64) error {
 		return w.copies(ctx, r, after)
 	}
 	return nil
+}
+
+// room: a new deposit fits under the request's cap (one already known
+// always does).
+func (w *Worker) room(known []Deposit, chain, outpoint string) bool {
+	n := 0
+	for _, d := range known {
+		if d.Chain != chain {
+			continue
+		}
+		if d.Outpoint() == outpoint {
+			return true
+		}
+		if d.State != Gone {
+			n++
+		}
+	}
+	return n < w.MaxDeposits
 }
 
 // copies relays the request's SHA256 donations to the BLAKE2b chain, those
@@ -498,9 +574,14 @@ func (w *Worker) copy(ctx context.Context, r Request, d Deposit) (string, string
 	if err != nil {
 		return d.CopyState, d.CopyReason, nil
 	}
-	// The explorer's bytes must be the transaction asked about
+	// The explorer's bytes must be the transaction asked about, and its
+	// claimed spent outputs (whose addresses the proofs are for) the ones
+	// its signatures commit to
 	if got, err := txidOf(raw); err != nil || got != d.Txid {
 		return d.CopyState, d.CopyReason, nil
+	}
+	if err := verifyInputs(raw, tx); err != nil {
+		return CopyNotPossible, "its inputs could not be verified: " + err.Error(), nil
 	}
 	acc, err := w.Node.TestAccept(ctx, raw)
 	if err != nil {
@@ -561,15 +642,12 @@ func (w *Worker) forward(ctx context.Context, now time.Time) error {
 	}
 	var ready []Deposit
 	for _, d := range all {
-		ok, hold, err := w.cleared(ctx, d, now)
+		if at, ok := w.failedAlone[d.Outpoint()]; ok && now.Sub(at) < time.Hour {
+			continue // its batch was refused: alone, in an hour
+		}
+		ok, d, err := w.cleared(ctx, d, now)
 		if err != nil {
 			return err
-		}
-		if d.Hold != hold {
-			d.Hold = hold
-			if err := w.Store.SaveDeposit(ctx, d); err != nil {
-				return err
-			}
 		}
 		if ok {
 			ready = append(ready, d)
@@ -594,8 +672,14 @@ func (w *Worker) forward(ctx context.Context, now time.Time) error {
 		if dest == "" {
 			key, dest, rid = "lnd", w.LndAddress, ""
 		}
-		if dest == "" {
+		if dest == "" || dest == r.Address {
 			continue
+		}
+		if _, alone := w.failedAlone[d.Outpoint()]; alone {
+			key = "alone:" + d.Outpoint()
+		}
+		if g, ok := groups[key]; ok && len(g.coins) >= w.MaxTxInputs {
+			continue // next pass
 		}
 		g, ok := groups[key]
 		if !ok {
@@ -643,11 +727,21 @@ func (w *Worker) forward(ctx context.Context, now time.Time) error {
 			continue
 		}
 		if !acc.Allowed {
-			// Never relayed: its coins go back to Ready
+			// Never relayed: its coins go back to Ready, each to be tried
+			// alone, so one bad coin does not hold the others
 			f.State, f.Error = FailedSend, acc.Reason
-			w.Logger.Printf("ALERT: forward %s refused by our node: %s", s.Txid, acc.Reason)
+			for _, c := range g.coins {
+				w.failedAlone[c.Outpoint()] = now
+			}
+			if len(g.coins) == 1 {
+				w.alertOnce(ctx, now, "forward:"+g.coins[0].Outpoint(),
+					fmt.Sprintf("forward of %s refused by our node: %s", g.coins[0].Outpoint(), acc.Reason))
+			}
 			errs = append(errs, w.Store.EndForward(ctx, f))
 			continue
+		}
+		for _, c := range g.coins {
+			delete(w.failedAlone, c.Outpoint())
 		}
 		if _, err := w.Node.Send(ctx, s.Raw); err != nil {
 			errs = append(errs, err)
@@ -682,7 +776,11 @@ func (w *Worker) track(ctx context.Context) error {
 			confs = height - st.BlockHeight + 1
 		}
 		if confs < 0 {
-			// Neither in the UTXO set, the mempool nor a block: relay again
+			// Not in our node's UTXO set nor its mempool: an explorer that
+			// has it (its output already spent) settles it; else relay again
+			if _, err := w.Blake2b.Tx(ctx, f.Txid); err == nil {
+				continue
+			}
 			if _, err := w.Node.Send(ctx, f.Raw); err != nil {
 				f.Error = err.Error()
 				w.Logger.Printf("ALERT: forward %s cannot be relayed again: %v", f.Txid, err)
@@ -704,9 +802,31 @@ func (w *Worker) track(ctx context.Context) error {
 // cleared: the coin cannot be valid on the SHA256 chain, so nothing that
 // spends it, however it is signed (by us too), can be copied there; anyone
 // can check it. Either its twin there is spent by one of our locks, deep
-// enough, or the transaction that made it can never reach that chain. Else
-// it is held, and the reason says what for.
-func (w *Worker) cleared(ctx context.Context, d Deposit, now time.Time) (bool, string, error) {
+// enough by every SHA256 explorer we use, or the transaction that made it
+// cannot reach that chain as signed or by its history. Else it is held,
+// and the reason (saved with the deposit, returned) says what for.
+func (w *Worker) cleared(ctx context.Context, d Deposit, now time.Time) (bool, Deposit, error) {
+	before := d.HoldChecked
+	ok, hold, err := w.clearance(ctx, &d, now)
+	if err != nil {
+		return false, d, err
+	}
+	if !ok && hold == "" {
+		hold = "held"
+	}
+	if ok {
+		hold = ""
+	}
+	if d.Hold != hold || d.HoldChecked != before {
+		d.Hold = hold
+		if err := w.Store.SaveDeposit(ctx, d); err != nil {
+			return false, d, err
+		}
+	}
+	return ok, d, nil
+}
+
+func (w *Worker) clearance(ctx context.Context, d *Deposit, now time.Time) (bool, string, error) {
 	deposits, err := w.Store.Deposits(ctx, d.RequestID)
 	if err != nil {
 		return false, "", err
@@ -715,29 +835,76 @@ func (w *Worker) cleared(ctx context.Context, d Deposit, now time.Time) (bool, s
 		if twin.Chain != SHA256 || twin.Txid != d.Txid || twin.Vout != d.Vout || twin.State == Gone {
 			continue
 		}
-		if twin.State == Locked {
-			return true, "", nil
+		if twin.State != Locked {
+			return false, "waiting for its twin on the SHA256 chain to be locked", nil
 		}
-		return false, "waiting for its twin on the SHA256 chain to be locked", nil
-	}
-	// No twin of ours there: can there ever be one? Looked at again every
-	// 10 minutes while held
-	if d.Hold != "" && d.HoldChecked != nil && now.Sub(*d.HoldChecked) < 10*time.Minute {
-		return false, d.Hold, nil
-	}
-	result, err := replay.Check(ctx, d.Txid, w.Blake2b, w.Sha256)
-	d.HoldChecked = &now
-	_ = w.Store.SaveDeposit(ctx, d)
-	switch {
-	case err != nil:
-		return false, "its history could not be read yet", nil
-	case result.Verdict == replay.Protected || result.Verdict == replay.TwinMoved:
+		lock, err := w.Store.GetLock(ctx, twin.LockID)
+		if err != nil {
+			return false, "", err
+		}
+		if why := w.lockHolds(ctx, twin, lock); why != "" {
+			return false, why, nil
+		}
 		return true, "", nil
-	case result.Verdict == replay.Replayed:
+	}
+	// No twin of ours there: can there ever be one? Looked at again less
+	// often as the deposit ages (10 minutes at first, a day at most)
+	if d.Hold != "" && d.HoldChecked != nil {
+		every := now.Sub(d.FirstSeen) / 6
+		if every < 10*time.Minute {
+			every = 10 * time.Minute
+		}
+		if every > 24*time.Hour {
+			every = 24 * time.Hour
+		}
+		if now.Sub(*d.HoldChecked) < every {
+			return false, d.Hold, nil
+		}
+	}
+	result, ok := w.checks[d.Txid]
+	if !ok {
+		result, err = replay.Check(ctx, d.Txid, w.Blake2b, w.Sha256)
+		if err != nil {
+			result = replay.Result{Verdict: replay.Unknown, Reason: "its history could not be read yet"}
+		}
+		if w.checks != nil {
+			w.checks[d.Txid] = result
+		}
+	}
+	d.HoldChecked = &now
+	switch result.Verdict {
+	case replay.Protected, replay.TwinMoved:
+		return true, "", nil
+	case replay.Replayed:
 		return false, "copied to the SHA256 chain: waiting for that copy to be locked", nil
 	}
 	return false, "its coins could still appear on the SHA256 chain (" + result.Reason +
 		"): passed on once they cannot", nil
+}
+
+// lockHolds: every SHA256 explorer we use says the twin is spent by the
+// lock, at least LockConfs deep. "" when it holds, else why not.
+func (w *Worker) lockHolds(ctx context.Context, twin Deposit, lock Lock) string {
+	for _, v := range w.Verifiers {
+		spend, err := v.Outspend(ctx, twin.Txid, twin.Vout)
+		if err != nil {
+			return "its lock could not be confirmed with every SHA256 explorer"
+		}
+		if !spend.Spent || spend.Txid != lock.Txid {
+			return "an explorer does not see its twin spent by its lock"
+		}
+		if spend.Status == nil || !spend.Status.Confirmed || spend.Status.BlockHeight <= 0 {
+			return "its lock is not confirmed by every SHA256 explorer"
+		}
+		tip, err := v.TipHeight(ctx)
+		if err != nil {
+			return "its lock could not be confirmed with every SHA256 explorer"
+		}
+		if tip-spend.Status.BlockHeight+1 < w.LockConfs {
+			return fmt.Sprintf("its lock is not yet %d deep by every SHA256 explorer", w.LockConfs)
+		}
+	}
+	return ""
 }
 
 // alertOnce logs an alert at most once a day per key (the monitor sends
@@ -756,7 +923,46 @@ func (w *Worker) alertOnce(ctx context.Context, now time.Time, key, text string)
 // (SignLock). Once a lock is deep, a donation's twin on the BLAKE2b chain
 // can be passed on: what spends it there can never be valid on the SHA256
 // chain, where its coin is already spent.
+// RDTSWarning: from this long before the data rules end, an alert a day
+// counts the locks still exposed: a lock whose BLAKE2b twin was never
+// passed on can be mined on the BLAKE2b chain once the rules end (if that
+// twin exists or comes to exist there), taking the twin to our sweep
+// address instead of its donor.
+const RDTSWarning = 90 * 24 * time.Hour
+
+func (w *Worker) exposure(ctx context.Context, now time.Time) {
+	if now.Before(w.RDTSUntil.Add(-RDTSWarning)) {
+		return
+	}
+	locked, err := w.Store.DepositsIn(ctx, SHA256, Locked)
+	if err != nil {
+		return
+	}
+	exposed := 0
+	for _, d := range locked {
+		all, err := w.Store.Deposits(ctx, d.RequestID)
+		if err != nil {
+			return
+		}
+		safe := false
+		for _, b := range all {
+			if b.Chain == BLAKE2b && b.Txid == d.Txid && b.Vout == d.Vout && b.State == Forwarded {
+				safe = true
+			}
+		}
+		if !safe {
+			exposed++
+		}
+	}
+	if exposed > 0 {
+		w.alertOnce(ctx, now, "rdts-exposure", fmt.Sprintf(
+			"%d locked SHA256 donation(s) have no BLAKE2b twin passed on; their locks can be mined on the BLAKE2b chain after %s (see OPERATING, Locks)",
+			exposed, w.RDTSUntil.UTC().Format("2006-01-02")))
+	}
+}
+
 func (w *Worker) lock(ctx context.Context, now time.Time) error {
+	w.exposure(ctx, now)
 	deposits, err := w.Store.DepositsIn(ctx, SHA256, Confirmed)
 	if err != nil || len(deposits) == 0 {
 		return err
@@ -767,7 +973,7 @@ func (w *Worker) lock(ctx context.Context, now time.Time) error {
 			w.RDTSUntil.UTC().Format("2006-01-02")))
 		return nil
 	}
-	if last, _ := w.Store.Setting(ctx, "last_lock_failure"); last != "" {
+	if last, _ := w.Store.Setting(ctx, "last_lock_wait"); last != "" {
 		if at, err := time.Parse(time.RFC3339, last); err == nil && now.Sub(at) < time.Hour {
 			return nil
 		}
@@ -775,11 +981,21 @@ func (w *Worker) lock(ctx context.Context, now time.Time) error {
 	var coins []Coin
 	var ids []int64
 	for _, d := range deposits {
+		if len(coins) >= w.MaxTxInputs {
+			break // the rest next pass
+		}
 		spend, err := w.Sha256.Outspend(ctx, d.Txid, d.Vout)
 		if err != nil {
-			return fmt.Errorf("SHA256 explorer: %w", err)
+			continue // this coin next pass; the others go on
 		}
 		if spend.Spent {
+			// Ours after all (a lock taken for failed that went out)?
+			if l, err := w.Store.LockByTxid(ctx, spend.Txid); err == nil {
+				if err := w.Store.ReviveLock(ctx, l.ID, []int64{d.ID}); err != nil {
+					return err
+				}
+				continue
+			}
 			w.Logger.Printf("ALERT: SHA256 donation %s was spent by %s, not by a lock of ours",
 				d.Outpoint(), spend.Txid)
 			d.State = Gone
@@ -814,7 +1030,9 @@ func (w *Worker) lock(ctx context.Context, now time.Time) error {
 	}
 	s, err := SignLock(w.Keys, coins, uint32(j), rate, w.Params)
 	if errors.Is(err, ErrTooSmall) {
-		return nil // more may come
+		// More may come; an hour's wait spares the explorers meanwhile
+		_ = w.Store.SetSetting(ctx, "last_lock_wait", now.UTC().Format(time.RFC3339))
+		return nil
 	}
 	if err != nil {
 		return err
@@ -836,8 +1054,13 @@ func (w *Worker) lock(ctx context.Context, now time.Time) error {
 	}
 	l.ID = id
 	if _, err := w.Sha256.Broadcast(ctx, s.Raw); err != nil {
+		// An explorer may have relayed it and answered badly: if one has
+		// it, it went out, and trackLocks follows it
+		if _, terr := w.Sha256.Tx(ctx, s.Txid); terr == nil {
+			return nil
+		}
 		l.State, l.Error = FailedSend, err.Error()
-		_ = w.Store.SetSetting(ctx, "last_lock_failure", now.UTC().Format(time.RFC3339))
+		_ = w.Store.SetSetting(ctx, "last_lock_wait", now.UTC().Format(time.RFC3339))
 		w.alertOnce(ctx, now, "lock-relay", fmt.Sprintf("lock %s not relayed (tried again in an hour): %v", s.Txid, err))
 		return w.Store.EndLock(ctx, l)
 	}
@@ -874,7 +1097,7 @@ func (w *Worker) trackLocks(ctx context.Context) error {
 			continue
 		}
 		l.Confirmations = tip - tx.Status.BlockHeight + 1
-		if l.Confirmations >= w.Sha256Confs {
+		if l.Confirmations >= w.LockConfs {
 			l.State = Done
 			errs = append(errs, w.Store.EndLock(ctx, l))
 			continue
@@ -906,11 +1129,20 @@ func (w *Worker) sweep(ctx context.Context, now time.Time) error {
 	var ids []int64
 	var total int64
 	for _, l := range locks {
+		if len(coins) >= w.MaxTxInputs {
+			break
+		}
 		spend, err := w.Sha256.Outspend(ctx, l.Txid, 0)
 		if err != nil {
-			return fmt.Errorf("SHA256 explorer: %w", err)
+			continue
 		}
 		if spend.Spent {
+			if sw, err := w.Store.SweepByTxid(ctx, spend.Txid); err == nil {
+				if err := w.Store.ReviveSweep(ctx, sw.ID, []int64{l.ID}); err != nil {
+					return err
+				}
+				continue
+			}
 			w.Logger.Printf("ALERT: lock output %s:0 was spent by %s, not by a sweep of ours", l.Txid, spend.Txid)
 			continue
 		}
@@ -955,6 +1187,9 @@ func (w *Worker) sweep(ctx context.Context, now time.Time) error {
 	}
 	sw.ID = id
 	if _, err := w.Sha256.Broadcast(ctx, s.Raw); err != nil {
+		if _, terr := w.Sha256.Tx(ctx, s.Txid); terr == nil {
+			return nil
+		}
 		sw.State, sw.Error = FailedSend, err.Error()
 		w.Logger.Printf("ALERT: sweep %s not relayed: %v", s.Txid, err)
 		return w.Store.EndSweep(ctx, sw)
@@ -1002,4 +1237,49 @@ func (w *Worker) trackSweeps(ctx context.Context) error {
 		errs = append(errs, w.Store.SaveSweep(ctx, sw))
 	}
 	return errors.Join(errs...)
+}
+
+// sha256Consensus: the SHA256 chain's script rules (consensus, not policy)
+const sha256Consensus = txscript.ScriptBip16 | txscript.ScriptVerifyDERSignatures |
+	txscript.ScriptVerifyCheckLockTimeVerify | txscript.ScriptVerifyCheckSequenceVerify |
+	txscript.ScriptVerifyWitness | txscript.ScriptStrictMultiSig | txscript.ScriptVerifyTaproot
+
+// verifyInputs runs each input of a SHA256-chain transaction against the
+// spent outputs an explorer gave: a wrong script or amount fails.
+func verifyInputs(raw string, tx *esplora.Tx) error {
+	b, err := hex.DecodeString(raw)
+	if err != nil {
+		return err
+	}
+	msg := wire.NewMsgTx(2)
+	if err := msg.Deserialize(bytes.NewReader(b)); err != nil {
+		return err
+	}
+	if len(msg.TxIn) != len(tx.Vin) {
+		return errors.New("inputs do not match")
+	}
+	f := txscript.NewMultiPrevOutFetcher(nil)
+	for i, vin := range tx.Vin {
+		op := msg.TxIn[i].PreviousOutPoint
+		if vin.Prevout == nil || op.Hash.String() != vin.Txid || op.Index != vin.Vout {
+			return errors.New("a spent output is missing")
+		}
+		script, err := hex.DecodeString(vin.Prevout.ScriptPubKey)
+		if err != nil {
+			return errors.New("a spent output is missing")
+		}
+		f.AddPrevOut(op, wire.NewTxOut(vin.Prevout.Value, script))
+	}
+	sh := txscript.NewTxSigHashes(msg, f)
+	for i := range msg.TxIn {
+		prev := f.FetchPrevOutput(msg.TxIn[i].PreviousOutPoint)
+		vm, err := txscript.NewEngine(prev.PkScript, msg, i, sha256Consensus, nil, sh, prev.Value, f)
+		if err != nil {
+			return err
+		}
+		if err := vm.Execute(); err != nil {
+			return fmt.Errorf("input %d: %w", i, err)
+		}
+	}
+	return nil
 }

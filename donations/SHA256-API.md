@@ -15,7 +15,7 @@ on.
    there into its own wallet, in a transaction the BLAKE2b chain's
    consensus refuses (see "Why you can trust what you receive").
 4. Whatever reaches the same address **on the BLAKE2b chain** is passed on
-   once it is 6 blocks deep and the lock is 3 deep:
+   once it is 6 blocks deep and the lock is 6 deep:
    - to the **return address** you gave, minus the miner fee;
    - with no return address, to the swap service's own wallet, as a
      donation to its liquidity.
@@ -36,8 +36,10 @@ accepts it (with `SIGHASH_UNIFIED`). Because the donation is locked first,
 nothing that spends its BLAKE2b twin can ever be valid on the SHA256 chain
 either, whoever signs it, the service included.
 
-Amounts too small to cover the fee and still leave 1,000 sat
-(`minForwardSat`) wait at the address until more arrives.
+Payments under 5,000 sat (`minDepositSat`) on either chain are kept by the
+service as they are: never locked nor passed on. Larger amounts that still
+cannot cover the fee and leave 1,000 sat (`minForwardSat`) wait at the
+address until more arrives. A request takes at most 50 deposits.
 
 ## Endpoints
 
@@ -52,7 +54,8 @@ an HTTP status; the codes are listed under each call.
   "powBits": 18,
   "challenge": "AAAAAGn...",
   "minForwardSat": 1000,
-  "confirmations": {"sha256": 3, "blake2b": 6},
+  "minDepositSat": 5000,
+  "confirmations": {"sha256": 3, "blake2b": 6, "lock": 6},
   "proofMessage": "Lightning Fork Swap: copy <txid> to the BLAKE2b chain for request <id>, return to <returnAddress>"
 }
 ```
@@ -61,8 +64,8 @@ an HTTP status; the codes are listed under each call.
   then.
 - `challenge` and `powBits`: a fresh proof-of-work challenge, valid for 10
   minutes and good for one request (see "Proof of work").
-- `confirmations`: when a SHA256-chain deposit counts, and when BLAKE2b
-  coins are passed on.
+- `confirmations`: when a SHA256-chain deposit counts, when BLAKE2b coins
+  are passed on, and how deep a lock must be first.
 
 ### `POST /donate/v1/sha256`
 
@@ -107,7 +110,7 @@ Error codes:
   "sha256": [
     {"chain": "sha256", "txid": "ab...", "vout": 1, "valueSat": 50000,
      "confirmations": 4, "state": "locked", "lockTxid": "ef...",
-     "lockConfirmations": 3, "copy": "already", "firstSeen": "2026-10-16T01:05:00Z"}
+     "lockConfirmations": 6, "copy": "already", "firstSeen": "2026-10-16T01:05:00Z"}
   ],
   "blake2b": [
     {"chain": "blake2b", "txid": "ab...", "vout": 1, "valueSat": 50000,
@@ -138,8 +141,9 @@ Transaction IDs, to follow a request on an explorer of either chain:
 States of a SHA256-chain deposit:
 - `seen`: not yet 3 deep;
 - `confirmed`: the donation counts;
-- `locking`: spent by a lock that is not yet 3 deep;
-- `locked`: spent by a lock 3 deep or more;
+- `locking`: spent by a lock that is not yet 6 deep;
+- `locked`: spent by a lock 6 deep or more;
+- `kept`: under 5,000 sat, kept as it is;
 - `gone`: an unconfirmed payment that was replaced or dropped.
 
 States of a BLAKE2b-chain deposit:
@@ -199,7 +203,9 @@ check it yourself on any explorer:
 1. Your forward (`forwardTxid`, BLAKE2b chain) spends the outpoint
    `txid:vout` of your BLAKE2b deposit.
 2. On the SHA256 chain, the same outpoint is spent by the lock
-   (`lockTxid`), at least 3 blocks deep. So no version of your forward can
+   (`lockTxid`), at least 6 blocks deep. The service checks this with every
+   SHA256 explorer it uses, again at the moment it forwards. So no version
+   of your forward can
    ever be valid on the SHA256 chain: its coin is already spent there.
 3. The lock has an output the BLAKE2b chain's consensus refuses: an
    OP_RETURN of 103 bytes, over the 83 its data rules allow, which reads
@@ -207,21 +213,37 @@ check it yourself on any explorer:
    the lock can never be mined on the BLAKE2b chain, and never compete
    there with your forward.
 
-A BLAKE2b deposit with no SHA256 twin (a plain send) is passed on only once
-its history proves it can never appear on the SHA256 chain (signed with
-`SIGHASH_UNIFIED`, or its coins gone elsewhere there); until then it is held.
+A BLAKE2b deposit with no SHA256 twin (a plain send) cannot be locked. It is
+passed on only once the transaction that paid it cannot be valid on the
+SHA256 chain:
+
+- as it is signed: the service runs its scripts under both chains' rules,
+  and an input that passes the BLAKE2b chain's and fails the SHA256
+  chain's (signed with `SIGHASH_UNIFIED`) keeps it off the SHA256 chain.
+  This binds everyone but whoever holds that input's keys, who could sign
+  it again the ordinary way: if that is you, the guarantee is yours to
+  keep. If someone else paid the address (an exchange, say), it rests on
+  them too;
+- or by its history: it descends from coins mined after the fork, or its
+  coins were spent differently on the SHA256 chain, at least 6 blocks deep.
+
+Until then it is held, and `hold` says why.
 
 The BLAKE2b chain's data rules end on 1 September 2027. From a month before,
-the service makes no new locks and holds what would need one.
+the service makes no new locks and holds what would need one. Locks made
+before stay valid. A lock whose BLAKE2b twin was never passed on (a deposit
+held or kept) could, after that date, be mined on the BLAKE2b chain and take
+that twin to the service's own wallet instead of to its donor; the service
+alerts its operator about any such lock from three months before.
 
 ## Asking for a copy
 
 A copy moves the donor's own coins on the BLAKE2b chain, so the service
 makes one only for a request created with `"replay": true` and a return
 address, and only with a proof from **every** address the donation spends
-from. Each proof is a BIP322 signature (the "simple" form for SegWit and
-taproot addresses, or the classic signed message for legacy `1...`
-addresses) of exactly this message:
+from. Each proof is a BIP322 signature (the "simple" form for native and
+nested SegWit and taproot addresses, or the classic signed message for
+legacy `1...` addresses) of exactly this message:
 
 ```
 Lightning Fork Swap: copy <txid> to the BLAKE2b chain for request <id>, return to <returnAddress>
@@ -257,8 +279,11 @@ def work(challenge, bits):
 ## Limits
 
 - Requests a day, all callers together: 300 by default.
-- A request is looked at every 30 seconds during its first day. After
-  that it is looked at less often: every 10 minutes for a week, hourly
-  for a month, daily for a year. A hint (`/tx`) makes the service look at
-  once.
-- Requests per client are rate limited at the web server.
+- A request is looked at about every 30 seconds during its first day, 40
+  requests a pass, the least recently looked at first (longer when many
+  are new). After that it is looked at less often: every 10 minutes for a
+  week, hourly for a month, daily for a year. A hint (`/tx`) makes it due
+  at once.
+- Creating requests is rate limited per client at the web server, as
+  creating swaps is.
+- Hints: at most 5 per transaction and 50 per request.

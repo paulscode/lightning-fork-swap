@@ -80,8 +80,10 @@ func (a *API) info(w http.ResponseWriter, r *http.Request) {
 		"powBits":       a.PoW.Bits,
 		"challenge":     a.PoW.Challenge(a.Now()),
 		"minForwardSat": MinForwardSat,
-		"confirmations": map[string]int64{SHA256: a.Sha256Confs, BLAKE2b: a.Blake2bConfs},
-		"proofMessage":  ProofMessage("<id>", "<txid>", "<returnAddress>"),
+		"minDepositSat": DefaultMinDepositSat,
+		"confirmations": map[string]int64{SHA256: a.Sha256Confs, BLAKE2b: a.Blake2bConfs,
+			"lock": DefaultLockConfs},
+		"proofMessage": ProofMessage("<id>", "<txid>", "<returnAddress>"),
 	})
 }
 
@@ -128,22 +130,29 @@ func (a *API) create(w http.ResponseWriter, r *http.Request) {
 		fail(w, http.StatusUnprocessableEntity, "replay_needs_address", "a copy needs a return address")
 		return
 	}
+	if ret != "" {
+		ours, err := a.Store.IsRequestAddress(ctx, ret)
+		if err != nil {
+			fail(w, http.StatusServiceUnavailable, "unavailable", "try again later")
+			return
+		}
+		if ours {
+			fail(w, http.StatusUnprocessableEntity, "bad_address", "that is one of this service's own addresses")
+			return
+		}
+	}
 	if !a.available(r) {
 		fail(w, http.StatusServiceUnavailable, "unavailable", "SHA256 donations are paused")
 		return
 	}
-	n, err := a.Store.CreatedSince(ctx, a.Now().Add(-24*time.Hour))
+	req0 := Request{ID: channels.NewID(), ReturnAddress: ret, Replay: req.Replay}
+	created, err := a.Store.CreateRequestWithin(ctx, req0, a.Now().Add(-24*time.Hour), a.MaxPerDay)
 	if err != nil {
 		fail(w, http.StatusServiceUnavailable, "unavailable", "try again later")
 		return
 	}
-	if n >= a.MaxPerDay {
+	if !created {
 		fail(w, http.StatusServiceUnavailable, "budget", "too many requests today; try again later")
-		return
-	}
-	req0 := Request{ID: channels.NewID(), ReturnAddress: ret, Replay: req.Replay}
-	if err := a.Store.CreateRequest(ctx, req0); err != nil {
-		fail(w, http.StatusServiceUnavailable, "unavailable", "try again later")
 		return
 	}
 	// The worker hands out the address in a moment
@@ -254,8 +263,12 @@ type hintRequest struct {
 // MaxProofs is the most proofs one hint carries.
 const MaxProofs = 20
 
-// MaxHints is the most hints a request keeps.
-const MaxHints = 20
+// MaxHints is the most hints a request keeps, MaxHintsPerTx the most for
+// one transaction (so others' junk can't use up a donor's room for proofs).
+const (
+	MaxHints      = 50
+	MaxHintsPerTx = 5
+)
 
 func (a *API) hint(w http.ResponseWriter, r *http.Request) {
 	req, ok := a.request(w, r)
@@ -299,7 +312,13 @@ func (a *API) hint(w http.ResponseWriter, r *http.Request) {
 		fail(w, http.StatusServiceUnavailable, "unavailable", "try again later")
 		return
 	}
-	if len(hints) >= MaxHints {
+	forTx := 0
+	for _, x := range hints {
+		if x.Txid == h.Txid {
+			forTx++
+		}
+	}
+	if len(hints) >= MaxHints || forTx >= MaxHintsPerTx {
 		fail(w, http.StatusUnprocessableEntity, "too_many_hints", "this request has enough hints")
 		return
 	}

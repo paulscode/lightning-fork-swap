@@ -87,8 +87,11 @@ func TestPostgres(t *testing.T) {
 	if err := api.CreateRequest(ctx, Request{ID: id, ReturnAddress: dest, Replay: true}); err != nil {
 		t.Fatalf("the API cannot create a request: %v", err)
 	}
-	if err := api.CreateRequest(ctx, Request{ID: id2}); err != nil {
-		t.Fatal(err)
+	if ok, err := api.CreateRequestWithin(ctx, Request{ID: id2}, time.Now().Add(-time.Hour), 5); err != nil || !ok {
+		t.Fatalf("the API cannot create within the budget: %v %v", ok, err)
+	}
+	if ok, err := api.CreateRequestWithin(ctx, Request{ID: channels.NewID()}, time.Now().Add(-time.Hour), 2); err != nil || ok {
+		t.Fatalf("created over the budget: %v %v", ok, err)
 	}
 	if err := api.AddHint(ctx, Hint{RequestID: id, Txid: txA, Proofs: []Proof{{Address: "a", Signature: "s"}}}); err != nil {
 		t.Fatalf("the API cannot add a hint: %v", err)
@@ -121,6 +124,9 @@ func TestPostgres(t *testing.T) {
 		}); err != nil {
 			t.Fatal(err)
 		}
+	}
+	if ours, err := api.IsRequestAddress(ctx, "bc1pours1"); err != nil || !ours {
+		t.Fatalf("our address: %v %v", ours, err)
 	}
 	r, err := api.GetRequest(ctx, id)
 	if err != nil || r.Address != "bc1pours0" || r.KeyIndex != 0 || !r.Replay || r.ReturnAddress != dest {

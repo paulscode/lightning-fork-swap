@@ -14,6 +14,7 @@ import (
 	"github.com/jackc/pgx/v5/pgxpool"
 
 	"github.com/paulscode/lightning-fork-swap/donations/internal/channels"
+	"github.com/paulscode/lightning-fork-swap/donations/internal/esplora"
 	"github.com/paulscode/lightning-fork-swap/donations/internal/knots"
 	"github.com/paulscode/lightning-fork-swap/donations/internal/sha256don"
 	"github.com/paulscode/lightning-fork-swap/donations/internal/store"
@@ -80,6 +81,12 @@ func runSHA256(ctx context.Context, logger *log.Logger) error {
 		logger.Print("no SHA256_LND_ADDRESS nor DONATION_ADDRESSES: coins without a return address wait")
 	}
 	blake2b, sha256 := explorers()
+	// Each SHA256 explorer on its own: all must see a lock, deep enough,
+	// before its twin is passed on
+	var verifiers []sha256don.Explorer
+	for _, u := range list("SHA256_EXPLORERS", "https://mempool.space/api,https://blockstream.info/api") {
+		verifiers = append(verifiers, esplora.New(u))
+	}
 	sweep := env("SHA256_SWEEP_ADDRESS", "")
 	if sweep != "" {
 		addr, err := btcutil.DecodeAddress(sweep, &chaincfg.MainNetParams)
@@ -87,7 +94,7 @@ func runSHA256(ctx context.Context, logger *log.Logger) error {
 			return fmt.Errorf("SHA256_SWEEP_ADDRESS is not a mainnet address: %q", sweep)
 		}
 	}
-	w := &sha256don.Worker{Store: &sha256don.Postgres{Pool: db.Pool}, Keys: keys,
+	w := &sha256don.Worker{Store: &sha256don.Postgres{Pool: db.Pool}, Keys: keys, Verifiers: verifiers,
 		Params: &chaincfg.MainNetParams, Sha256: sha256, Blake2b: blake2b, Node: node,
 		LndAddress: lndAddress, Now: time.Now, Logger: logger,
 		SweepAddress: sweep,

@@ -1,11 +1,18 @@
 package worker
 
 import (
+	"bytes"
 	"context"
+	"encoding/hex"
 	"errors"
 	"strings"
 	"testing"
 	"time"
+
+	"github.com/btcsuite/btcd/btcec/v2"
+	"github.com/btcsuite/btcd/chaincfg/chainhash"
+	"github.com/btcsuite/btcd/txscript"
+	"github.com/btcsuite/btcd/wire"
 
 	"github.com/paulscode/lightning-fork-swap/donations/internal/esplora"
 	"github.com/paulscode/lightning-fork-swap/donations/internal/lnd"
@@ -25,6 +32,7 @@ func (w *wallet) Transactions(_ context.Context, start int64) ([]lnd.Transaction
 }
 
 type chain struct {
+	hex    map[string]string
 	tx     *esplora.Tx
 	status map[string]*esplora.Status
 	fail   error
@@ -44,6 +52,16 @@ func (c *chain) Tx(_ context.Context, txid string) (*esplora.Tx, error) {
 	}
 	return nil, esplora.ErrNotFound
 }
+func (c *chain) TxHex(_ context.Context, txid string) (string, error) {
+	if c.fail != nil {
+		return "", c.fail
+	}
+	if h, ok := c.hex[txid]; ok {
+		return h, nil
+	}
+	return "", esplora.ErrNotFound
+}
+func (c *chain) TipHeight(context.Context) (int64, error) { return 980_000, c.fail }
 func (c *chain) TxStatus(_ context.Context, txid string) (*esplora.Status, error) {
 	if c.fail != nil {
 		return nil, c.fail
@@ -61,9 +79,30 @@ func (c *chain) Outspend(context.Context, string, uint32) (*esplora.Outspend, er
 }
 
 var (
-	donationTx = strings.Repeat("d", 64)
-	prev       = strings.Repeat("a", 64)
+	prev = strings.Repeat("a", 64)
+	// A real donation, signed the ordinary way, spending prev:0
+	donationTx, donationHex, donorScript = signedDonation()
 )
+
+func signedDonation() (string, string, string) {
+	priv, _ := btcec.PrivKeyFromBytes(bytes.Repeat([]byte{3}, 32))
+	script, _ := txscript.PayToTaprootScript(txscript.ComputeTaprootKeyNoScript(priv.PubKey()))
+	h, _ := chainhash.NewHashFromStr(prev)
+	op := wire.NewOutPoint(h, 0)
+	msg := wire.NewMsgTx(2)
+	msg.AddTxIn(wire.NewTxIn(op, nil, nil))
+	msg.AddTxOut(wire.NewTxOut(50_000, script))
+	f := txscript.NewCannedPrevOutputFetcher(script, 60_000)
+	w, err := txscript.TaprootWitnessSignature(msg, txscript.NewTxSigHashes(msg, f), 0, 60_000,
+		script, txscript.SigHashDefault, priv)
+	if err != nil {
+		panic(err)
+	}
+	msg.TxIn[0].Witness = w
+	var buf bytes.Buffer
+	_ = msg.Serialize(&buf)
+	return msg.TxHash().String(), hex.EncodeToString(buf.Bytes()), hex.EncodeToString(script)
+}
 
 func setup() (*Worker, *store.Memory, *wallet, *chain, *chain, *time.Time) {
 	now := time.Date(2026, 10, 10, 0, 0, 0, 0, time.UTC)
@@ -77,9 +116,10 @@ func setup() (*Worker, *store.Memory, *wallet, *chain, *chain, *time.Time) {
 			{Address: "bc1pdonate", Amount: "1"}}},
 	}}
 	blake := &chain{
+		hex: map[string]string{donationTx: donationHex},
 		tx: &esplora.Tx{Txid: donationTx, Vin: []esplora.Vin{{Txid: prev, Vout: 0,
-			Witness: []string{strings.Repeat("11", 64)},
-			Prevout: &esplora.Prevout{Type: "v1_p2tr", Address: "bc1pdonor", Value: 60000}}}},
+			Prevout: &esplora.Prevout{Type: "v1_p2tr", Address: "bc1pdonor", Value: 60000,
+				ScriptPubKey: donorScript}}}},
 		status: map[string]*esplora.Status{prev: {Confirmed: true, BlockHeight: replay.ForkHeight - 10}},
 	}
 	sha := &chain{status: map[string]*esplora.Status{}}

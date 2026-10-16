@@ -11,11 +11,16 @@
 package replay
 
 import (
+	"bytes"
 	"context"
+	"encoding/hex"
 	"errors"
 	"fmt"
 	"strings"
 	"time"
+
+	"github.com/btcsuite/btcd/txscript"
+	"github.com/btcsuite/btcd/wire"
 
 	"github.com/paulscode/lightning-fork-swap/donations/internal/esplora"
 	"github.com/paulscode/lightning-fork-swap/donations/internal/sighash"
@@ -52,8 +57,10 @@ func (v Verdict) Final() bool {
 // Explorer is what a check reads from each chain.
 type Explorer interface {
 	Tx(ctx context.Context, txid string) (*esplora.Tx, error)
+	TxHex(ctx context.Context, txid string) (string, error)
 	TxStatus(ctx context.Context, txid string) (*esplora.Status, error)
 	Outspend(ctx context.Context, txid string, vout uint32) (*esplora.Outspend, error)
+	TipHeight(ctx context.Context) (int64, error)
 }
 
 // Input is the report on one input.
@@ -94,7 +101,32 @@ const MaxInputs = 100
 // the check is left "unknown" rather than called protected.
 const MaxAncestors = 60
 
-// Where a coin stands with respect to the SHA256 chain
+// SpendDepth: a coin spent on the other chain by another transaction counts
+// as moved there only once that spend is this deep; until then it could be
+// replaced or reorganised away, and the coin is still at risk.
+const SpendDepth = 6
+
+// Script flags of each chain's consensus (not relay policy: a legacy
+// signature with an unusual hash type is non-standard on the SHA256 chain,
+// yet valid in a block there). The BLAKE2b chain's adds the unified
+// signature hash; that is the only difference that matters here.
+const (
+	sha256Consensus = txscript.ScriptBip16 | txscript.ScriptVerifyDERSignatures |
+		txscript.ScriptVerifyCheckLockTimeVerify | txscript.ScriptVerifyCheckSequenceVerify |
+		txscript.ScriptVerifyWitness | txscript.ScriptStrictMultiSig | txscript.ScriptVerifyTaproot
+	blake2bConsensus = sha256Consensus | txscript.ScriptVerifyUnifiedSigHash
+)
+
+// direction: the rules of the chain a transaction is on (here) and of the
+// one it might be copied to (there)
+type direction struct{ here, there txscript.ScriptFlags }
+
+var (
+	toSHA256  = direction{here: blake2bConsensus, there: sha256Consensus}
+	toBLAKE2b = direction{here: sha256Consensus, there: blake2bConsensus}
+)
+
+// Where a coin stands with respect to the other chain
 type reach int
 
 const (
@@ -108,19 +140,21 @@ const (
 	reachNever
 )
 
-// walk follows a transaction's ancestry on the BLAKE2b chain to decide
-// whether its coins exist, or could come to exist, on the SHA256 chain.
+// walk follows a transaction's ancestry on its chain (here) to decide
+// whether its coins exist, or could come to exist, on the other (there).
 type walk struct {
-	ctx             context.Context
-	blake2b, sha256 Explorer
-	txs             map[string]reachOf
-	reads           int
+	ctx         context.Context
+	here, there Explorer
+	dir         direction
+	txs         map[string]reachOf
+	reads       int
+	thereTip    int64
 }
 
 type reachOf struct {
 	reach  reach
 	why    string
-	height int64 // on the BLAKE2b chain; 0 when unconfirmed or unread
+	height int64 // here; 0 when unconfirmed or unread
 }
 
 // tx decides for a whole transaction: whether its outputs exist there.
@@ -138,7 +172,7 @@ func (w *walk) read(txid string) reachOf {
 		return reachOf{reach: reachUnknown, why: "its ancestry is too long to follow automatically: look by hand"}
 	}
 	w.reads++
-	tx, err := w.blake2b.Tx(w.ctx, txid)
+	tx, err := w.here.Tx(w.ctx, txid)
 	if err != nil || tx == nil {
 		return reachOf{reach: reachUnknown, why: "the BLAKE2b-chain explorers did not answer"}
 	}
@@ -152,24 +186,27 @@ func (w *walk) read(txid string) reachOf {
 	// After the fork: there if it was copied there. The whole transaction,
 	// not its status: explorers answer a status for transactions they don't
 	// know as unconfirmed
-	there, err := w.sha256.Tx(w.ctx, txid)
+	there, err := w.there.Tx(w.ctx, txid)
 	switch {
 	case err == nil && there != nil:
 		return reachOf{reach: reachThere, why: "copied to the SHA256 chain", height: height}
 	case !errors.Is(err, esplora.ErrNotFound):
 		return reachOf{reach: reachUnknown, why: "the SHA256-chain explorers did not answer", height: height}
 	}
-	// Not there: could it be copied? Signatures first, they cost nothing
-	unknown := ""
+	// Not there: could it be copied? New coins first, then its signatures
 	for _, vin := range tx.Vin {
-		if vin.IsCoinbase || vin.Prevout == nil {
+		if vin.IsCoinbase {
 			return reachOf{reach: reachNever, why: "it descends from coins mined after the fork", height: height}
 		}
-		switch protectionOf(vin) {
+	}
+	unknown := ""
+	verdicts, why := signedVerdicts(w.ctx, w.here, tx, w.dir)
+	for _, v := range verdicts {
+		switch v {
 		case sighash.Protected:
-			return reachOf{reach: reachNever, why: "an earlier transaction is signed with SIGHASH_UNIFIED", height: height}
+			return reachOf{reach: reachNever, why: "an earlier transaction is signed so that the SHA256 chain refuses it", height: height}
 		case sighash.Unknown:
-			unknown = "an earlier transaction's signatures could not be read"
+			unknown = why
 		}
 	}
 	for _, vin := range tx.Vin {
@@ -188,32 +225,102 @@ func (w *walk) read(txid string) reachOf {
 }
 
 // coin decides for one coin, as spent by spender: there and unspent (or
-// spent by the spender itself) is there; spent there by something else
-// can never serve the spender.
+// spent by the spender itself, or by another transaction not yet deep) is
+// there; spent there deep enough by something else can never serve the
+// spender.
 func (w *walk) coin(txid string, vout uint32, spender string) (reach, string) {
 	r := w.tx(txid)
 	if r.reach != reachThere {
 		return r.reach, r.why
 	}
-	spend, err := w.sha256.Outspend(w.ctx, txid, vout)
+	moved, err := w.movedThere(txid, vout, spender)
 	switch {
 	case err != nil:
 		return reachUnknown, "the SHA256-chain explorers did not answer"
-	case spend.Spent && spend.Txid != spender:
+	case moved:
 		return reachNever, "an earlier coin was spent on the SHA256 chain by another transaction"
 	}
 	return reachThere, r.why
 }
 
-func protectionOf(vin esplora.Vin) sighash.Protection {
-	read, err := sighash.Read(sighash.Input{
-		ScriptType: vin.Prevout.Type, Witness: vin.Witness,
-		ScriptSig: vin.ScriptSig,
-	})
+// movedThere: the coin is spent on the other chain by a transaction other
+// than spender, at least SpendDepth deep.
+func (w *walk) movedThere(txid string, vout uint32, spender string) (bool, error) {
+	spend, err := w.there.Outspend(w.ctx, txid, vout)
 	if err != nil {
-		return sighash.Unknown
+		return false, err
 	}
-	return read.Protection
+	if !spend.Spent || spend.Txid == spender || spend.Status == nil ||
+		!spend.Status.Confirmed || spend.Status.BlockHeight <= 0 {
+		return false, nil
+	}
+	if w.thereTip == 0 {
+		if w.thereTip, err = w.there.TipHeight(w.ctx); err != nil {
+			return false, err
+		}
+	}
+	return w.thereTip-spend.Status.BlockHeight+1 >= SpendDepth, nil
+}
+
+// signedVerdicts judges each input of tx as it is signed, by running its
+// scripts: Protected when valid under the rules here and invalid under the
+// rules there (only whoever holds its keys could sign it again for there),
+// Unprotected when valid under both, Unknown when it cannot be verified
+// (raw bytes or a spent output missing, or inconsistent). The raw bytes
+// are checked against the txid; the spent outputs come from the explorer,
+// and signatures commit to them, so wrong ones fail verification.
+func signedVerdicts(ctx context.Context, here Explorer, tx *esplora.Tx, dir direction) ([]sighash.Protection, string) {
+	unknown := func(why string) ([]sighash.Protection, string) {
+		out := make([]sighash.Protection, len(tx.Vin))
+		for i := range out {
+			out[i] = sighash.Unknown
+		}
+		return out, why
+	}
+	raw, err := here.TxHex(ctx, tx.Txid)
+	if err != nil {
+		return unknown("a transaction's bytes could not be read")
+	}
+	b, err := hex.DecodeString(raw)
+	if err != nil {
+		return unknown("a transaction's bytes could not be read")
+	}
+	msg := wire.NewMsgTx(2)
+	if err := msg.Deserialize(bytes.NewReader(b)); err != nil ||
+		msg.TxHash().String() != tx.Txid || len(msg.TxIn) != len(tx.Vin) {
+		return unknown("a transaction's bytes do not match it")
+	}
+	fetcher := txscript.NewMultiPrevOutFetcher(nil)
+	for i, vin := range tx.Vin {
+		in := msg.TxIn[i].PreviousOutPoint
+		if vin.Prevout == nil || in.Hash.String() != vin.Txid || in.Index != vin.Vout {
+			return unknown("a spent output is missing")
+		}
+		script, err := hex.DecodeString(vin.Prevout.ScriptPubKey)
+		if err != nil {
+			return unknown("a spent output is missing")
+		}
+		fetcher.AddPrevOut(in, wire.NewTxOut(vin.Prevout.Value, script))
+	}
+	sigHashes := txscript.NewTxSigHashes(msg, fetcher)
+	out := make([]sighash.Protection, len(msg.TxIn))
+	why := ""
+	for i := range msg.TxIn {
+		prev := fetcher.FetchPrevOutput(msg.TxIn[i].PreviousOutPoint)
+		valid := func(flags txscript.ScriptFlags) bool {
+			vm, err := txscript.NewEngine(prev.PkScript, msg, i, flags, nil, sigHashes, prev.Value, fetcher)
+			return err == nil && vm.Execute() == nil
+		}
+		switch {
+		case !valid(dir.here):
+			out[i], why = sighash.Unknown, "an input's signatures do not verify"
+		case valid(dir.there):
+			out[i] = sighash.Unprotected
+		default:
+			out[i] = sighash.Protected
+		}
+	}
+	return out, why
 }
 
 // CheckSHA256 judges a transaction of the SHA256 chain the other way
@@ -221,15 +328,19 @@ func protectionOf(vin esplora.Vin) sighash.Protection {
 // rules hold in both directions; the reason names the chains accordingly,
 // and Input.Sha256 then tells where each coin stands on the BLAKE2b chain.
 func CheckSHA256(ctx context.Context, txid string, sha256, blake2b Explorer) (Result, error) {
-	result, err := Check(ctx, txid, sha256, blake2b)
+	result, err := check(ctx, txid, sha256, blake2b, toBLAKE2b)
 	swap := strings.NewReplacer("SHA256", "BLAKE2b", "BLAKE2b", "SHA256")
 	result.Reason = swap.Replace(result.Reason)
 	return result, err
 }
 
-// Check judges a donation transaction.
+// Check judges a donation transaction of the BLAKE2b chain.
 func Check(ctx context.Context, txid string, blake2b, sha256 Explorer) (Result, error) {
-	tx, err := blake2b.Tx(ctx, txid)
+	return check(ctx, txid, blake2b, sha256, toSHA256)
+}
+
+func check(ctx context.Context, txid string, here, there Explorer, dir direction) (Result, error) {
+	tx, err := here.Tx(ctx, txid)
 	if err != nil {
 		return Result{}, fmt.Errorf("reading %s: %w", txid, err)
 	}
@@ -240,11 +351,11 @@ func Check(ctx context.Context, txid string, blake2b, sha256 Explorer) (Result, 
 		return result, nil
 	}
 
-	// The donation's own signatures first: they cost nothing
+	// What the inputs are, then how they are signed
 	unknown := ""
 	for _, vin := range tx.Vin {
 		in := Input{Prevout: fmt.Sprintf("%s:%d", vin.Txid, vin.Vout)}
-		if vin.IsCoinbase || vin.Prevout == nil {
+		if vin.IsCoinbase {
 			// New coins: they exist on this chain only
 			in.ScriptType = "coinbase"
 			result.Inputs = append(result.Inputs, in)
@@ -252,36 +363,44 @@ func Check(ctx context.Context, txid string, blake2b, sha256 Explorer) (Result, 
 			result.Reason = "spends coins the SHA256 chain does not have"
 			return result, nil
 		}
+		if vin.Prevout == nil {
+			result.Inputs = append(result.Inputs, in)
+			unknown = "a spent output is missing"
+			continue
+		}
 		in.Address = vin.Prevout.Address
 		in.Value = vin.Prevout.Value
 		in.ScriptType = vin.Prevout.Type
-		read, err := sighash.Read(sighash.Input{
-			ScriptType: vin.Prevout.Type, Witness: vin.Witness,
-			ScriptSig: vin.ScriptSig,
-		})
-		if err != nil {
-			read.Protection = sighash.Unknown
-		}
-		in.Protection = read.Protection
-		for _, t := range read.HashTypes {
-			in.HashTypes = append(in.HashTypes, fmt.Sprintf("0x%02x", t))
+		// The hash types, for the report; the verdict comes from the scripts
+		if read, err := sighash.Read(sighash.Input{ScriptType: vin.Prevout.Type,
+			Witness: vin.Witness, ScriptSig: vin.ScriptSig}); err == nil {
+			for _, t := range read.HashTypes {
+				in.HashTypes = append(in.HashTypes, fmt.Sprintf("0x%02x", t))
+			}
 		}
 		result.Inputs = append(result.Inputs, in)
-		switch read.Protection {
+	}
+	verdicts, why := signedVerdicts(ctx, here, tx, dir)
+	for i, v := range verdicts {
+		result.Inputs[i].Protection = v
+		switch v {
 		case sighash.Protected:
 			result.Verdict = Protected
-			result.Reason = "signed with SIGHASH_UNIFIED"
+			result.Reason = "an input, as signed, is invalid on the SHA256 chain (signed with SIGHASH_UNIFIED)"
 			return result, nil
 		case sighash.Unknown:
-			unknown = "some inputs' signatures could not be read"
+			unknown = why
 		}
 	}
 
-	// Then the coins it spends: one that can never exist on the SHA256
+	// Then the coins it spends: one that can never exist on the other
 	// chain keeps the whole transaction off it
-	w := &walk{ctx: ctx, blake2b: blake2b, sha256: sha256, txs: map[string]reachOf{}}
+	w := &walk{ctx: ctx, here: here, there: there, dir: dir, txs: map[string]reachOf{}}
 	moved, copyable := false, false
 	for i, vin := range tx.Vin {
+		if vin.Prevout == nil {
+			continue
+		}
 		r := w.tx(vin.Txid)
 		in := &result.Inputs[i]
 		in.PreFork = r.height > 0 && r.height < ForkHeight
@@ -298,7 +417,12 @@ func Check(ctx context.Context, txid string, blake2b, sha256 Explorer) (Result, 
 			copyable = true
 			continue
 		}
-		spend, err := sha256.Outspend(ctx, vin.Txid, vin.Vout)
+		spend, err := there.Outspend(ctx, vin.Txid, vin.Vout)
+		if err != nil {
+			unknown = "the SHA256-chain explorers did not answer"
+			continue
+		}
+		deep, err := w.movedThere(vin.Txid, vin.Vout, txid)
 		switch {
 		case err != nil:
 			unknown = "the SHA256-chain explorers did not answer"
@@ -307,9 +431,13 @@ func Check(ctx context.Context, txid string, blake2b, sha256 Explorer) (Result, 
 		case spend.Txid == txid:
 			// Copied, perhaps not yet confirmed
 			in.Sha256 = "spent:" + spend.Txid
-		default:
+		case deep:
 			in.Sha256 = "spent:" + spend.Txid
 			moved = true
+		default:
+			// Spent there by something else, not deep yet: it may still
+			// be replaced or reorganised away
+			in.Sha256 = "spent (not yet deep):" + spend.Txid
 		}
 	}
 
@@ -323,7 +451,7 @@ func Check(ctx context.Context, txid string, blake2b, sha256 Explorer) (Result, 
 
 	// Already copied over?
 	if !copyable {
-		status, err := sha256.TxStatus(ctx, txid)
+		status, err := there.TxStatus(ctx, txid)
 		switch {
 		case err == nil && status.Confirmed:
 			result.Verdict = Replayed
@@ -339,7 +467,7 @@ func Check(ctx context.Context, txid string, blake2b, sha256 Explorer) (Result, 
 	switch {
 	case moved:
 		result.Verdict = TwinMoved
-		result.Reason = "the coins on the SHA256 chain were moved by another transaction"
+		result.Reason = "the coins on the SHA256 chain were moved by another transaction, at least 6 blocks deep"
 	case unknown != "":
 		result.Verdict = Unknown
 		result.Reason = unknown

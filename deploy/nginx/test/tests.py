@@ -334,6 +334,9 @@ class RateLimits(unittest.TestCase):
         # Creating a channel donation counts against the same limit
         status, _, _ = request("POST", "/donate/v1/channel-orders", body="{}")
         self.assertEqual(status, 503)
+        # So does a SHA256-chain donation request
+        status, _, _ = request("POST", "/donate/v1/sha256", body="{}")
+        self.assertEqual(status, 503)
 
 
     def test_a_big_body_is_refused(self):
@@ -341,6 +344,13 @@ class RateLimits(unittest.TestCase):
                                "/donate/v1/channel-orders/AbCdEfGhIjKlMnOpQrSt_-/node",
                                body="x" * 17000)
         self.assertEqual(status, 413)
+        # Creating takes little; a hint with its proofs takes more
+        for path in ("/donate/v1/channel-orders", "/donate/v1/sha256"):
+            status, _, _ = request("POST", path, body="x" * 5000)
+            self.assertEqual(status, 413, path)
+        status, _, _ = request("POST", "/donate/v1/sha256/AbCdEfGhIjKlMnOpQrSt_-/tx",
+                               body="x" * 10000)
+        self.assertNotEqual(status, 413)
 
     def test_the_donations_api_is_limited(self):
         path = "/donate/v1/replay/" + "cd" * 32

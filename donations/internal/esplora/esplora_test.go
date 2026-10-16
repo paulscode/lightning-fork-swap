@@ -3,6 +3,7 @@ package esplora
 import (
 	"context"
 	"errors"
+	"fmt"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -209,5 +210,36 @@ func TestFeesAndBroadcast(t *testing.T) {
 	if _, err := New(refuses.URL).Broadcast(context.Background(), "0200aa"); err == nil ||
 		!strings.Contains(err.Error(), "missingorspent") {
 		t.Fatalf("refused: %v", err)
+	}
+}
+
+func TestAddressTxsReadsOlderPages(t *testing.T) {
+	page := func(from, n int) string {
+		var parts []string
+		for i := from; i < from+n; i++ {
+			parts = append(parts, fmt.Sprintf(`{"txid":"%064x","status":{"confirmed":true,"block_height":%d}}`, i, 1000-i))
+		}
+		return "[" + strings.Join(parts, ",") + "]"
+	}
+	var paths []string
+	s := server(func(w http.ResponseWriter, r *http.Request) {
+		paths = append(paths, r.URL.Path)
+		switch r.URL.Path {
+		case "/address/bc1pexampleexampleexample/txs":
+			_, _ = w.Write([]byte(page(0, 25)))
+		case fmt.Sprintf("/address/bc1pexampleexampleexample/txs/chain/%064x", 24):
+			_, _ = w.Write([]byte(page(25, 25)))
+		case fmt.Sprintf("/address/bc1pexampleexampleexample/txs/chain/%064x", 49):
+			_, _ = w.Write([]byte(page(50, 3)))
+		default:
+			http.NotFound(w, r)
+		}
+	})
+	defer s.Close()
+	c := New(s.URL)
+	c.Interval = 0
+	txs, err := c.AddressTxs(context.Background(), "bc1pexampleexampleexample")
+	if err != nil || len(txs) != 53 || len(paths) != 3 {
+		t.Fatalf("%d txs, %v, paths %v", len(txs), err, paths)
 	}
 }
