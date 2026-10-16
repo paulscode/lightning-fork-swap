@@ -126,3 +126,50 @@ func TestReadsATransaction(t *testing.T) {
 		t.Fatalf("%+v", tx)
 	}
 }
+
+func TestReadsAnAddressAndRawTransactions(t *testing.T) {
+	s := server(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/address/bc1pexampleexampleexample/txs":
+			_, _ = w.Write([]byte(`[{"txid":"` + txid + `","vout":[{"scriptpubkey":"5120ab","scriptpubkey_address":"bc1pexampleexampleexample","value":7}],"status":{"confirmed":true,"block_height":9}}]`))
+		case "/tx/" + txid + "/hex":
+			_, _ = w.Write([]byte("0200aa\n"))
+		default:
+			http.NotFound(w, r)
+		}
+	})
+	defer s.Close()
+	c := New(s.URL)
+	c.Interval = 0
+	txs, err := c.AddressTxs(context.Background(), "bc1pexampleexampleexample")
+	if err != nil || len(txs) != 1 || txs[0].Vout[0].Value != 7 ||
+		txs[0].Vout[0].ScriptPubKey != "5120ab" || txs[0].Status.BlockHeight != 9 {
+		t.Fatalf("%+v %v", txs, err)
+	}
+	raw, err := c.TxHex(context.Background(), txid)
+	if err != nil || raw != "0200aa" {
+		t.Fatalf("%q %v", raw, err)
+	}
+	if _, err := c.TxHex(context.Background(), strings.Repeat("b", 64)); !errors.Is(err, ErrNotFound) {
+		t.Fatalf("unknown transaction: %v", err)
+	}
+	if _, err := c.AddressTxs(context.Background(), "../tx/x"); err == nil {
+		t.Fatal("a path was taken for an address")
+	}
+}
+
+func TestReadsTheTip(t *testing.T) {
+	s := server(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/blocks/tip/height" {
+			http.NotFound(w, r)
+			return
+		}
+		_, _ = w.Write([]byte("977412"))
+	})
+	defer s.Close()
+	c := New(s.URL)
+	c.Interval = 0
+	if h, err := c.TipHeight(context.Background()); err != nil || h != 977412 {
+		t.Fatalf("%d %v", h, err)
+	}
+}

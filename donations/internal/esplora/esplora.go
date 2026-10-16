@@ -12,6 +12,7 @@ import (
 	"net/http"
 	"regexp"
 	"strconv"
+	"strings"
 	"sync"
 	"time"
 )
@@ -93,8 +94,9 @@ type Vin struct {
 
 // Vout is an output.
 type Vout struct {
-	Address string `json:"scriptpubkey_address"`
-	Value   int64  `json:"value"`
+	ScriptPubKey string `json:"scriptpubkey"`
+	Address      string `json:"scriptpubkey_address"`
+	Value        int64  `json:"value"`
 }
 
 // Tx is a transaction as an explorer gives it.
@@ -114,6 +116,14 @@ type Outspend struct {
 const maxBody = 4 << 20
 
 func (c *Client) get(ctx context.Context, path string, out any) error {
+	return c.fetch(ctx, path, func(body []byte) error {
+		return json.Unmarshal(body, out)
+	})
+}
+
+// fetch asks each explorer in turn until one answers and decode accepts
+// its answer.
+func (c *Client) fetch(ctx context.Context, path string, decode func([]byte) error) error {
 	var errs []error
 	notFound := 0
 	for _, base := range c.URLs {
@@ -145,7 +155,7 @@ func (c *Client) get(ctx context.Context, path string, out any) error {
 			errs = append(errs, fmt.Errorf("%s: HTTP %d", base, res.StatusCode))
 			continue
 		}
-		if err := json.Unmarshal(body, out); err != nil {
+		if err := decode(body); err != nil {
 			errs = append(errs, fmt.Errorf("%s: %w", base, err))
 			continue
 		}
@@ -210,4 +220,57 @@ func (c *Client) Outspend(ctx context.Context, txid string, vout uint32) (*Outsp
 		return nil, fmt.Errorf("explorer gave a malformed spend")
 	}
 	return &out, nil
+}
+
+var addressPattern = regexp.MustCompile(`^[a-zA-Z0-9]{14,90}$`)
+
+// AddressTxs reads the latest transactions paying or spending an address,
+// unconfirmed first (Esplora gives up to 50 of each).
+func (c *Client) AddressTxs(ctx context.Context, address string) ([]Tx, error) {
+	if !addressPattern.MatchString(address) {
+		return nil, fmt.Errorf("not an address: %q", address)
+	}
+	var txs []Tx
+	if err := c.get(ctx, "/address/"+address+"/txs", &txs); err != nil {
+		return nil, err
+	}
+	for _, tx := range txs {
+		if !ValidTxid(tx.Txid) {
+			return nil, fmt.Errorf("explorer gave a malformed transaction")
+		}
+	}
+	return txs, nil
+}
+
+var hexPattern = regexp.MustCompile(`^([0-9a-f]{2})+$`)
+
+// TxHex reads a transaction's raw bytes, hex encoded.
+func (c *Client) TxHex(ctx context.Context, txid string) (string, error) {
+	if !ValidTxid(txid) {
+		return "", fmt.Errorf("not a txid: %q", txid)
+	}
+	var raw string
+	err := c.fetch(ctx, "/tx/"+txid+"/hex", func(body []byte) error {
+		text := strings.TrimSpace(string(body))
+		if !hexPattern.MatchString(text) {
+			return fmt.Errorf("not a transaction")
+		}
+		raw = text
+		return nil
+	})
+	return raw, err
+}
+
+// TipHeight reads the height of the explorer's best block.
+func (c *Client) TipHeight(ctx context.Context) (int64, error) {
+	var h int64
+	err := c.fetch(ctx, "/blocks/tip/height", func(body []byte) error {
+		n, err := strconv.ParseInt(strings.TrimSpace(string(body)), 10, 64)
+		if err != nil || n <= 0 {
+			return fmt.Errorf("not a height")
+		}
+		h = n
+		return nil
+	})
+	return h, err
 }

@@ -28,6 +28,17 @@ func TestPostgres(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer root.Close()
+	// The roles are shared with other packages' tests, which go test runs
+	// at the same time: one at a time
+	lock, err := root.Acquire(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer lock.Release()
+	if _, err := lock.Exec(ctx, `SELECT pg_advisory_lock(52436)`); err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _, _ = lock.Exec(ctx, `SELECT pg_advisory_unlock(52436)`) }()
 	db := fmt.Sprintf("channels_test_%d", time.Now().UnixNano())
 	workerPw, apiPw := NewID(), NewID()
 	for _, q := range []string{
