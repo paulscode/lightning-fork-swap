@@ -45,12 +45,20 @@ type Store interface {
 	// or never relayed (back to Ready)
 	EndForward(ctx context.Context, f Forward) error
 	ForwardsIn(ctx context.Context, state string) ([]Forward, error)
+	// Records a sweep and marks its deposits Sweeping, at once
+	CreateSweep(ctx context.Context, s Sweep, depositIDs []int64) (int64, error)
+	SaveSweep(ctx context.Context, s Sweep) error
+	// Marks a sweep, and its deposits, as ended: confirmed (Swept) or never
+	// relayed (back to Confirmed)
+	EndSweep(ctx context.Context, s Sweep) error
+	SweepsIn(ctx context.Context, state string) ([]Sweep, error)
 	SetSetting(ctx context.Context, key, value string) error
 }
 
 // Settings
 const (
-	SettingLastPass = "last_pass"
+	SettingLastPass  = "last_pass"
+	SettingLastSweep = "last_sweep"
 )
 
 // Schema is created by the worker (the database's owner). The API's role
@@ -104,6 +112,19 @@ CREATE TABLE IF NOT EXISTS sha256_hints (
     at timestamptz NOT NULL DEFAULT now()
 );
 CREATE INDEX IF NOT EXISTS sha256_hints_request ON sha256_hints (request_id, txid);
+CREATE TABLE IF NOT EXISTS sha256_sweeps (
+    id bigserial PRIMARY KEY,
+    txid text NOT NULL UNIQUE,
+    raw text NOT NULL,
+    dest text NOT NULL,
+    amount_sat bigint NOT NULL,
+    fee_sat bigint NOT NULL,
+    state text NOT NULL,
+    confirmations bigint NOT NULL DEFAULT 0,
+    error text NOT NULL DEFAULT '',
+    created_at timestamptz NOT NULL DEFAULT now()
+);
+ALTER TABLE sha256_deposits ADD COLUMN IF NOT EXISTS sweep_id bigint REFERENCES sha256_sweeps (id);
 CREATE TABLE IF NOT EXISTS sha256_settings (key text PRIMARY KEY, value text NOT NULL);
 DO $$ BEGIN
   IF EXISTS (SELECT FROM pg_roles WHERE rolname = 'donations_api') THEN
@@ -207,7 +228,7 @@ func (p *Postgres) CreatedSince(ctx context.Context, since time.Time) (int, erro
 }
 
 const depositColumns = `id, request_id, chain, txid, vout, value_sat, confirmations, state,
-    coalesce(forward_id, 0), copy_state, copy_reason, missing, first_seen`
+    coalesce(forward_id, 0), coalesce(sweep_id, 0), copy_state, copy_reason, missing, first_seen`
 
 func (p *Postgres) deposits(ctx context.Context, where string, args ...any) ([]Deposit, error) {
 	rows, err := p.Pool.Query(ctx, `SELECT `+depositColumns+` FROM sha256_deposits `+where, args...)
@@ -220,7 +241,7 @@ func (p *Postgres) deposits(ctx context.Context, where string, args ...any) ([]D
 		var d Deposit
 		var vout int64
 		if err := rows.Scan(&d.ID, &d.RequestID, &d.Chain, &d.Txid, &vout, &d.ValueSat,
-			&d.Confirmations, &d.State, &d.ForwardID, &d.CopyState, &d.CopyReason,
+			&d.Confirmations, &d.State, &d.ForwardID, &d.SweepID, &d.CopyState, &d.CopyReason,
 			&d.Missing, &d.FirstSeen); err != nil {
 			return nil, err
 		}
@@ -377,6 +398,79 @@ func (p *Postgres) EndForward(ctx context.Context, f Forward) error {
 	return tx.Commit(ctx)
 }
 
+func (p *Postgres) CreateSweep(ctx context.Context, sw Sweep, depositIDs []int64) (int64, error) {
+	tx, err := p.Pool.Begin(ctx)
+	if err != nil {
+		return 0, err
+	}
+	defer func() { _ = tx.Rollback(ctx) }()
+	var id int64
+	if err := tx.QueryRow(ctx, `INSERT INTO sha256_sweeps (txid, raw, dest, amount_sat,
+        fee_sat, state) VALUES ($1, $2, $3, $4, $5, $6) RETURNING id`,
+		sw.Txid, sw.Raw, sw.Dest, sw.AmountSat, sw.FeeSat, sw.State).Scan(&id); err != nil {
+		return 0, err
+	}
+	tag, err := tx.Exec(ctx, `UPDATE sha256_deposits SET state = $2, sweep_id = $3
+        WHERE id = ANY($1) AND chain = 'sha256' AND state = $4`, depositIDs, Sweeping, id, Confirmed)
+	if err != nil {
+		return 0, err
+	}
+	if tag.RowsAffected() != int64(len(depositIDs)) {
+		return 0, errors.New("a deposit is no longer confirmed and unswept")
+	}
+	return id, tx.Commit(ctx)
+}
+
+func (p *Postgres) SaveSweep(ctx context.Context, sw Sweep) error {
+	_, err := p.Pool.Exec(ctx, `UPDATE sha256_sweeps SET state = $2, confirmations = $3,
+        error = $4 WHERE id = $1`, sw.ID, sw.State, sw.Confirmations, sw.Error)
+	return err
+}
+
+func (p *Postgres) EndSweep(ctx context.Context, sw Sweep) error {
+	tx, err := p.Pool.Begin(ctx)
+	if err != nil {
+		return err
+	}
+	defer func() { _ = tx.Rollback(ctx) }()
+	if _, err := tx.Exec(ctx, `UPDATE sha256_sweeps SET state = $2, confirmations = $3,
+        error = $4 WHERE id = $1`, sw.ID, sw.State, sw.Confirmations, sw.Error); err != nil {
+		return err
+	}
+	switch sw.State {
+	case Done:
+		_, err = tx.Exec(ctx, `UPDATE sha256_deposits SET state = $2 WHERE sweep_id = $1`, sw.ID, Swept)
+	case FailedSend:
+		_, err = tx.Exec(ctx, `UPDATE sha256_deposits SET state = $2, sweep_id = NULL
+            WHERE sweep_id = $1`, sw.ID, Confirmed)
+	default:
+		err = errors.New("a sweep ends confirmed or failed")
+	}
+	if err != nil {
+		return err
+	}
+	return tx.Commit(ctx)
+}
+
+func (p *Postgres) SweepsIn(ctx context.Context, state string) ([]Sweep, error) {
+	rows, err := p.Pool.Query(ctx, `SELECT id, txid, raw, dest, amount_sat, fee_sat, state,
+        confirmations, error, created_at FROM sha256_sweeps WHERE state = $1 ORDER BY id`, state)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var out []Sweep
+	for rows.Next() {
+		var sw Sweep
+		if err := rows.Scan(&sw.ID, &sw.Txid, &sw.Raw, &sw.Dest, &sw.AmountSat, &sw.FeeSat,
+			&sw.State, &sw.Confirmations, &sw.Error, &sw.CreatedAt); err != nil {
+			return nil, err
+		}
+		out = append(out, sw)
+	}
+	return out, rows.Err()
+}
+
 func (p *Postgres) Setting(ctx context.Context, key string) (string, error) {
 	var v string
 	err := p.Pool.QueryRow(ctx, `SELECT value FROM sha256_settings WHERE key = $1`, key).Scan(&v)
@@ -398,6 +492,7 @@ type Memory struct {
 	requests map[string]*Request
 	deposits []*Deposit
 	forwards []*Forward
+	sweeps   []*Sweep
 	hints    []Hint
 	settings map[string]string
 	Now      func() time.Time
@@ -658,6 +753,73 @@ func (m *Memory) EndForward(ctx context.Context, f Forward) error {
 		}
 	}
 	return nil
+}
+
+func (m *Memory) CreateSweep(_ context.Context, sw Sweep, depositIDs []int64) (int64, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	var picked []*Deposit
+	for _, id := range depositIDs {
+		for _, d := range m.deposits {
+			if d.ID == id && d.Chain == SHA256 && d.State == Confirmed {
+				picked = append(picked, d)
+			}
+		}
+	}
+	if len(picked) != len(depositIDs) {
+		return 0, errors.New("a deposit is no longer confirmed and unswept")
+	}
+	sw.ID, sw.CreatedAt = int64(len(m.sweeps)+1), m.Now()
+	m.sweeps = append(m.sweeps, &sw)
+	for _, d := range picked {
+		d.State, d.SweepID = Sweeping, sw.ID
+	}
+	return sw.ID, nil
+}
+
+func (m *Memory) SaveSweep(_ context.Context, sw Sweep) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	for _, e := range m.sweeps {
+		if e.ID == sw.ID {
+			e.State, e.Confirmations, e.Error = sw.State, sw.Confirmations, sw.Error
+		}
+	}
+	return nil
+}
+
+func (m *Memory) EndSweep(ctx context.Context, sw Sweep) error {
+	if sw.State != Done && sw.State != FailedSend {
+		return errors.New("a sweep ends confirmed or failed")
+	}
+	if err := m.SaveSweep(ctx, sw); err != nil {
+		return err
+	}
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	for _, d := range m.deposits {
+		if d.SweepID != sw.ID {
+			continue
+		}
+		if sw.State == Done {
+			d.State = Swept
+		} else {
+			d.State, d.SweepID = Confirmed, 0
+		}
+	}
+	return nil
+}
+
+func (m *Memory) SweepsIn(_ context.Context, state string) ([]Sweep, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	var out []Sweep
+	for _, sw := range m.sweeps {
+		if sw.State == state {
+			out = append(out, *sw)
+		}
+	}
+	return out, nil
 }
 
 func (m *Memory) Setting(_ context.Context, key string) (string, error) {

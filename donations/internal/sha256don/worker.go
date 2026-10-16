@@ -17,15 +17,20 @@ import (
 	"github.com/paulscode/lightning-fork-swap/donations/internal/bip322"
 	"github.com/paulscode/lightning-fork-swap/donations/internal/esplora"
 	"github.com/paulscode/lightning-fork-swap/donations/internal/knots"
+	"github.com/paulscode/lightning-fork-swap/donations/internal/replay"
 )
 
-// Explorer is what the worker reads from a chain's explorer.
+// Explorer is what the worker reads from a chain's explorer, and relays
+// through (the SHA256 chain's: the service runs no node of it).
 type Explorer interface {
 	AddressTxs(ctx context.Context, address string) ([]esplora.Tx, error)
 	Tx(ctx context.Context, txid string) (*esplora.Tx, error)
 	TxHex(ctx context.Context, txid string) (string, error)
 	TxStatus(ctx context.Context, txid string) (*esplora.Status, error)
+	Outspend(ctx context.Context, txid string, vout uint32) (*esplora.Outspend, error)
 	TipHeight(ctx context.Context) (int64, error)
+	FeeRate(ctx context.Context, blocks int) (float64, error)
+	Broadcast(ctx context.Context, raw string) (string, error)
 }
 
 // Node is our BLAKE2b-chain node: the truth for everything we act on.
@@ -61,7 +66,23 @@ type Worker struct {
 	MaxPolls int
 	// Checks a proof; nil is BIP322
 	Verify func(address, message, signature string) error
+
+	// Sweeps: the SHA256-chain donations sent on to SweepAddress (the
+	// operator's) every SweepEvery, when they come to SweepMinSat or more;
+	// "" never. SweepMaxFee caps the rate (sat/vB); a sweep is done at
+	// Sha256Confs.
+	SweepAddress string
+	SweepMinSat  int64
+	SweepEvery   time.Duration
+	SweepMaxFee  float64
 }
+
+// Sweep defaults
+const (
+	DefaultSweepMinSat = 50_000
+	DefaultSweepEvery  = 24 * time.Hour
+	DefaultSweepMaxFee = 50
+)
 
 func (w *Worker) verify(address, message, signature string) error {
 	if w.Verify != nil {
@@ -97,6 +118,15 @@ func (w *Worker) defaults() {
 	}
 	if w.MaxPolls == 0 {
 		w.MaxPolls = DefaultMaxPolls
+	}
+	if w.SweepMinSat == 0 {
+		w.SweepMinSat = DefaultSweepMinSat
+	}
+	if w.SweepEvery == 0 {
+		w.SweepEvery = DefaultSweepEvery
+	}
+	if w.SweepMaxFee == 0 {
+		w.SweepMaxFee = DefaultSweepMaxFee
 	}
 	if w.Logger == nil {
 		w.Logger = log.Default()
@@ -191,6 +221,12 @@ func (w *Worker) Pass(ctx context.Context) error {
 	}
 	if err := w.track(ctx); err != nil {
 		errs = append(errs, fmt.Errorf("following forwards: %w", err))
+	}
+	if err := w.sweep(ctx, now); err != nil {
+		errs = append(errs, fmt.Errorf("sweeping: %w", err))
+	}
+	if err := w.trackSweeps(ctx); err != nil {
+		errs = append(errs, fmt.Errorf("following sweeps: %w", err))
 	}
 	// Alive and handing out addresses: what the API and the monitor ask.
 	// A request whose explorer failed is looked at again next pass.
@@ -621,6 +657,181 @@ func (w *Worker) track(ctx context.Context) error {
 			continue
 		}
 		errs = append(errs, w.Store.SaveForward(ctx, f))
+	}
+	return errors.Join(errs...)
+}
+
+// sweep sends the SHA256-chain donations on to the operator's address, at
+// most every SweepEvery, when they come to SweepMinSat.
+//
+// Signed the ordinary way, as the SHA256 chain wants, a sweep could also be
+// valid on the BLAKE2b chain if every coin it spends existed there: then a
+// copy of it would send those coins (a donor's to pass on, or the
+// service's) to the operator's address. So each sweep spends at least one
+// anchor, a coin that cannot exist unspent on the BLAKE2b chain: one whose
+// twin there we have passed on, or whose donation can never reach it. One
+// is enough for the whole transaction. Our BLAKE2b node is asked to be
+// sure: it must refuse the sweep for a missing coin.
+func (w *Worker) sweep(ctx context.Context, now time.Time) error {
+	if w.SweepAddress == "" {
+		return nil
+	}
+	if last, _ := w.Store.Setting(ctx, SettingLastSweep); last != "" {
+		if at, err := time.Parse(time.RFC3339, last); err == nil && now.Sub(at) < w.SweepEvery {
+			return nil
+		}
+	}
+	deposits, err := w.Store.DepositsIn(ctx, SHA256, Confirmed)
+	if err != nil {
+		return err
+	}
+	var coins []Coin
+	var ids []int64
+	var total int64
+	anchors := 0
+	for _, d := range deposits {
+		spend, err := w.Sha256.Outspend(ctx, d.Txid, d.Vout)
+		if err != nil {
+			return fmt.Errorf("SHA256 explorer: %w", err)
+		}
+		if spend.Spent {
+			w.Logger.Printf("ALERT: SHA256 donation %s was spent by %s, not by a sweep of ours",
+				d.Outpoint(), spend.Txid)
+			continue
+		}
+		r, err := w.Store.GetRequest(ctx, d.RequestID)
+		if err != nil {
+			return err
+		}
+		anchor, err := w.anchor(ctx, d)
+		if err != nil {
+			return err
+		}
+		if anchor {
+			anchors++
+		}
+		coins = append(coins, Coin{Txid: d.Txid, Vout: d.Vout, ValueSat: d.ValueSat,
+			KeyIndex: uint32(r.KeyIndex)})
+		ids = append(ids, d.ID)
+		total += d.ValueSat
+	}
+	// Looked at: the next look is a day from now, whatever it found
+	if len(deposits) > 0 {
+		_ = w.Store.SetSetting(ctx, SettingLastSweep, now.UTC().Format(time.RFC3339))
+	}
+	if total < w.SweepMinSat {
+		return nil
+	}
+	if anchors == 0 {
+		w.Logger.Printf("not sweeping %d sat: none of the %d donations is known not to exist on the BLAKE2b chain yet",
+			total, len(coins))
+		return nil
+	}
+	rate, err := w.Sha256.FeeRate(ctx, 6)
+	if err != nil || rate <= 0 {
+		return fmt.Errorf("no SHA256-chain fee estimate: %v", err)
+	}
+	if rate > w.SweepMaxFee {
+		w.Logger.Printf("not sweeping: the SHA256-chain fee rate is %.1f sat/vB, above %.0f", rate, w.SweepMaxFee)
+		return nil
+	}
+	s, err := SignSHA256(w.Keys, coins, w.SweepAddress, rate, w.Params)
+	if errors.Is(err, ErrTooSmall) {
+		return nil
+	}
+	if err != nil {
+		return err
+	}
+	acc, err := w.Node.TestAccept(ctx, s.Raw)
+	if err != nil {
+		return fmt.Errorf("our node: %w", err)
+	}
+	if acc.Allowed || !(strings.Contains(acc.Reason, "missingorspent") ||
+		strings.Contains(acc.Reason, "missing-inputs")) {
+		w.Logger.Printf("ALERT: not sweeping: the BLAKE2b node does not refuse the sweep for a missing coin (allowed %v, %q)",
+			acc.Allowed, acc.Reason)
+		return nil
+	}
+	sw := Sweep{Txid: s.Txid, Raw: s.Raw, Dest: w.SweepAddress, AmountSat: s.AmountSat,
+		FeeSat: s.FeeSat, State: Sent}
+	id, err := w.Store.CreateSweep(ctx, sw, ids)
+	if err != nil {
+		return err
+	}
+	sw.ID = id
+	if _, err := w.Sha256.Broadcast(ctx, s.Raw); err != nil {
+		// No explorer took it: its coins wait for the next sweep
+		sw.State, sw.Error = FailedSend, err.Error()
+		w.Logger.Printf("ALERT: sweep %s not relayed: %v", s.Txid, err)
+		return w.Store.EndSweep(ctx, sw)
+	}
+	w.Logger.Printf("swept %d sat of SHA256-chain donations to %s in %s (fee %d)",
+		s.AmountSat, w.SweepAddress, s.Txid, s.FeeSat)
+	return nil
+}
+
+// anchor: the deposit's coin cannot exist unspent on the BLAKE2b chain.
+func (w *Worker) anchor(ctx context.Context, d Deposit) (bool, error) {
+	all, err := w.Store.Deposits(ctx, d.RequestID)
+	if err != nil {
+		return false, err
+	}
+	for _, b := range all {
+		if b.Chain == BLAKE2b && b.Txid == d.Txid && b.Vout == d.Vout {
+			if b.State != Forwarded {
+				return false, nil // there, not yet passed on deep enough
+			}
+			out, err := w.Node.TxOut(ctx, d.Txid, d.Vout, true)
+			if err != nil {
+				return false, fmt.Errorf("our node: %w", err)
+			}
+			return out == nil, nil
+		}
+	}
+	// Never seen there: can the donation ever get there?
+	result, err := replay.CheckSHA256(ctx, d.Txid, w.Sha256, w.Blake2b)
+	if err != nil {
+		return false, nil
+	}
+	return result.Verdict == replay.Protected || result.Verdict == replay.TwinMoved, nil
+}
+
+// trackSweeps follows sweeps until they are deep enough, relaying again
+// any that the SHA256 chain lost.
+func (w *Worker) trackSweeps(ctx context.Context) error {
+	sent, err := w.Store.SweepsIn(ctx, Sent)
+	if err != nil || len(sent) == 0 {
+		return err
+	}
+	tip, err := w.Sha256.TipHeight(ctx)
+	if err != nil {
+		return err
+	}
+	var errs []error
+	for _, sw := range sent {
+		tx, err := w.Sha256.Tx(ctx, sw.Txid)
+		switch {
+		case errors.Is(err, esplora.ErrNotFound):
+			if _, err := w.Sha256.Broadcast(ctx, sw.Raw); err != nil {
+				sw.Error = err.Error()
+				w.Logger.Printf("ALERT: sweep %s cannot be relayed again: %v", sw.Txid, err)
+				errs = append(errs, w.Store.SaveSweep(ctx, sw))
+			}
+			continue
+		case err != nil:
+			errs = append(errs, err)
+			continue
+		}
+		if !tx.Status.Confirmed {
+			continue
+		}
+		sw.Confirmations = tip - tx.Status.BlockHeight + 1
+		if sw.Confirmations >= w.Sha256Confs {
+			sw.State = Done
+			errs = append(errs, w.Store.EndSweep(ctx, sw))
+			continue
+		}
+		errs = append(errs, w.Store.SaveSweep(ctx, sw))
 	}
 	return errors.Join(errs...)
 }

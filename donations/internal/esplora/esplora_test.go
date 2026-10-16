@@ -3,6 +3,7 @@ package esplora
 import (
 	"context"
 	"errors"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -171,5 +172,42 @@ func TestReadsTheTip(t *testing.T) {
 	c.Interval = 0
 	if h, err := c.TipHeight(context.Background()); err != nil || h != 977412 {
 		t.Fatalf("%d %v", h, err)
+	}
+}
+
+func TestFeesAndBroadcast(t *testing.T) {
+	var posted []string
+	ok := server(func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case r.URL.Path == "/fee-estimates":
+			_, _ = w.Write([]byte(`{"1": 20.5, "3": 12, "6": 8.2, "144": 1.1}`))
+		case r.Method == "POST" && r.URL.Path == "/tx":
+			b, _ := io.ReadAll(r.Body)
+			posted = append(posted, string(b))
+			_, _ = w.Write([]byte(txid))
+		default:
+			http.NotFound(w, r)
+		}
+	})
+	defer ok.Close()
+	refuses := server(func(w http.ResponseWriter, r *http.Request) {
+		http.Error(w, "sendrawtransaction RPC error: bad-txns-inputs-missingorspent", http.StatusBadRequest)
+	})
+	defer refuses.Close()
+	c := New(refuses.URL, ok.URL)
+	c.Interval = 0
+	if rate, err := c.FeeRate(context.Background(), 5); err != nil || rate != 8.2 {
+		t.Fatalf("%v %v", rate, err)
+	}
+	if _, err := New(ok.URL).FeeRate(context.Background(), 500); err == nil {
+		t.Fatal("an estimate past the furthest target")
+	}
+	got, err := c.Broadcast(context.Background(), "0200aa")
+	if err != nil || got != txid || len(posted) != 1 || posted[0] != "0200aa" {
+		t.Fatalf("%q %v %v", got, err, posted)
+	}
+	if _, err := New(refuses.URL).Broadcast(context.Background(), "0200aa"); err == nil ||
+		!strings.Contains(err.Error(), "missingorspent") {
+		t.Fatalf("refused: %v", err)
 	}
 }

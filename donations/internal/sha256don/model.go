@@ -35,6 +35,8 @@ const (
 const (
 	Seen       = "seen"
 	Confirmed  = "confirmed"
+	Sweeping   = "sweeping" // SHA256: in a sweep not yet deep enough
+	Swept      = "swept"    // SHA256: sent on to the operator's address
 	Ready      = "ready"
 	Forwarding = "forwarding"
 	Forwarded  = "forwarded"
@@ -61,6 +63,7 @@ type Deposit struct {
 	Confirmations int64  `json:"confirmations"`
 	State         string `json:"state"`
 	ForwardID     int64  `json:"-"`
+	SweepID       int64  `json:"-"`
 	// The forward that spends it (filled in for callers)
 	ForwardTxid string `json:"forwardTxid,omitempty"`
 	CopyState   string `json:"copy,omitempty"`
@@ -94,6 +97,21 @@ type Forward struct {
 	Confirmations int64     `json:"confirmations"`
 	Error         string    `json:"-"`
 	CreatedAt     time.Time `json:"createdAt"`
+}
+
+// Sweep is a transaction on the SHA256 chain sending the donations on to
+// the operator's address. States as a Forward's.
+type Sweep struct {
+	ID            int64
+	Txid          string
+	Raw           string
+	Dest          string
+	AmountSat     int64
+	FeeSat        int64
+	State         string
+	Confirmations int64
+	Error         string
+	CreatedAt     time.Time
 }
 
 // Proof is a BIP322 signature by one of a donation's input addresses

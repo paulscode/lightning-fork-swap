@@ -110,6 +110,22 @@ func TestTwoChains(t *testing.T) {
 	}
 	t.Logf("the SHA256 node refuses the forward: %s", acc.Reason)
 
+	// A sweep of the donation on the SHA256 chain, while its twin is
+	// unspent on the BLAKE2b chain: valid on both, the danger an anchor
+	// removes
+	var sweepTo string
+	call(t, miner, "getnewaddress", nil, &sweepTo)
+	early, err := SignSHA256(keys, coins, sweepTo, 2, params)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if acc, err := sha.TestAccept(ctx, early.Raw); err != nil || !acc.Allowed {
+		t.Fatalf("the SHA256 node refuses a sweep: %+v %v", acc, err)
+	}
+	if acc, err := b2b.TestAccept(ctx, early.Raw); err != nil || !acc.Allowed {
+		t.Fatalf("expected the BLAKE2b node to take a sweep of an unforwarded twin: %+v %v", acc, err)
+	}
+
 	// The control: the same forward signed the ordinary way
 	ordinary := resign(t, keys, signed.Raw, coin.ValueSat, script, txscript.SigHashDefault)
 	if acc, err := sha.TestAccept(ctx, ordinary); err != nil || !acc.Allowed {
@@ -133,6 +149,25 @@ func TestTwoChains(t *testing.T) {
 	if c, _ := sha.TxOut(ctx, txid, uint32(vout), true); c == nil {
 		t.Fatal("the donation was spent on the SHA256 chain")
 	}
+
+	// Now the twin is passed on: the sweep is an anchor's, valid on the
+	// SHA256 chain only, refused by the BLAKE2b node for a missing coin
+	sweep, err := SignSHA256(keys, coins, sweepTo, 2, params)
+	if err != nil {
+		t.Fatal(err)
+	}
+	acc, err = b2b.TestAccept(ctx, sweep.Raw)
+	if err != nil || acc.Allowed || !strings.Contains(acc.Reason, "missing") {
+		t.Fatalf("the BLAKE2b node on the sweep: %+v %v", acc, err)
+	}
+	if _, err := sha.Send(ctx, sweep.Raw); err != nil {
+		t.Fatalf("the SHA256 node refuses the sweep: %v", err)
+	}
+	call(t, sha, "generatetoaddress", []any{1, minerAddr}, &mined)
+	if c, _ := sha.TxOut(ctx, sweep.Txid, 0, false); c == nil || c.ValueSat != sweep.AmountSat {
+		t.Fatalf("the sweep did not pay the operator: %+v", c)
+	}
+	t.Logf("swept on the SHA256 chain; the BLAKE2b node refuses it: %s", acc.Reason)
 }
 
 func client(t *testing.T, raw, wallet string) *knots.Client {

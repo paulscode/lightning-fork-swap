@@ -132,6 +132,7 @@ Transaction IDs, to follow a request on an explorer of either chain:
 States of a SHA256-chain deposit:
 - `seen`: not yet 3 deep;
 - `confirmed`: the donation counts;
+- `sweeping`, `swept`: the service moved it on to its own wallet;
 - `gone`: an unconfirmed payment that was replaced or dropped.
 
 States of a BLAKE2b-chain deposit:

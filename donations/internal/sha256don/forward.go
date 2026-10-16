@@ -50,6 +50,20 @@ const HashType = txscript.SigHashAll | txscript.SigHashUnified
 // chain's rules and that each fails under the SHA256 chain's before
 // returning it.
 func Sign(keys *Keys, coins []Coin, dest string, feeRate float64, params *chaincfg.Params) (*Signed, error) {
+	return sign(keys, coins, dest, feeRate, params, HashType, CheckUnified)
+}
+
+// SignSHA256 builds and signs a transaction for the SHA256 chain: the
+// ordinary way (BIP341, default hash type), which that chain takes. It
+// verifies every input under the SHA256 chain's rules. Whether the BLAKE2b
+// chain could take it too depends on its inputs, not on its signatures:
+// the caller makes sure one of them cannot exist there.
+func SignSHA256(keys *Keys, coins []Coin, dest string, feeRate float64, params *chaincfg.Params) (*Signed, error) {
+	return sign(keys, coins, dest, feeRate, params, txscript.SigHashDefault, CheckSHA256)
+}
+
+func sign(keys *Keys, coins []Coin, dest string, feeRate float64, params *chaincfg.Params,
+	hashType txscript.SigHashType, check func(*wire.MsgTx, txscript.PrevOutputFetcher) error) (*Signed, error) {
 	if len(coins) == 0 {
 		return nil, errors.New("nothing to send")
 	}
@@ -89,10 +103,14 @@ func Sign(keys *Keys, coins []Coin, dest string, feeRate float64, params *chainc
 	}
 	tx.AddTxOut(wire.NewTxOut(0, destScript))
 
-	// The size with the witnesses to come: a 64-byte signature and its
-	// hash type byte per input
+	// The size with the witnesses to come: a 64-byte signature, and its
+	// hash type byte unless it is the default
+	sigLen := 65
+	if hashType == txscript.SigHashDefault {
+		sigLen = 64
+	}
 	for _, in := range tx.TxIn {
-		in.Witness = wire.TxWitness{make([]byte, 65)}
+		in.Witness = wire.TxWitness{make([]byte, sigLen)}
 	}
 	vsize := virtualSize(tx)
 	if feeRate < 1 {
@@ -111,13 +129,13 @@ func Sign(keys *Keys, coins []Coin, dest string, feeRate float64, params *chainc
 			return nil, err
 		}
 		witness, err := txscript.TaprootWitnessSignature(tx, sigHashes, i,
-			c.ValueSat, scripts[i], HashType, priv)
+			c.ValueSat, scripts[i], hashType, priv)
 		if err != nil {
 			return nil, err
 		}
 		tx.TxIn[i].Witness = witness
 	}
-	if err := CheckUnified(tx, fetcher); err != nil {
+	if err := check(tx, fetcher); err != nil {
 		return nil, err
 	}
 
@@ -160,6 +178,31 @@ func CheckUnified(tx *wire.MsgTx, fetcher txscript.PrevOutputFetcher) error {
 		}
 		if vm.Execute() == nil {
 			return fmt.Errorf("input %d would also be valid on the SHA256 chain", i)
+		}
+	}
+	return nil
+}
+
+// CheckSHA256 verifies each input of a signed transaction under the SHA256
+// chain's rules, and that it is signed the ordinary way (no opt-in byte).
+func CheckSHA256(tx *wire.MsgTx, fetcher txscript.PrevOutputFetcher) error {
+	sigHashes := txscript.NewTxSigHashes(tx, fetcher)
+	sha256Flags := txscript.StandardVerifyFlags &^ txscript.ScriptVerifyUnifiedSigHash
+	for i, in := range tx.TxIn {
+		prev := fetcher.FetchPrevOutput(in.PreviousOutPoint)
+		if prev == nil {
+			return fmt.Errorf("input %d: unknown coin", i)
+		}
+		if len(in.Witness) != 1 || len(in.Witness[0]) != 64 {
+			return fmt.Errorf("input %d: not a default-hash-type key spend", i)
+		}
+		vm, err := txscript.NewEngine(prev.PkScript, tx, i, sha256Flags, nil,
+			sigHashes, prev.Value, fetcher)
+		if err != nil {
+			return fmt.Errorf("input %d: %w", i, err)
+		}
+		if err := vm.Execute(); err != nil {
+			return fmt.Errorf("input %d does not verify on the SHA256 chain: %w", i, err)
 		}
 	}
 	return nil

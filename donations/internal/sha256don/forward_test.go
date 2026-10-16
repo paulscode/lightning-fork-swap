@@ -118,3 +118,27 @@ func TestSignRefuses(t *testing.T) {
 		t.Fatalf("%+v %v", s, err)
 	}
 }
+
+func TestSignsForTheSHA256Chain(t *testing.T) {
+	k := vectorKeys(t)
+	s, err := SignSHA256(k, coins(), dest, 3, &chaincfg.MainNetParams)
+	if err != nil {
+		t.Fatal(err)
+	}
+	tx := decode(t, s.Raw)
+	f := fetcherFor(t, k, coins())
+	if err := CheckSHA256(tx, f); err != nil {
+		t.Fatal(err)
+	}
+	if s.FeeSat != 3*s.VSize || s.AmountSat+s.FeeSat != 100_000 {
+		t.Fatalf("%+v", s)
+	}
+	// Not what a forward may be, and the reverse
+	if err := CheckUnified(tx, f); err == nil {
+		t.Fatal("an ordinary signature passed as unified")
+	}
+	u, _ := Sign(k, coins(), dest, 3, &chaincfg.MainNetParams)
+	if err := CheckSHA256(decode(t, u.Raw), f); err == nil {
+		t.Fatal("a unified signature passed on the SHA256 chain")
+	}
+}

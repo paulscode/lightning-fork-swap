@@ -469,6 +469,20 @@ $S sha256 export --private              # the same with its private key, for
                                         # a SHA256-chain wallet (Sparrow)
 ```
 
+**Daily sweeps.** With `SHA256_SWEEP_ADDRESS` set in `.env` (an address
+of yours on the SHA256 chain), the worker sends the SHA256-chain donations
+there once a day when they come to `SHA256_SWEEP_MIN_SAT` (50,000 sat), at
+the explorers' 6-block fee estimate (not above `SHA256_SWEEP_MAX_FEE`, 50
+sat/vB; above, it waits a day). A sweep is signed the ordinary way, so it
+could also be valid on the BLAKE2b chain if every coin it spends were
+there too. Each sweep therefore includes at least one coin that cannot
+exist unspent on the BLAKE2b chain: a donation whose BLAKE2b twin was
+already passed on, or one whose history keeps it off that chain. One is
+enough for the whole transaction. Before sending, our BLAKE2b node must
+refuse the sweep for a missing coin; otherwise the worker does not send it
+and logs an alert. Until such a coin exists, the sweep waits. After
+changing the address: `docker compose up -d donations-sha256`.
+
 **Spending the SHA256-chain coins by hand.** A wallet on the SHA256 chain
 signs the ordinary way, so what it sends could also be valid on the
 BLAKE2b chain, where it would spend the same coins if they are there. Before
@@ -480,10 +494,9 @@ exists on the SHA256 chain only, such as one mined after the fork, which
 keeps the whole transaction off the BLAKE2b chain.
 
 The monitor alerts when the worker stops passing, sends a message for each
-SHA256-chain donation, each forward and each copy, one when a forward is
-refused by our node, and one while the SHA256-chain coins held pass
-`MONITOR_SHA256_MAX_SAT` (5,000,000 sat): time to move them to cold
-storage.
+SHA256-chain donation, each forward, each copy and each sweep, one when a
+forward or a sweep could not be relayed, and one while the SHA256-chain
+coins held (not yet swept) pass `MONITOR_SHA256_MAX_SAT` (5,000,000 sat).
 
 ## 9. Routine
 

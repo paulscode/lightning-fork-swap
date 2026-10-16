@@ -21,13 +21,17 @@ type explorer struct {
 	byAddress map[string][]esplora.Tx
 	txs       map[string]*esplora.Tx
 	hex       map[string]string
+	spent     map[string]string // outpoint -> spender
 	tip       int64
 	fail      error
+	feeRate   float64
+	broadcast []string
+	refuse    error
 }
 
 func newExplorer() *explorer {
 	return &explorer{byAddress: map[string][]esplora.Tx{}, txs: map[string]*esplora.Tx{},
-		hex: map[string]string{}, tip: 100}
+		hex: map[string]string{}, spent: map[string]string{}, tip: 100, feeRate: 4}
 }
 
 func (e *explorer) AddressTxs(_ context.Context, a string) ([]esplora.Tx, error) {
@@ -52,6 +56,22 @@ func (e *explorer) TxStatus(_ context.Context, txid string) (*esplora.Status, er
 	return nil, esplora.ErrNotFound
 }
 func (e *explorer) TipHeight(context.Context) (int64, error) { return e.tip, e.fail }
+func (e *explorer) Outspend(_ context.Context, txid string, vout uint32) (*esplora.Outspend, error) {
+	if by, ok := e.spent[fmt.Sprintf("%s:%d", txid, vout)]; ok {
+		return &esplora.Outspend{Spent: true, Txid: by}, nil
+	}
+	return &esplora.Outspend{}, e.fail
+}
+func (e *explorer) FeeRate(context.Context, int) (float64, error) { return e.feeRate, e.fail }
+func (e *explorer) Broadcast(_ context.Context, raw string) (string, error) {
+	if e.refuse != nil {
+		return "", e.refuse
+	}
+	e.broadcast = append(e.broadcast, raw)
+	id := txid(raw)
+	e.txs[id] = &esplora.Tx{Txid: id}
+	return id, nil
+}
 
 // pay makes a payment of value to address, from an input of from
 func (e *explorer) pay(txid, address string, value, height int64, from string) {
@@ -410,5 +430,145 @@ func TestAFailingExplorerDoesNotPauseTheService(t *testing.T) {
 	last, _ := h.store.Setting(context.Background(), SettingLastPass)
 	if last != h.clock.UTC().Format(time.RFC3339) {
 		t.Fatalf("last pass %q", last)
+	}
+}
+
+const sweepTo = "bc1q0mgraq3342p0etdrmvnevurc4xdemtwhyl9q7j"
+
+// sweepHarness: two SHA256 donations, confirmed; the first one's twin on
+// the BLAKE2b chain passed on and spent there (an anchor), the second
+// never seen there and of unknown fate
+func sweepHarness(t *testing.T) (*harness, Request) {
+	h := newHarness(t)
+	h.w.SweepAddress = sweepTo
+	r := h.request(t, "req-1", "", false)
+	h.sha.pay(txA, r.Address, 40_000, 98, "bc1qdonor")
+	h.sha.pay(txB, r.Address, 30_000, 98, "bc1qdonor")
+	ctx := context.Background()
+	h.pass(t)
+	// txA's twin: forwarded long ago
+	d, _ := h.store.PutDeposit(ctx, Deposit{RequestID: r.ID, Chain: BLAKE2b, Txid: txA, Vout: 1,
+		ValueSat: 40_000, Confirmations: 50, State: Seen})
+	d.State = Forwarded
+	_ = h.store.SaveDeposit(ctx, d)
+	// The BLAKE2b node: the swept coins are missing there
+	h.node.refuse["*"] = "bad-txns-inputs-missingorspent"
+	// The fixtures' own pass looked already: the day starts now
+	_ = h.store.SetSetting(ctx, SettingLastSweep, "")
+	return h, r
+}
+
+func TestASweepCarriesAnAnchor(t *testing.T) {
+	h, r := sweepHarness(t)
+	_ = h.store.SetSetting(context.Background(), SettingLastSweep, "")
+	h.pass(t)
+	if len(h.sha.broadcast) != 1 {
+		t.Fatalf("broadcast %d", len(h.sha.broadcast))
+	}
+	tx := decode(t, h.sha.broadcast[0])
+	if len(tx.TxIn) != 2 || len(tx.TxOut) != 1 {
+		t.Fatalf("both donations, one output: %d in %d out", len(tx.TxIn), len(tx.TxOut))
+	}
+	sweeps, _ := h.store.SweepsIn(context.Background(), Sent)
+	if len(sweeps) != 1 || sweeps[0].Dest != sweepTo || sweeps[0].AmountSat+sweeps[0].FeeSat != 70_000 {
+		t.Fatalf("%+v", sweeps)
+	}
+	for _, d := range h.deposits(t, r.ID, SHA256) {
+		if d.State != Sweeping {
+			t.Fatalf("%s: %s", d.Txid[:4], d.State)
+		}
+	}
+	// Not again the same day, nor twice
+	h.pass(t)
+	if len(h.sha.broadcast) != 1 {
+		t.Fatal("swept twice")
+	}
+	// Deep enough on the SHA256 chain: done
+	id := sweeps[0].Txid
+	h.sha.txs[id].Status = esplora.Status{Confirmed: true, BlockHeight: 98}
+	h.pass(t)
+	if done, _ := h.store.SweepsIn(context.Background(), Done); len(done) != 1 {
+		t.Fatalf("not done: %+v", done)
+	}
+	for _, d := range h.deposits(t, r.ID, SHA256) {
+		if d.State != Swept {
+			t.Fatalf("%s: %s", d.Txid[:4], d.State)
+		}
+	}
+}
+
+func TestNoSweepWithoutAnAnchor(t *testing.T) {
+	h, r := sweepHarness(t)
+	ctx := context.Background()
+	// The twin not yet passed on
+	for _, d := range h.deposits(t, r.ID, BLAKE2b) {
+		d.State = Forwarding
+		_ = h.store.SaveDeposit(ctx, d)
+	}
+	h.pass(t)
+	if len(h.sha.broadcast) != 0 {
+		t.Fatal("swept without an anchor")
+	}
+}
+
+func TestADonationThatCanNeverReachTheBLAKE2bChainAnchorsItself(t *testing.T) {
+	h := newHarness(t)
+	h.w.SweepAddress = sweepTo
+	r := h.request(t, "req-1", "", false)
+	// Paid from coins mined on the SHA256 chain after the fork
+	parent := strings.Repeat("7", 64)
+	h.sha.txs[parent] = &esplora.Tx{Txid: parent, Vin: []esplora.Vin{{IsCoinbase: true}},
+		Status: esplora.Status{Confirmed: true, BlockHeight: 970_000}}
+	h.sha.pay(txA, r.Address, 60_000, 98, "bc1qdonor")
+	h.sha.txs[txA].Vin = []esplora.Vin{{Txid: parent, Prevout: &esplora.Prevout{Address: "bc1qdonor", Type: "v0_p2wpkh"}}}
+	h.node.refuse["*"] = "bad-txns-inputs-missingorspent"
+	h.pass(t)
+	if len(h.sha.broadcast) != 1 {
+		t.Fatalf("broadcast %d", len(h.sha.broadcast))
+	}
+}
+
+func TestNoSweepBelowTheMinimumOrWhenTheBLAKE2bNodeWouldTakeIt(t *testing.T) {
+	h, _ := sweepHarness(t)
+	h.w.SweepMinSat = 100_000
+	h.pass(t)
+	if len(h.sha.broadcast) != 0 {
+		t.Fatal("swept below the minimum")
+	}
+
+	h, _ = sweepHarness(t)
+	h.node.refuse["*"] = "min relay fee not met" // refused, but not for a missing coin
+	h.pass(t)
+	if len(h.sha.broadcast) != 0 {
+		t.Fatal("swept what the BLAKE2b node might take")
+	}
+	h, _ = sweepHarness(t)
+	delete(h.node.refuse, "*") // allowed there
+	h.pass(t)
+	if len(h.sha.broadcast) != 0 {
+		t.Fatal("swept what the BLAKE2b node takes")
+	}
+}
+
+func TestAFailedSweepReleasesItsCoins(t *testing.T) {
+	h, r := sweepHarness(t)
+	h.sha.refuse = errors.New("explorers: HTTP 400")
+	h.pass(t)
+	if failed, _ := h.store.SweepsIn(context.Background(), FailedSend); len(failed) != 1 {
+		t.Fatalf("%+v", failed)
+	}
+	for _, d := range h.deposits(t, r.ID, SHA256) {
+		if d.State != Confirmed {
+			t.Fatalf("not released: %s", d.State)
+		}
+	}
+}
+
+func TestNoSweepAddressNoSweep(t *testing.T) {
+	h, _ := sweepHarness(t)
+	h.w.SweepAddress = ""
+	h.pass(t)
+	if len(h.sha.broadcast) != 0 {
+		t.Fatal("swept without an address")
 	}
 }

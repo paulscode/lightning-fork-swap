@@ -274,3 +274,63 @@ func (c *Client) TipHeight(ctx context.Context) (int64, error) {
 	})
 	return h, err
 }
+
+// FeeRate is the explorer's estimate, in sat/vB, to confirm within blocks
+// (the nearest target it gives at or above blocks).
+func (c *Client) FeeRate(ctx context.Context, blocks int) (float64, error) {
+	var est map[string]float64
+	if err := c.get(ctx, "/fee-estimates", &est); err != nil {
+		return 0, err
+	}
+	best, rate := 0, 0.0
+	for k, v := range est {
+		n, err := strconv.Atoi(k)
+		if err != nil || n < blocks || v <= 0 {
+			continue
+		}
+		if best == 0 || n < best {
+			best, rate = n, v
+		}
+	}
+	if best == 0 {
+		return 0, fmt.Errorf("no estimate for %d blocks", blocks)
+	}
+	return rate, nil
+}
+
+// Broadcast relays a transaction through every explorer, so that it
+// spreads; it is sent if one of them took it.
+func (c *Client) Broadcast(ctx context.Context, raw string) (string, error) {
+	if !hexPattern.MatchString(raw) {
+		return "", fmt.Errorf("not a transaction")
+	}
+	var errs []error
+	txid := ""
+	for _, base := range c.URLs {
+		if err := c.wait(ctx); err != nil {
+			return "", err
+		}
+		req, err := http.NewRequestWithContext(ctx, http.MethodPost, base+"/tx", strings.NewReader(raw))
+		if err != nil {
+			return "", err
+		}
+		req.Header.Set("Content-Type", "text/plain")
+		res, err := c.HTTP.Do(req)
+		if err != nil {
+			errs = append(errs, err)
+			continue
+		}
+		body, _ := io.ReadAll(io.LimitReader(res.Body, 4096))
+		res.Body.Close()
+		text := strings.TrimSpace(string(body))
+		if res.StatusCode == http.StatusOK && ValidTxid(text) {
+			txid = text
+			continue
+		}
+		errs = append(errs, fmt.Errorf("%s: HTTP %d: %.200s", base, res.StatusCode, text))
+	}
+	if txid != "" {
+		return txid, nil
+	}
+	return "", fmt.Errorf("explorers: %w", errors.Join(errs...))
+}

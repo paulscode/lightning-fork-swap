@@ -271,6 +271,12 @@ services:
       DONATION_ADDRESSES: ${DONATION_ADDRESS:-}
       BLAKE2B_EXPLORERS: ${DONATIONS_BLAKE2B_EXPLORERS:-}
       SHA256_EXPLORERS: ${DONATIONS_SHA256_EXPLORERS:-}
+      # The SHA256-chain donations sent on to the operator's address, daily
+      # from 50,000 sat; empty: kept here
+      SHA256_SWEEP_ADDRESS: ${SHA256_SWEEP_ADDRESS:-}
+      SHA256_SWEEP_MIN_SAT: ${SHA256_SWEEP_MIN_SAT:-}
+      SHA256_SWEEP_HOURS: ${SHA256_SWEEP_HOURS:-}
+      SHA256_SWEEP_MAX_FEE: ${SHA256_SWEEP_MAX_FEE:-}
     volumes:
       - type: bind
         source: ${LFSWAP_ROOT:-/srv/lfswap}/secrets/sha256-donations.seed

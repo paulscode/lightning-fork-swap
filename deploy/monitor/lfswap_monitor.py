@@ -530,6 +530,24 @@ class Monitor:
                     f"({txid})",
                     event=True,
                 )
+        for txid, amount, dest, state, error in self.psql(
+            "SELECT txid, amount_sat, dest, state, error FROM sha256_sweeps "
+            "WHERE created_at > now() - interval '3 days'", "donations"
+        ):
+            if state == "failed":
+                self.add(
+                    f"sha256:sweep-failed:{txid}",
+                    f"A sweep of {sats(amount)} to {dest} was not relayed "
+                    f"({error}); its coins wait for the next one",
+                    event=True,
+                )
+            else:
+                self.add(
+                    f"sha256:sweep:{txid}",
+                    f"Swept {sats(amount)} of SHA256-chain donations to "
+                    f"{dest} ({txid})",
+                    event=True,
+                )
         for request, txid in self.psql(
             "SELECT request_id, txid FROM sha256_deposits "
             "WHERE chain = 'sha256' AND copy_state = 'copied' "

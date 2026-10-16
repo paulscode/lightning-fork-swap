@@ -190,6 +190,44 @@ func TestPostgres(t *testing.T) {
 		t.Fatalf("%+v", ds)
 	}
 
+	// Sweeps take confirmed SHA256 deposits, once; a failed one gives them back
+	sd, err := worker.PutDeposit(ctx, Deposit{RequestID: id, Chain: SHA256, Txid: txA, Vout: 1,
+		ValueSat: 60_000, Confirmations: 3, State: Seen})
+	if err != nil {
+		t.Fatal(err)
+	}
+	sd.State = Confirmed
+	_ = worker.SaveDeposit(ctx, sd)
+	sid, err := worker.CreateSweep(ctx, Sweep{Txid: strings.Repeat("e", 64), Raw: "00",
+		Dest: dest, AmountSat: 59_000, FeeSat: 1000, State: Sent}, []int64{sd.ID})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := worker.CreateSweep(ctx, Sweep{Txid: strings.Repeat("f", 64), Raw: "00",
+		Dest: dest, State: Sent}, []int64{sd.ID}); err == nil {
+		t.Fatal("a deposit went into two sweeps")
+	}
+	if err := worker.EndSweep(ctx, Sweep{ID: sid, State: FailedSend, Error: "refused"}); err != nil {
+		t.Fatal(err)
+	}
+	if ds, _ := worker.DepositsIn(ctx, SHA256, Confirmed); len(ds) != 1 || ds[0].SweepID != 0 {
+		t.Fatalf("a failed sweep kept its coins: %+v", ds)
+	}
+	sid, _ = worker.CreateSweep(ctx, Sweep{Txid: strings.Repeat("1", 64), Raw: "00",
+		Dest: dest, State: Sent}, []int64{sd.ID})
+	if err := worker.EndSweep(ctx, Sweep{ID: sid, State: Done, Confirmations: 3}); err != nil {
+		t.Fatal(err)
+	}
+	if ds, _ := worker.DepositsIn(ctx, SHA256, Swept); len(ds) != 1 {
+		t.Fatalf("%+v", ds)
+	}
+	if sw, _ := worker.SweepsIn(ctx, Done); len(sw) != 1 || sw[0].Confirmations != 3 {
+		t.Fatalf("%+v", sw)
+	}
+	if _, err := apiPool.Exec(ctx, `UPDATE sha256_sweeps SET dest = 'bc1qattacker'`); err == nil {
+		t.Error("the API could change a sweep")
+	}
+
 	hints, err := worker.Hints(ctx, id, txA)
 	if err != nil || len(hints) != 1 || hints[0].Proofs[0].Signature != "s" {
 		t.Fatalf("%+v %v", hints, err)

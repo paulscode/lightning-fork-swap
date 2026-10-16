@@ -439,6 +439,7 @@ class ChecksTest(unittest.TestCase):
             "FROM sha256_forwards": f"{'cd' * 32}|49000|bc1qdest|sent|\n"
                                     f"{'ef' * 32}|7000|bc1qdest|failed|min relay fee not met\n",
             "copy_state = 'copied'": f"req1|{tx}\n",
+            "FROM sha256_sweeps": f"{'12' * 32}|69000|bc1qmine|sent|\n",
             "logs": "2026/10/07 11:59:00 ALERT: forward x refused by our node: y\n",
         })
         donation = alerts[f"sha256:donation:{tx}:1"]
@@ -448,6 +449,9 @@ class ChecksTest(unittest.TestCase):
         self.assertIn("bc1qdest", alerts[f"sha256:forward:{'cd' * 32}"].text)
         self.assertIn("min relay fee", alerts[f"sha256:forward-failed:{'ef' * 32}"].text)
         self.assertTrue(alerts[f"sha256:copied:{tx}"].event)
+        sweep = alerts[f"sha256:sweep:{'12' * 32}"]
+        self.assertTrue(sweep.event)
+        self.assertIn("Swept 69,000 sat", sweep.text)
         self.assertTrue(any(a.text.startswith("SHA256 donations: ") and "ALERT" in a.text
                             for a in alerts.values()))
         for a in alerts.values():

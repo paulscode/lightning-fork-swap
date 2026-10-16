@@ -9,6 +9,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/btcsuite/btcd/btcutil"
 	"github.com/btcsuite/btcd/chaincfg"
 	"github.com/jackc/pgx/v5/pgxpool"
 
@@ -79,9 +80,23 @@ func runSHA256(ctx context.Context, logger *log.Logger) error {
 		logger.Print("no SHA256_LND_ADDRESS nor DONATION_ADDRESSES: coins without a return address wait")
 	}
 	blake2b, sha256 := explorers()
+	sweep := env("SHA256_SWEEP_ADDRESS", "")
+	if sweep != "" {
+		addr, err := btcutil.DecodeAddress(sweep, &chaincfg.MainNetParams)
+		if err != nil || !addr.IsForNet(&chaincfg.MainNetParams) {
+			return fmt.Errorf("SHA256_SWEEP_ADDRESS is not a mainnet address: %q", sweep)
+		}
+	}
 	w := &sha256don.Worker{Store: &sha256don.Postgres{Pool: db.Pool}, Keys: keys,
 		Params: &chaincfg.MainNetParams, Sha256: sha256, Blake2b: blake2b, Node: node,
-		LndAddress: lndAddress, Now: time.Now, Logger: logger}
+		LndAddress: lndAddress, Now: time.Now, Logger: logger,
+		SweepAddress: sweep,
+		SweepMinSat:  number("SHA256_SWEEP_MIN_SAT", sha256don.DefaultSweepMinSat),
+		SweepEvery:   time.Duration(number("SHA256_SWEEP_HOURS", 24)) * time.Hour,
+		SweepMaxFee:  float64(number("SHA256_SWEEP_MAX_FEE", sha256don.DefaultSweepMaxFee))}
+	if sweep != "" {
+		logger.Printf("SHA256 donations: swept to %s every %v from %d sat", sweep, w.SweepEvery, w.SweepMinSat)
+	}
 	wake := make(chan struct{}, 1)
 	go listen(ctx, db.Pool, "sha256_requests", wake, logger)
 	logger.Printf("SHA256 donations: running (coins without a return address to %s)", lndAddress)
