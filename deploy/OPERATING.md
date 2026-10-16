@@ -283,7 +283,7 @@ each donation's verdict:
 
 | Verdict | Meaning |
 | --- | --- |
-| `protected` | cannot be replayed (signed with the bit, or its coins do not exist on the SHA256 chain) |
+| `protected` | cannot be replayed: signed with the bit, or its coins can never exist on the SHA256 chain (followed back, their history reaches coins mined after the fork, a transaction signed with the bit, or a coin the SHA256 chain spent differently; a coin made after the fork is not enough on its own, since the transactions that made it may be copied there first) |
 | `at_risk` | can be copied to the SHA256 chain now; rechecked hourly for 30 days, then daily for a year |
 | `replayed` | it was copied: we hold the donor's SHA256-chain coins at the donation address there |
 | `unknown` | scripts it cannot judge, or the explorers did not answer; rechecked, then look by hand |
