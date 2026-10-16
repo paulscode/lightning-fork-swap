@@ -61,8 +61,10 @@ type Deposit struct {
 	Confirmations int64  `json:"confirmations"`
 	State         string `json:"state"`
 	ForwardID     int64  `json:"-"`
-	CopyState     string `json:"copy,omitempty"`
-	CopyReason    string `json:"copyReason,omitempty"`
+	// The forward that spends it (filled in for callers)
+	ForwardTxid string `json:"forwardTxid,omitempty"`
+	CopyState   string `json:"copy,omitempty"`
+	CopyReason  string `json:"copyReason,omitempty"`
 	// Times a BLAKE2b deposit was looked for and not found
 	Missing   int       `json:"-"`
 	FirstSeen time.Time `json:"firstSeen"`

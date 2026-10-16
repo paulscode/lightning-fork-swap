@@ -181,18 +181,23 @@ func (a *API) view(r *http.Request, req Request) (View, error) {
 	if err != nil {
 		return v, err
 	}
-	for _, d := range deposits {
-		if d.Chain == SHA256 {
-			v.Sha256 = append(v.Sha256, d)
-		} else {
-			v.Blake2b = append(v.Blake2b, d)
-		}
-	}
 	forwards, err := a.Store.Forwards(r.Context(), req.ID)
 	if err != nil {
 		return v, err
 	}
 	v.Forwards = append(v.Forwards, forwards...)
+	txids := map[int64]string{}
+	for _, f := range forwards {
+		txids[f.ID] = f.Txid
+	}
+	for _, d := range deposits {
+		if d.Chain == SHA256 {
+			v.Sha256 = append(v.Sha256, d)
+		} else {
+			d.ForwardTxid = txids[d.ForwardID]
+			v.Blake2b = append(v.Blake2b, d)
+		}
+	}
 	return v, nil
 }
 

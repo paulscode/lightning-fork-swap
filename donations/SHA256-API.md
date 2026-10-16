@@ -107,7 +107,8 @@ Error codes:
   ],
   "blake2b": [
     {"chain": "blake2b", "txid": "ab...", "vout": 1, "valueSat": 50000,
-     "confirmations": 7, "state": "forwarded", "firstSeen": "2026-10-16T01:05:00Z"}
+     "confirmations": 7, "state": "forwarded", "forwardTxid": "cd...",
+     "firstSeen": "2026-10-16T01:05:00Z"}
   ],
   "forwards": [
     {"txid": "cd...", "to": "bc1q...", "amountSat": 49700, "feeSat": 300,
@@ -115,6 +116,18 @@ Error codes:
   ]
 }
 ```
+
+Transaction IDs, to follow a request on an explorer of either chain:
+- `sha256[].txid`: the donation on the SHA256 chain. A copy on the BLAKE2b
+  chain is the same transaction, so it has the same ID.
+- `blake2b[].txid`: what paid the address on the BLAKE2b chain. This is the
+  donation's ID when it was copied, or another transaction for a plain
+  send.
+- `blake2b[].forwardTxid`: the forward that passes this deposit on, once
+  there is one.
+- `forwards[].txid`: each forward on the BLAKE2b chain, with its
+  destination (`to`), amount and fee. Without a return address, a forward
+  can carry other requests' coins too, to the service's wallet.
 
 States of a SHA256-chain deposit:
 - `seen`: not yet 3 deep;

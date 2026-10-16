@@ -167,3 +167,24 @@ func TestHints(t *testing.T) {
 		t.Fatalf("no replay: %d %v", code, body)
 	}
 }
+
+func TestTheViewLinksDepositsToTheirForward(t *testing.T) {
+	h := newAPI(t)
+	ctx := context.Background()
+	_, body := h.create(t, dest, false)
+	id := body["id"].(string)
+	d, _ := h.store.PutDeposit(ctx, Deposit{RequestID: id, Chain: BLAKE2b, Txid: txA,
+		Vout: 1, ValueSat: 50_000, State: Seen})
+	d.State = Ready
+	_ = h.store.SaveDeposit(ctx, d)
+	if _, err := h.store.CreateForward(ctx, Forward{RequestID: id, Txid: txB, Dest: dest,
+		AmountSat: 49_000, FeeSat: 1000, State: Sent}, []int64{d.ID}); err != nil {
+		t.Fatal(err)
+	}
+	_, body = h.do(t, "GET", "/donate/v1/sha256/"+id, nil)
+	blake := body["blake2b"].([]any)[0].(map[string]any)
+	fwd := body["forwards"].([]any)[0].(map[string]any)
+	if blake["txid"] != txA || blake["forwardTxid"] != txB || fwd["txid"] != txB || fwd["to"] != dest {
+		t.Fatalf("%v", body)
+	}
+}
