@@ -18,8 +18,9 @@ State lives in `/srv/lfswap`; recovery material in `/srv/lfswap/secrets`
 (root only). The deployment files live in `/opt/lfswap` (a copy of this
 repository without the backend and web app sources).
 
-A host with 2 GB of RAM works with 3 GB of swap added; the containers use
-about 1 GB between them once running.
+The settings are sized for a host with 2 vCPUs, 4 GB of RAM and 80 GB of
+disk; the containers use about 1.5 GB between them once running. A 2 GB
+host works with 3 GB of swap added and smaller limits.
 
 ## First install
 
