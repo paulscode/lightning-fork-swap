@@ -559,9 +559,13 @@ class Monitor:
                 "asked for with its inputs' proofs)",
                 event=True,
             )
+        # Held on the SHA256 chain: donations not yet locked, and locks'
+        # outputs not yet swept
         rows = self.psql(
-            "SELECT coalesce(sum(value_sat), 0) FROM sha256_deposits "
-            "WHERE chain = 'sha256' AND state = 'confirmed'", "donations")
+            "SELECT coalesce((SELECT sum(value_sat) FROM sha256_deposits "
+            "WHERE chain = 'sha256' AND state = 'confirmed'), 0) + "
+            "coalesce((SELECT sum(value_sat) FROM sha256_locks "
+            "WHERE state <> 'failed' AND sweep_id IS NULL), 0)", "donations")
         held = int(rows[0][0]) if rows else 0
         limit = number(self.env, "MONITOR_SHA256_MAX_SAT", 5_000_000)
         if held > limit:

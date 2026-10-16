@@ -11,8 +11,11 @@ on.
    this request only. The same address exists on both chains.
 2. You send coins to it **on the SHA256 chain**. They are the donation; the
    service keeps them.
-3. Whatever reaches the same address **on the BLAKE2b chain** is passed on
-   once it is 6 blocks deep:
+3. The service **locks** the donation on the SHA256 chain: it spends it
+   there into its own wallet, in a transaction the BLAKE2b chain's
+   consensus refuses (see "Why you can trust what you receive").
+4. Whatever reaches the same address **on the BLAKE2b chain** is passed on
+   once it is 6 blocks deep and the lock is 3 deep:
    - to the **return address** you gave, minus the miner fee;
    - with no return address, to the swap service's own wallet, as a
      donation to its liquidity.
@@ -29,8 +32,9 @@ on.
      nothing reached the BLAKE2b chain. They are passed on the same way.
 
 The service signs everything it passes on so that only the BLAKE2b chain
-accepts it (with `SIGHASH_UNIFIED`). Otherwise the same transaction would
-also be valid on the SHA256 chain, where it would spend the donation.
+accepts it (with `SIGHASH_UNIFIED`). Because the donation is locked first,
+nothing that spends its BLAKE2b twin can ever be valid on the SHA256 chain
+either, whoever signs it, the service included.
 
 Amounts too small to cover the fee and still leave 1,000 sat
 (`minForwardSat`) wait at the address until more arrives.
@@ -102,8 +106,8 @@ Error codes:
   "pending": false,
   "sha256": [
     {"chain": "sha256", "txid": "ab...", "vout": 1, "valueSat": 50000,
-     "confirmations": 4, "state": "confirmed",
-     "copy": "already", "firstSeen": "2026-10-16T01:05:00Z"}
+     "confirmations": 4, "state": "locked", "lockTxid": "ef...",
+     "lockConfirmations": 3, "copy": "already", "firstSeen": "2026-10-16T01:05:00Z"}
   ],
   "blake2b": [
     {"chain": "blake2b", "txid": "ab...", "vout": 1, "valueSat": 50000,
@@ -123,6 +127,8 @@ Transaction IDs, to follow a request on an explorer of either chain:
 - `blake2b[].txid`: what paid the address on the BLAKE2b chain. This is the
   donation's ID when it was copied, or another transaction for a plain
   send.
+- `sha256[].lockTxid`: the lock, on the SHA256 chain, that spends the
+  donation there (with `lockConfirmations`).
 - `blake2b[].forwardTxid`: the forward that passes this deposit on, once
   there is one.
 - `forwards[].txid`: each forward on the BLAKE2b chain, with its
@@ -132,13 +138,15 @@ Transaction IDs, to follow a request on an explorer of either chain:
 States of a SHA256-chain deposit:
 - `seen`: not yet 3 deep;
 - `confirmed`: the donation counts;
-- `sweeping`, `swept`: the service moved it on to its own wallet;
+- `locking`: spent by a lock that is not yet 3 deep;
+- `locked`: spent by a lock 3 deep or more;
 - `gone`: an unconfirmed payment that was replaced or dropped.
 
 States of a BLAKE2b-chain deposit:
 - `seen`: not yet 6 deep;
-- `ready`: deep enough, about to be passed on, or waiting for more if too
-  small;
+- `ready`: deep enough. It is about to be passed on, or waiting for more
+  if too small, or held: then `hold` says why (its twin's lock is not deep
+  yet, or its coins could still appear on the SHA256 chain);
 - `forwarding`: in a forward that is not yet 6 deep;
 - `forwarded`: done;
 - `gone`: it left the chain before it was deep enough.
@@ -177,6 +185,34 @@ Error codes:
 - `too_many_proofs` (422): more than 20;
 - `too_many_hints` (422): more than 20 for one request;
 - `not_found` (404).
+
+## Why you can trust what you receive
+
+A coin is safe from replay only if it can never exist on the other chain.
+The service holds the keys of its addresses on both chains, so without a
+further step it could take the BLAKE2b coins it passed on to you and make
+them exist on the SHA256 chain too: sign its forward again the ordinary
+way (the same transaction ID) and broadcast it there, where the donation
+it spends is still unspent. The lock removes that possibility, and you can
+check it yourself on any explorer:
+
+1. Your forward (`forwardTxid`, BLAKE2b chain) spends the outpoint
+   `txid:vout` of your BLAKE2b deposit.
+2. On the SHA256 chain, the same outpoint is spent by the lock
+   (`lockTxid`), at least 3 blocks deep. So no version of your forward can
+   ever be valid on the SHA256 chain: its coin is already spent there.
+3. The lock has an output the BLAKE2b chain's consensus refuses: an
+   OP_RETURN of 103 bytes, over the 83 its data rules allow, which reads
+   "Lightning Fork Swap lock: invalid on the BLAKE2b chain by design". So
+   the lock can never be mined on the BLAKE2b chain, and never compete
+   there with your forward.
+
+A BLAKE2b deposit with no SHA256 twin (a plain send) is passed on only once
+its history proves it can never appear on the SHA256 chain (signed with
+`SIGHASH_UNIFIED`, or its coins gone elsewhere there); until then it is held.
+
+The BLAKE2b chain's data rules end on 1 September 2027. From a month before,
+the service makes no new locks and holds what would need one.
 
 ## Asking for a copy
 

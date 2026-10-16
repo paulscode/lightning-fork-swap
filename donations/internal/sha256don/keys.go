@@ -19,14 +19,22 @@ import (
 	"github.com/btcsuite/btcd/txscript"
 )
 
-// Keys derives the requests' keys: BIP86, m/86'/0'/0'/0/i. The same keys
-// hold the coins on both chains.
+// Keys derives the service's keys, BIP86: requests' addresses at
+// m/86'/0'/0'/0/i (the same keys hold the coins on both chains), and the
+// SHA256-chain hot wallet's, where locks pay, at m/86'/0'/0'/1/j.
 type Keys struct {
 	account *hdkeychain.ExtendedKey // m/86'/0'/0'
 	chain   *hdkeychain.ExtendedKey // m/86'/0'/0'/0
+	locks   *hdkeychain.ExtendedKey // m/86'/0'/0'/1
 	master  *hdkeychain.ExtendedKey
 	params  *chaincfg.Params
 }
+
+// Branches
+const (
+	Requests uint32 = 0
+	Locks    uint32 = 1
+)
 
 // NewKeys derives from a seed (16 to 64 bytes).
 func NewKeys(seed []byte, params *chaincfg.Params) (*Keys, error) {
@@ -44,7 +52,11 @@ func NewKeys(seed []byte, params *chaincfg.Params) (*Keys, error) {
 	if err != nil {
 		return nil, err
 	}
-	return &Keys{account: account, chain: chain, master: master, params: params}, nil
+	locks, err := account.Derive(1)
+	if err != nil {
+		return nil, err
+	}
+	return &Keys{account: account, chain: chain, locks: locks, master: master, params: params}, nil
 }
 
 // LoadKeys reads the seed file: hex, one line.
@@ -60,18 +72,32 @@ func LoadKeys(path string, params *chaincfg.Params) (*Keys, error) {
 	return NewKeys(seed, params)
 }
 
-// Private is the key of address i.
-func (k *Keys) Private(i uint32) (*btcec.PrivateKey, error) {
-	child, err := k.chain.Derive(i)
+// Private is the key of request address i.
+func (k *Keys) Private(i uint32) (*btcec.PrivateKey, error) { return k.PrivateAt(Requests, i) }
+
+// Address is request address i (taproot, key path only) and its script.
+func (k *Keys) Address(i uint32) (string, []byte, error) { return k.AddressAt(Requests, i) }
+
+// PrivateAt is the key of address i on a branch.
+func (k *Keys) PrivateAt(branch, i uint32) (*btcec.PrivateKey, error) {
+	parent := k.chain
+	switch branch {
+	case Requests:
+	case Locks:
+		parent = k.locks
+	default:
+		return nil, fmt.Errorf("no branch %d", branch)
+	}
+	child, err := parent.Derive(i)
 	if err != nil {
 		return nil, err
 	}
 	return child.ECPrivKey()
 }
 
-// Address is address i (taproot, key path only) and its output script.
-func (k *Keys) Address(i uint32) (string, []byte, error) {
-	priv, err := k.Private(i)
+// AddressAt is address i on a branch and its output script.
+func (k *Keys) AddressAt(branch, i uint32) (string, []byte, error) {
+	priv, err := k.PrivateAt(branch, i)
 	if err != nil {
 		return "", nil, err
 	}
@@ -100,7 +126,7 @@ func (k *Keys) Descriptor(private bool) (string, error) {
 			return "", err
 		}
 	}
-	body := fmt.Sprintf("tr([%s/86h/0h/0h]%s/0/*)", fp, key.String())
+	body := fmt.Sprintf("tr([%s/86h/0h/0h]%s/<0;1>/*)", fp, key.String())
 	sum, err := DescriptorChecksum(body)
 	if err != nil {
 		return "", err

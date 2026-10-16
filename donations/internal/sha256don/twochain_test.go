@@ -90,7 +90,7 @@ func TestTwoChains(t *testing.T) {
 		t.Fatal("the donation is not on the SHA256 chain")
 	}
 
-	// Our forward: accepted by the BLAKE2b node, refused by the SHA256 one
+	// Our forward of the BLAKE2b twin, unified
 	var ret string
 	call(t, miner, "getnewaddress", nil, &ret)
 	coins := []Coin{{Txid: txid, Vout: uint32(vout), ValueSat: coin.ValueSat, KeyIndex: 0}}
@@ -102,57 +102,71 @@ func TestTwoChains(t *testing.T) {
 		t.Fatalf("the BLAKE2b node refuses our forward: %+v %v", acc, err)
 	}
 	acc, err := sha.TestAccept(ctx, signed.Raw)
-	if err != nil || acc.Allowed {
-		t.Fatalf("the SHA256 node takes our forward: %+v %v", acc, err)
+	if err != nil || acc.Allowed || strings.Contains(acc.Reason, "missingorspent") {
+		t.Fatalf("the SHA256 node on our forward: %+v %v", acc, err)
 	}
-	if strings.Contains(acc.Reason, "missingorspent") {
-		t.Fatalf("refused for its coin, not its signature: %s", acc.Reason)
+	// The scam's step 4, before a lock: we hold the key, so we could sign
+	// the same forward the ordinary way (the same txid), and the SHA256
+	// chain would take it. This is what the lock removes.
+	ordinary := resign(t, keys, signed.Raw, coin.ValueSat, script, txscript.SigHashDefault)
+	if id, _ := txidOf(ordinary); id != signed.Txid {
+		t.Fatal("re-signing changed the txid")
 	}
-	t.Logf("the SHA256 node refuses the forward: %s", acc.Reason)
+	if acc, err := sha.TestAccept(ctx, ordinary); err != nil || !acc.Allowed {
+		t.Fatalf("expected the SHA256 node to take the re-signed forward before a lock: %+v %v", acc, err)
+	}
 
-	// A sweep of the donation on the SHA256 chain, while its twin is
-	// unspent on the BLAKE2b chain: valid on both, the danger an anchor
-	// removes
-	var sweepTo string
-	call(t, miner, "getnewaddress", nil, &sweepTo)
-	early, err := SignSHA256(keys, coins, sweepTo, 2, params)
+	// The lock, on the SHA256 chain: taken there; the BLAKE2b chain refuses
+	// it for its data output while its coin is unspent there, and will not
+	// mine it (consensus, not only relay)
+	lockCoins := []Coin{{Txid: txid, Vout: uint32(vout), ValueSat: coin.ValueSat, KeyIndex: 0}}
+	lock, err := SignLock(keys, lockCoins, 0, 2, params)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if acc, err := sha.TestAccept(ctx, early.Raw); err != nil || !acc.Allowed {
-		t.Fatalf("the SHA256 node refuses a sweep: %+v %v", acc, err)
+	if acc, err := sha.TestAccept(ctx, lock.Raw); err != nil || !acc.Allowed {
+		t.Fatalf("the SHA256 node refuses the lock: %+v %v", acc, err)
 	}
-	if acc, err := b2b.TestAccept(ctx, early.Raw); err != nil || !acc.Allowed {
-		t.Fatalf("expected the BLAKE2b node to take a sweep of an unforwarded twin: %+v %v", acc, err)
+	// Its mempool refuses it (for relay policy first); mining it is the
+	// consensus question
+	acc, err = b2b.TestAccept(ctx, lock.Raw)
+	if err != nil || acc.Allowed {
+		t.Fatalf("the BLAKE2b node takes the lock: %+v %v", acc, err)
 	}
+	var block any
+	err = b2b.Call(ctx, "generateblock", []any{minerAddr, []string{lock.Raw}}, &block)
+	if err == nil || !strings.Contains(err.Error(), "vout-script-toolarge") {
+		t.Fatalf("the BLAKE2b node mined the lock: %v", err)
+	}
+	t.Logf("the BLAKE2b chain will not mine the lock: %v", err)
+	if _, err := sha.Send(ctx, lock.Raw); err != nil {
+		t.Fatal(err)
+	}
+	call(t, sha, "generatetoaddress", []any{3, minerAddr}, &mined)
 
-	// The control: the same forward signed the ordinary way
-	ordinary := resign(t, keys, signed.Raw, coin.ValueSat, script, txscript.SigHashDefault)
-	if acc, err := sha.TestAccept(ctx, ordinary); err != nil || !acc.Allowed {
-		t.Fatalf("control: the SHA256 node refuses an ordinary signature: %+v %v", acc, err)
-	}
-	if acc, err := b2b.TestAccept(ctx, ordinary); err != nil || !acc.Allowed {
-		t.Fatalf("control: the BLAKE2b node refuses an ordinary signature: %+v %v", acc, err)
-	}
-
-	// Passed on, on the BLAKE2b chain; the donation stays on the SHA256 chain
+	// Locked: our forward goes out on the BLAKE2b chain
 	if _, err := b2b.Send(ctx, signed.Raw); err != nil {
 		t.Fatal(err)
 	}
 	call(t, b2b, "generatetoaddress", []any{1, minerAddr}, &mined)
-	if c, _ := b2b.TxOut(ctx, txid, uint32(vout), true); c != nil {
-		t.Fatal("our coin is unspent on the BLAKE2b chain after the forward")
-	}
-	if _, err := sha.Send(ctx, signed.Raw); err == nil {
-		t.Fatal("the SHA256 node relayed the forward")
-	}
-	if c, _ := sha.TxOut(ctx, txid, uint32(vout), true); c == nil {
-		t.Fatal("the donation was spent on the SHA256 chain")
+	if c, _ := b2b.TxOut(ctx, signed.Txid, 0, false); c == nil || c.ValueSat != signed.AmountSat {
+		t.Fatalf("the forward did not pay the return address: %+v", c)
 	}
 
-	// Now the twin is passed on: the sweep is an anchor's, valid on the
-	// SHA256 chain only, refused by the BLAKE2b node for a missing coin
-	sweep, err := SignSHA256(keys, coins, sweepTo, 2, params)
+	// The scam's step 4, after the lock: the re-signed forward is refused
+	// by the SHA256 chain, its coin already spent there by the lock. Its
+	// output exists on the BLAKE2b chain only, whoever signs what.
+	acc, err = sha.TestAccept(ctx, ordinary)
+	if err != nil || acc.Allowed || !strings.Contains(acc.Reason, "missing") {
+		t.Fatalf("the SHA256 node on the re-signed forward after the lock: %+v %v", acc, err)
+	}
+	t.Logf("after the lock the SHA256 chain refuses even a re-signed forward: %s", acc.Reason)
+
+	// The sweep of the lock's output: the SHA256 chain only
+	var sweepTo string
+	call(t, miner, "getnewaddress", nil, &sweepTo)
+	sweep, err := SignSHA256(keys, []Coin{{Txid: lock.Txid, Vout: 0, ValueSat: lock.AmountSat,
+		KeyIndex: 0, Branch: Locks}}, sweepTo, 2, params)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -167,7 +181,6 @@ func TestTwoChains(t *testing.T) {
 	if c, _ := sha.TxOut(ctx, sweep.Txid, 0, false); c == nil || c.ValueSat != sweep.AmountSat {
 		t.Fatalf("the sweep did not pay the operator: %+v", c)
 	}
-	t.Logf("swept on the SHA256 chain; the BLAKE2b node refuses it: %s", acc.Reason)
 }
 
 func client(t *testing.T, raw, wallet string) *knots.Client {

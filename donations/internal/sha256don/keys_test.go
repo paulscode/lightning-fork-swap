@@ -36,15 +36,20 @@ func TestBIP86Vectors(t *testing.T) {
 			t.Fatalf("script %x", script)
 		}
 	}
+	// BIP86's first change address: the locks' branch
+	if got, _, err := k.AddressAt(Locks, 0); err != nil ||
+		got != "bc1p3qkhfews2uk44qtvauqyr2ttdsw7svhkl9nkm9s9c3x4ax5h60wqwruhk7" {
+		t.Fatalf("lock address 0: %s %v", got, err)
+	}
 	pub, err := k.Descriptor(false)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if !strings.HasPrefix(pub, "tr([73c5da0a/86h/0h/0h]xpub6BgBgsespWvERF3LHQu6CnqdvfEvtMcQjYrcRzx53QJjSxarj2afYWcLteoGVky7D3UKDP9QyrLprQ3VCECoY49yfdDEHGCtMMj92pReUsQ/0/*)#") {
+	if !strings.HasPrefix(pub, "tr([73c5da0a/86h/0h/0h]xpub6BgBgsespWvERF3LHQu6CnqdvfEvtMcQjYrcRzx53QJjSxarj2afYWcLteoGVky7D3UKDP9QyrLprQ3VCECoY49yfdDEHGCtMMj92pReUsQ/<0;1>/*)#") {
 		t.Fatalf("public descriptor %s", pub)
 	}
 	priv, _ := k.Descriptor(true)
-	if !strings.Contains(priv, "xprv9xgqHN7yz9MwCkxsBPN5qetuNdQSUttZNKw1dcYTV4mkaAFiBVGQziHs3NRSWMkCzvgjEe3n9xV8oYywvM8at9yRqyaZVz6TYYhX98VjsUk/0/*") {
+	if !strings.Contains(priv, "xprv9xgqHN7yz9MwCkxsBPN5qetuNdQSUttZNKw1dcYTV4mkaAFiBVGQziHs3NRSWMkCzvgjEe3n9xV8oYywvM8at9yRqyaZVz6TYYhX98VjsUk/<0;1>/*") {
 		t.Fatalf("private descriptor %s", priv)
 	}
 }

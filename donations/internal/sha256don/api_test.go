@@ -188,3 +188,21 @@ func TestTheViewLinksDepositsToTheirForward(t *testing.T) {
 		t.Fatalf("%v", body)
 	}
 }
+
+func TestTheViewShowsTheLock(t *testing.T) {
+	h := newAPI(t)
+	ctx := context.Background()
+	_, body := h.create(t, dest, false)
+	id := body["id"].(string)
+	d, _ := h.store.PutDeposit(ctx, Deposit{RequestID: id, Chain: SHA256, Txid: txA,
+		Vout: 1, ValueSat: 50_000, Confirmations: 3, State: Seen})
+	d.State = Confirmed
+	_ = h.store.SaveDeposit(ctx, d)
+	lid, _ := h.store.CreateLock(ctx, Lock{Txid: txB, KeyIndex: 0, ValueSat: 49_000, State: Sent}, []int64{d.ID})
+	_ = h.store.EndLock(ctx, Lock{ID: lid, State: Done, Confirmations: 3})
+	_, body = h.do(t, "GET", "/donate/v1/sha256/"+id, nil)
+	sha := body["sha256"].([]any)[0].(map[string]any)
+	if sha["state"] != Locked || sha["lockTxid"] != txB || sha["lockConfirmations"] != float64(3) {
+		t.Fatalf("%v", sha)
+	}
+}

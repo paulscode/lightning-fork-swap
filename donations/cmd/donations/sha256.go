@@ -176,8 +176,15 @@ func runSHA256CLI(ctx context.Context, args []string) error {
 		if err != nil {
 			return err
 		}
+		ls, err := s.Locks(ctx, r.ID)
+		if err != nil {
+			return err
+		}
+		for i := range ls {
+			ls[i].Raw = ""
+		}
 		return printJSON(map[string]any{"request": r, "keyIndex": r.KeyIndex,
-			"deposits": ds, "forwards": fs})
+			"deposits": ds, "locks": ls, "forwards": fs})
 	}
 	return usage
 }

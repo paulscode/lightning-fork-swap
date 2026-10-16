@@ -190,7 +190,7 @@ func TestPostgres(t *testing.T) {
 		t.Fatalf("%+v", ds)
 	}
 
-	// Sweeps take confirmed SHA256 deposits, once; a failed one gives them back
+	// Locks take confirmed SHA256 deposits, once; a failed one gives them back
 	sd, err := worker.PutDeposit(ctx, Deposit{RequestID: id, Chain: SHA256, Txid: txA, Vout: 1,
 		ValueSat: 60_000, Confirmations: 3, State: Seen})
 	if err != nil {
@@ -198,34 +198,81 @@ func TestPostgres(t *testing.T) {
 	}
 	sd.State = Confirmed
 	_ = worker.SaveDeposit(ctx, sd)
-	sid, err := worker.CreateSweep(ctx, Sweep{Txid: strings.Repeat("e", 64), Raw: "00",
-		Dest: dest, AmountSat: 59_000, FeeSat: 1000, State: Sent}, []int64{sd.ID})
+	if j, _ := worker.NextLockIndex(ctx); j != 0 {
+		t.Fatalf("first lock index %d", j)
+	}
+	lid, err := worker.CreateLock(ctx, Lock{Txid: strings.Repeat("e", 64), Raw: "00",
+		KeyIndex: 0, ValueSat: 59_000, FeeSat: 1000, State: Sent}, []int64{sd.ID})
 	if err != nil {
 		t.Fatal(err)
 	}
-	if _, err := worker.CreateSweep(ctx, Sweep{Txid: strings.Repeat("f", 64), Raw: "00",
-		Dest: dest, State: Sent}, []int64{sd.ID}); err == nil {
-		t.Fatal("a deposit went into two sweeps")
+	if _, err := worker.CreateLock(ctx, Lock{Txid: strings.Repeat("f", 64), Raw: "00",
+		KeyIndex: 1, State: Sent}, []int64{sd.ID}); err == nil {
+		t.Fatal("a deposit went into two locks")
 	}
-	if err := worker.EndSweep(ctx, Sweep{ID: sid, State: FailedSend, Error: "refused"}); err != nil {
+	if err := worker.EndLock(ctx, Lock{ID: lid, State: FailedSend, Error: "refused"}); err != nil {
 		t.Fatal(err)
 	}
-	if ds, _ := worker.DepositsIn(ctx, SHA256, Confirmed); len(ds) != 1 || ds[0].SweepID != 0 {
-		t.Fatalf("a failed sweep kept its coins: %+v", ds)
+	if ds, _ := worker.DepositsIn(ctx, SHA256, Confirmed); len(ds) != 1 || ds[0].LockID != 0 {
+		t.Fatalf("a failed lock kept its coins: %+v", ds)
 	}
-	sid, _ = worker.CreateSweep(ctx, Sweep{Txid: strings.Repeat("1", 64), Raw: "00",
-		Dest: dest, State: Sent}, []int64{sd.ID})
+	if j, _ := worker.NextLockIndex(ctx); j != 1 {
+		t.Fatalf("a lock index was reused: %d", j)
+	}
+	lid, _ = worker.CreateLock(ctx, Lock{Txid: strings.Repeat("1", 64), Raw: "00",
+		KeyIndex: 1, ValueSat: 59_000, State: Sent}, []int64{sd.ID})
+	if err := worker.EndLock(ctx, Lock{ID: lid, State: Done, Confirmations: 3}); err != nil {
+		t.Fatal(err)
+	}
+	if ds, _ := worker.DepositsIn(ctx, SHA256, Locked); len(ds) != 1 || ds[0].LockID != lid {
+		t.Fatalf("%+v", ds)
+	}
+	if ls, _ := api.Locks(ctx, id); len(ls) != 1 || ls[0].Txid != strings.Repeat("1", 64) {
+		t.Fatalf("the request's locks: %+v", ls)
+	}
+
+	// Sweeps take confirmed, unswept locks, once
+	unswept, err := worker.Unswept(ctx)
+	if err != nil || len(unswept) != 1 {
+		t.Fatalf("%+v %v", unswept, err)
+	}
+	sid, err := worker.CreateSweep(ctx, Sweep{Txid: strings.Repeat("2", 64), Raw: "00",
+		Dest: dest, AmountSat: 58_000, FeeSat: 1000, State: Sent}, []int64{lid})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := worker.CreateSweep(ctx, Sweep{Txid: strings.Repeat("3", 64), Raw: "00",
+		Dest: dest, State: Sent}, []int64{lid}); err == nil {
+		t.Fatal("a lock went into two sweeps")
+	}
+	if err := worker.EndSweep(ctx, Sweep{ID: sid, State: FailedSend}); err != nil {
+		t.Fatal(err)
+	}
+	if un, _ := worker.Unswept(ctx); len(un) != 1 {
+		t.Fatal("a failed sweep kept its lock")
+	}
+	sid, _ = worker.CreateSweep(ctx, Sweep{Txid: strings.Repeat("4", 64), Raw: "00",
+		Dest: dest, State: Sent}, []int64{lid})
 	if err := worker.EndSweep(ctx, Sweep{ID: sid, State: Done, Confirmations: 3}); err != nil {
 		t.Fatal(err)
 	}
-	if ds, _ := worker.DepositsIn(ctx, SHA256, Swept); len(ds) != 1 {
-		t.Fatalf("%+v", ds)
+	if un, _ := worker.Unswept(ctx); len(un) != 0 {
+		t.Fatalf("swept, still unswept: %+v", un)
 	}
-	if sw, _ := worker.SweepsIn(ctx, Done); len(sw) != 1 || sw[0].Confirmations != 3 {
-		t.Fatalf("%+v", sw)
+	for _, q := range []string{`UPDATE sha256_sweeps SET dest = 'bc1qattacker'`,
+		`UPDATE sha256_locks SET sweep_id = NULL`} {
+		if _, err := apiPool.Exec(ctx, q); err == nil {
+			t.Errorf("the API could: %s", q)
+		}
 	}
-	if _, err := apiPool.Exec(ctx, `UPDATE sha256_sweeps SET dest = 'bc1qattacker'`); err == nil {
-		t.Error("the API could change a sweep")
+	// The hold reason and when it was looked at
+	bd, _ := worker.DepositsIn(ctx, BLAKE2b, Forwarded)
+	at := time.Now().UTC().Truncate(time.Microsecond)
+	bd[0].Hold, bd[0].HoldChecked = "waiting", &at
+	_ = worker.SaveDeposit(ctx, bd[0])
+	if got, _ := worker.DepositsIn(ctx, BLAKE2b, Forwarded); got[0].Hold != "waiting" ||
+		got[0].HoldChecked == nil || !got[0].HoldChecked.Equal(at) {
+		t.Fatalf("%+v", got[0])
 	}
 
 	hints, err := worker.Hints(ctx, id, txA)

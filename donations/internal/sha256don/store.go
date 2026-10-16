@@ -45,11 +45,22 @@ type Store interface {
 	// or never relayed (back to Ready)
 	EndForward(ctx context.Context, f Forward) error
 	ForwardsIn(ctx context.Context, state string) ([]Forward, error)
-	// Records a sweep and marks its deposits Sweeping, at once
-	CreateSweep(ctx context.Context, s Sweep, depositIDs []int64) (int64, error)
-	SaveSweep(ctx context.Context, s Sweep) error
-	// Marks a sweep, and its deposits, as ended: confirmed (Swept) or never
+	// The next lock address index
+	NextLockIndex(ctx context.Context) (int64, error)
+	// Records a lock and marks its deposits Locking, at once
+	CreateLock(ctx context.Context, l Lock, depositIDs []int64) (int64, error)
+	SaveLock(ctx context.Context, l Lock) error
+	// Marks a lock, and its deposits, as ended: confirmed (Locked) or never
 	// relayed (back to Confirmed)
+	EndLock(ctx context.Context, l Lock) error
+	LocksIn(ctx context.Context, state string) ([]Lock, error)
+	// Confirmed locks whose output no sweep spends
+	Unswept(ctx context.Context) ([]Lock, error)
+	Locks(ctx context.Context, requestID string) ([]Lock, error)
+	// Records a sweep of locks' outputs and marks them, at once
+	CreateSweep(ctx context.Context, s Sweep, lockIDs []int64) (int64, error)
+	SaveSweep(ctx context.Context, s Sweep) error
+	// Ends a sweep: confirmed, or never relayed (its locks unswept again)
 	EndSweep(ctx context.Context, s Sweep) error
 	SweepsIn(ctx context.Context, state string) ([]Sweep, error)
 	SetSetting(ctx context.Context, key, value string) error
@@ -125,6 +136,22 @@ CREATE TABLE IF NOT EXISTS sha256_sweeps (
     created_at timestamptz NOT NULL DEFAULT now()
 );
 ALTER TABLE sha256_deposits ADD COLUMN IF NOT EXISTS sweep_id bigint REFERENCES sha256_sweeps (id);
+CREATE TABLE IF NOT EXISTS sha256_locks (
+    id bigserial PRIMARY KEY,
+    txid text NOT NULL UNIQUE,
+    raw text NOT NULL,
+    key_index bigint NOT NULL UNIQUE,
+    value_sat bigint NOT NULL,
+    fee_sat bigint NOT NULL,
+    state text NOT NULL,
+    confirmations bigint NOT NULL DEFAULT 0,
+    error text NOT NULL DEFAULT '',
+    sweep_id bigint REFERENCES sha256_sweeps (id),
+    created_at timestamptz NOT NULL DEFAULT now()
+);
+ALTER TABLE sha256_deposits ADD COLUMN IF NOT EXISTS lock_id bigint REFERENCES sha256_locks (id);
+ALTER TABLE sha256_deposits ADD COLUMN IF NOT EXISTS hold text NOT NULL DEFAULT '';
+ALTER TABLE sha256_deposits ADD COLUMN IF NOT EXISTS hold_checked timestamptz;
 CREATE TABLE IF NOT EXISTS sha256_settings (key text PRIMARY KEY, value text NOT NULL);
 DO $$ BEGIN
   IF EXISTS (SELECT FROM pg_roles WHERE rolname = 'donations_api') THEN
@@ -228,7 +255,8 @@ func (p *Postgres) CreatedSince(ctx context.Context, since time.Time) (int, erro
 }
 
 const depositColumns = `id, request_id, chain, txid, vout, value_sat, confirmations, state,
-    coalesce(forward_id, 0), coalesce(sweep_id, 0), copy_state, copy_reason, missing, first_seen`
+    coalesce(forward_id, 0), coalesce(lock_id, 0), copy_state, copy_reason, missing, first_seen,
+    hold, hold_checked`
 
 func (p *Postgres) deposits(ctx context.Context, where string, args ...any) ([]Deposit, error) {
 	rows, err := p.Pool.Query(ctx, `SELECT `+depositColumns+` FROM sha256_deposits `+where, args...)
@@ -241,8 +269,8 @@ func (p *Postgres) deposits(ctx context.Context, where string, args ...any) ([]D
 		var d Deposit
 		var vout int64
 		if err := rows.Scan(&d.ID, &d.RequestID, &d.Chain, &d.Txid, &vout, &d.ValueSat,
-			&d.Confirmations, &d.State, &d.ForwardID, &d.SweepID, &d.CopyState, &d.CopyReason,
-			&d.Missing, &d.FirstSeen); err != nil {
+			&d.Confirmations, &d.State, &d.ForwardID, &d.LockID, &d.CopyState, &d.CopyReason,
+			&d.Missing, &d.FirstSeen, &d.Hold, &d.HoldChecked); err != nil {
 			return nil, err
 		}
 		d.Vout = uint32(vout)
@@ -276,8 +304,8 @@ func (p *Postgres) PutDeposit(ctx context.Context, d Deposit) (Deposit, error) {
 
 func (p *Postgres) SaveDeposit(ctx context.Context, d Deposit) error {
 	_, err := p.Pool.Exec(ctx, `UPDATE sha256_deposits SET confirmations = $2, state = $3,
-        copy_state = $4, copy_reason = $5, missing = $6 WHERE id = $1`,
-		d.ID, d.Confirmations, d.State, d.CopyState, d.CopyReason, d.Missing)
+        copy_state = $4, copy_reason = $5, missing = $6, hold = $7, hold_checked = $8 WHERE id = $1`,
+		d.ID, d.Confirmations, d.State, d.CopyState, d.CopyReason, d.Missing, d.Hold, d.HoldChecked)
 	return err
 }
 
@@ -398,7 +426,101 @@ func (p *Postgres) EndForward(ctx context.Context, f Forward) error {
 	return tx.Commit(ctx)
 }
 
-func (p *Postgres) CreateSweep(ctx context.Context, sw Sweep, depositIDs []int64) (int64, error) {
+const lockColumns = `id, txid, raw, key_index, value_sat, fee_sat, state, confirmations,
+    error, coalesce(sweep_id, 0), created_at`
+
+func (p *Postgres) locks(ctx context.Context, where string, args ...any) ([]Lock, error) {
+	rows, err := p.Pool.Query(ctx, `SELECT `+lockColumns+` FROM sha256_locks `+where, args...)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var out []Lock
+	for rows.Next() {
+		var l Lock
+		if err := rows.Scan(&l.ID, &l.Txid, &l.Raw, &l.KeyIndex, &l.ValueSat, &l.FeeSat,
+			&l.State, &l.Confirmations, &l.Error, &l.SweepID, &l.CreatedAt); err != nil {
+			return nil, err
+		}
+		out = append(out, l)
+	}
+	return out, rows.Err()
+}
+
+func (p *Postgres) NextLockIndex(ctx context.Context) (int64, error) {
+	var n int64
+	err := p.Pool.QueryRow(ctx, `SELECT coalesce(max(key_index) + 1, 0) FROM sha256_locks`).Scan(&n)
+	return n, err
+}
+
+func (p *Postgres) CreateLock(ctx context.Context, l Lock, depositIDs []int64) (int64, error) {
+	tx, err := p.Pool.Begin(ctx)
+	if err != nil {
+		return 0, err
+	}
+	defer func() { _ = tx.Rollback(ctx) }()
+	var id int64
+	if err := tx.QueryRow(ctx, `INSERT INTO sha256_locks (txid, raw, key_index, value_sat,
+        fee_sat, state) VALUES ($1, $2, $3, $4, $5, $6) RETURNING id`,
+		l.Txid, l.Raw, l.KeyIndex, l.ValueSat, l.FeeSat, l.State).Scan(&id); err != nil {
+		return 0, err
+	}
+	tag, err := tx.Exec(ctx, `UPDATE sha256_deposits SET state = $2, lock_id = $3
+        WHERE id = ANY($1) AND chain = 'sha256' AND state = $4`, depositIDs, Locking, id, Confirmed)
+	if err != nil {
+		return 0, err
+	}
+	if tag.RowsAffected() != int64(len(depositIDs)) {
+		return 0, errors.New("a deposit is no longer confirmed and unlocked")
+	}
+	return id, tx.Commit(ctx)
+}
+
+func (p *Postgres) SaveLock(ctx context.Context, l Lock) error {
+	_, err := p.Pool.Exec(ctx, `UPDATE sha256_locks SET state = $2, confirmations = $3,
+        error = $4 WHERE id = $1`, l.ID, l.State, l.Confirmations, l.Error)
+	return err
+}
+
+func (p *Postgres) EndLock(ctx context.Context, l Lock) error {
+	tx, err := p.Pool.Begin(ctx)
+	if err != nil {
+		return err
+	}
+	defer func() { _ = tx.Rollback(ctx) }()
+	if _, err := tx.Exec(ctx, `UPDATE sha256_locks SET state = $2, confirmations = $3,
+        error = $4 WHERE id = $1`, l.ID, l.State, l.Confirmations, l.Error); err != nil {
+		return err
+	}
+	switch l.State {
+	case Done:
+		_, err = tx.Exec(ctx, `UPDATE sha256_deposits SET state = $2 WHERE lock_id = $1`, l.ID, Locked)
+	case FailedSend:
+		_, err = tx.Exec(ctx, `UPDATE sha256_deposits SET state = $2, lock_id = NULL
+            WHERE lock_id = $1`, l.ID, Confirmed)
+	default:
+		err = errors.New("a lock ends confirmed or failed")
+	}
+	if err != nil {
+		return err
+	}
+	return tx.Commit(ctx)
+}
+
+func (p *Postgres) LocksIn(ctx context.Context, state string) ([]Lock, error) {
+	return p.locks(ctx, `WHERE state = $1 ORDER BY id`, state)
+}
+
+func (p *Postgres) Unswept(ctx context.Context) ([]Lock, error) {
+	return p.locks(ctx, `WHERE state = $1 AND sweep_id IS NULL ORDER BY id`, Done)
+}
+
+func (p *Postgres) Locks(ctx context.Context, requestID string) ([]Lock, error) {
+	return p.locks(ctx, `WHERE id IN (SELECT lock_id FROM sha256_deposits
+        WHERE request_id = $1) ORDER BY id`, requestID)
+}
+
+func (p *Postgres) CreateSweep(ctx context.Context, sw Sweep, lockIDs []int64) (int64, error) {
 	tx, err := p.Pool.Begin(ctx)
 	if err != nil {
 		return 0, err
@@ -410,13 +532,13 @@ func (p *Postgres) CreateSweep(ctx context.Context, sw Sweep, depositIDs []int64
 		sw.Txid, sw.Raw, sw.Dest, sw.AmountSat, sw.FeeSat, sw.State).Scan(&id); err != nil {
 		return 0, err
 	}
-	tag, err := tx.Exec(ctx, `UPDATE sha256_deposits SET state = $2, sweep_id = $3
-        WHERE id = ANY($1) AND chain = 'sha256' AND state = $4`, depositIDs, Sweeping, id, Confirmed)
+	tag, err := tx.Exec(ctx, `UPDATE sha256_locks SET sweep_id = $2
+        WHERE id = ANY($1) AND state = $3 AND sweep_id IS NULL`, lockIDs, id, Done)
 	if err != nil {
 		return 0, err
 	}
-	if tag.RowsAffected() != int64(len(depositIDs)) {
-		return 0, errors.New("a deposit is no longer confirmed and unswept")
+	if tag.RowsAffected() != int64(len(lockIDs)) {
+		return 0, errors.New("a lock is no longer confirmed and unswept")
 	}
 	return id, tx.Commit(ctx)
 }
@@ -439,15 +561,12 @@ func (p *Postgres) EndSweep(ctx context.Context, sw Sweep) error {
 	}
 	switch sw.State {
 	case Done:
-		_, err = tx.Exec(ctx, `UPDATE sha256_deposits SET state = $2 WHERE sweep_id = $1`, sw.ID, Swept)
 	case FailedSend:
-		_, err = tx.Exec(ctx, `UPDATE sha256_deposits SET state = $2, sweep_id = NULL
-            WHERE sweep_id = $1`, sw.ID, Confirmed)
+		if _, err := tx.Exec(ctx, `UPDATE sha256_locks SET sweep_id = NULL WHERE sweep_id = $1`, sw.ID); err != nil {
+			return err
+		}
 	default:
-		err = errors.New("a sweep ends confirmed or failed")
-	}
-	if err != nil {
-		return err
+		return errors.New("a sweep ends confirmed or failed")
 	}
 	return tx.Commit(ctx)
 }
@@ -493,6 +612,7 @@ type Memory struct {
 	deposits []*Deposit
 	forwards []*Forward
 	sweeps   []*Sweep
+	locks    []*Lock
 	hints    []Hint
 	settings map[string]string
 	Now      func() time.Time
@@ -643,8 +763,8 @@ func (m *Memory) SaveDeposit(_ context.Context, d Deposit) error {
 	defer m.mu.Unlock()
 	for _, e := range m.deposits {
 		if e.ID == d.ID {
-			e.Confirmations, e.State, e.CopyState, e.CopyReason, e.Missing =
-				d.Confirmations, d.State, d.CopyState, d.CopyReason, d.Missing
+			e.Confirmations, e.State, e.CopyState, e.CopyReason, e.Missing, e.Hold, e.HoldChecked =
+				d.Confirmations, d.State, d.CopyState, d.CopyReason, d.Missing, d.Hold, d.HoldChecked
 		}
 	}
 	return nil
@@ -755,7 +875,19 @@ func (m *Memory) EndForward(ctx context.Context, f Forward) error {
 	return nil
 }
 
-func (m *Memory) CreateSweep(_ context.Context, sw Sweep, depositIDs []int64) (int64, error) {
+func (m *Memory) NextLockIndex(context.Context) (int64, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	n := int64(0)
+	for _, l := range m.locks {
+		if l.KeyIndex >= n {
+			n = l.KeyIndex + 1
+		}
+	}
+	return n, nil
+}
+
+func (m *Memory) CreateLock(_ context.Context, l Lock, depositIDs []int64) (int64, error) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	var picked []*Deposit
@@ -767,12 +899,109 @@ func (m *Memory) CreateSweep(_ context.Context, sw Sweep, depositIDs []int64) (i
 		}
 	}
 	if len(picked) != len(depositIDs) {
-		return 0, errors.New("a deposit is no longer confirmed and unswept")
+		return 0, errors.New("a deposit is no longer confirmed and unlocked")
+	}
+	l.ID, l.CreatedAt = int64(len(m.locks)+1), m.Now()
+	m.locks = append(m.locks, &l)
+	for _, d := range picked {
+		d.State, d.LockID = Locking, l.ID
+	}
+	return l.ID, nil
+}
+
+func (m *Memory) SaveLock(_ context.Context, l Lock) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	for _, e := range m.locks {
+		if e.ID == l.ID {
+			e.State, e.Confirmations, e.Error = l.State, l.Confirmations, l.Error
+		}
+	}
+	return nil
+}
+
+func (m *Memory) EndLock(ctx context.Context, l Lock) error {
+	if l.State != Done && l.State != FailedSend {
+		return errors.New("a lock ends confirmed or failed")
+	}
+	if err := m.SaveLock(ctx, l); err != nil {
+		return err
+	}
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	for _, d := range m.deposits {
+		if d.LockID != l.ID {
+			continue
+		}
+		if l.State == Done {
+			d.State = Locked
+		} else {
+			d.State, d.LockID = Confirmed, 0
+		}
+	}
+	return nil
+}
+
+func (m *Memory) LocksIn(_ context.Context, state string) ([]Lock, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	var out []Lock
+	for _, l := range m.locks {
+		if l.State == state {
+			out = append(out, *l)
+		}
+	}
+	return out, nil
+}
+
+func (m *Memory) Unswept(_ context.Context) ([]Lock, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	var out []Lock
+	for _, l := range m.locks {
+		if l.State == Done && l.SweepID == 0 {
+			out = append(out, *l)
+		}
+	}
+	return out, nil
+}
+
+func (m *Memory) Locks(_ context.Context, requestID string) ([]Lock, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	ids := map[int64]bool{}
+	for _, d := range m.deposits {
+		if d.RequestID == requestID && d.LockID != 0 {
+			ids[d.LockID] = true
+		}
+	}
+	var out []Lock
+	for _, l := range m.locks {
+		if ids[l.ID] {
+			out = append(out, *l)
+		}
+	}
+	return out, nil
+}
+
+func (m *Memory) CreateSweep(_ context.Context, sw Sweep, lockIDs []int64) (int64, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	var picked []*Lock
+	for _, id := range lockIDs {
+		for _, l := range m.locks {
+			if l.ID == id && l.State == Done && l.SweepID == 0 {
+				picked = append(picked, l)
+			}
+		}
+	}
+	if len(picked) != len(lockIDs) {
+		return 0, errors.New("a lock is no longer confirmed and unswept")
 	}
 	sw.ID, sw.CreatedAt = int64(len(m.sweeps)+1), m.Now()
 	m.sweeps = append(m.sweeps, &sw)
-	for _, d := range picked {
-		d.State, d.SweepID = Sweeping, sw.ID
+	for _, l := range picked {
+		l.SweepID = sw.ID
 	}
 	return sw.ID, nil
 }
@@ -795,16 +1024,13 @@ func (m *Memory) EndSweep(ctx context.Context, sw Sweep) error {
 	if err := m.SaveSweep(ctx, sw); err != nil {
 		return err
 	}
-	m.mu.Lock()
-	defer m.mu.Unlock()
-	for _, d := range m.deposits {
-		if d.SweepID != sw.ID {
-			continue
-		}
-		if sw.State == Done {
-			d.State = Swept
-		} else {
-			d.State, d.SweepID = Confirmed, 0
+	if sw.State == FailedSend {
+		m.mu.Lock()
+		defer m.mu.Unlock()
+		for _, l := range m.locks {
+			if l.SweepID == sw.ID {
+				l.SweepID = 0
+			}
 		}
 	}
 	return nil

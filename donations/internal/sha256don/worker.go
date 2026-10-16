@@ -74,8 +74,20 @@ type Worker struct {
 	SweepAddress string
 	SweepMinSat  int64
 	SweepEvery   time.Duration
-	SweepMaxFee  float64
+	// The most paid on the SHA256 chain (locks and sweeps), sat/vB
+	SweepMaxFee float64
+	// When the BLAKE2b chain's data rules (RDTS) end; locks are made only
+	// until RDTSMargin before it. Zero: RDTSExpiry.
+	RDTSUntil time.Time
 }
+
+// RDTSExpiry is when the BLAKE2b chain's data rules end on mainnet
+// (getdeploymentinfo: reduced_data expiry_time). A lock is refused there
+// only while they hold.
+var RDTSExpiry = time.Unix(1819756800, 0)
+
+// RDTSMargin: no new lock this close to the end of the data rules.
+const RDTSMargin = 30 * 24 * time.Hour
 
 // Sweep defaults
 const (
@@ -127,6 +139,9 @@ func (w *Worker) defaults() {
 	}
 	if w.SweepMaxFee == 0 {
 		w.SweepMaxFee = DefaultSweepMaxFee
+	}
+	if w.RDTSUntil.IsZero() {
+		w.RDTSUntil = RDTSExpiry
 	}
 	if w.Logger == nil {
 		w.Logger = log.Default()
@@ -216,7 +231,13 @@ func (w *Worker) Pass(ctx context.Context) error {
 			errs = append(errs, err)
 		}
 	}
-	if err := w.forward(ctx); err != nil {
+	if err := w.lock(ctx, now); err != nil {
+		errs = append(errs, fmt.Errorf("locking: %w", err))
+	}
+	if err := w.trackLocks(ctx); err != nil {
+		errs = append(errs, fmt.Errorf("following locks: %w", err))
+	}
+	if err := w.forward(ctx, now); err != nil {
 		errs = append(errs, fmt.Errorf("forwarding: %w", err))
 	}
 	if err := w.track(ctx); err != nil {
@@ -533,10 +554,29 @@ func txidOf(raw string) (string, error) {
 
 // forward passes deep BLAKE2b deposits on: each request's to its return
 // address, the rest together to lnd.
-func (w *Worker) forward(ctx context.Context) error {
-	ready, err := w.Store.DepositsIn(ctx, BLAKE2b, Ready)
-	if err != nil || len(ready) == 0 {
+func (w *Worker) forward(ctx context.Context, now time.Time) error {
+	all, err := w.Store.DepositsIn(ctx, BLAKE2b, Ready)
+	if err != nil || len(all) == 0 {
 		return err
+	}
+	var ready []Deposit
+	for _, d := range all {
+		ok, hold, err := w.cleared(ctx, d, now)
+		if err != nil {
+			return err
+		}
+		if d.Hold != hold {
+			d.Hold = hold
+			if err := w.Store.SaveDeposit(ctx, d); err != nil {
+				return err
+			}
+		}
+		if ok {
+			ready = append(ready, d)
+		}
+	}
+	if len(ready) == 0 {
+		return nil
 	}
 	type group struct {
 		requestID, dest string
@@ -661,17 +701,193 @@ func (w *Worker) track(ctx context.Context) error {
 	return errors.Join(errs...)
 }
 
-// sweep sends the SHA256-chain donations on to the operator's address, at
-// most every SweepEvery, when they come to SweepMinSat.
-//
-// Signed the ordinary way, as the SHA256 chain wants, a sweep could also be
-// valid on the BLAKE2b chain if every coin it spends existed there: then a
-// copy of it would send those coins (a donor's to pass on, or the
-// service's) to the operator's address. So each sweep spends at least one
-// anchor, a coin that cannot exist unspent on the BLAKE2b chain: one whose
-// twin there we have passed on, or whose donation can never reach it. One
-// is enough for the whole transaction. Our BLAKE2b node is asked to be
-// sure: it must refuse the sweep for a missing coin.
+// cleared: the coin cannot be valid on the SHA256 chain, so nothing that
+// spends it, however it is signed (by us too), can be copied there; anyone
+// can check it. Either its twin there is spent by one of our locks, deep
+// enough, or the transaction that made it can never reach that chain. Else
+// it is held, and the reason says what for.
+func (w *Worker) cleared(ctx context.Context, d Deposit, now time.Time) (bool, string, error) {
+	deposits, err := w.Store.Deposits(ctx, d.RequestID)
+	if err != nil {
+		return false, "", err
+	}
+	for _, twin := range deposits {
+		if twin.Chain != SHA256 || twin.Txid != d.Txid || twin.Vout != d.Vout || twin.State == Gone {
+			continue
+		}
+		if twin.State == Locked {
+			return true, "", nil
+		}
+		return false, "waiting for its twin on the SHA256 chain to be locked", nil
+	}
+	// No twin of ours there: can there ever be one? Looked at again every
+	// 10 minutes while held
+	if d.Hold != "" && d.HoldChecked != nil && now.Sub(*d.HoldChecked) < 10*time.Minute {
+		return false, d.Hold, nil
+	}
+	result, err := replay.Check(ctx, d.Txid, w.Blake2b, w.Sha256)
+	d.HoldChecked = &now
+	_ = w.Store.SaveDeposit(ctx, d)
+	switch {
+	case err != nil:
+		return false, "its history could not be read yet", nil
+	case result.Verdict == replay.Protected || result.Verdict == replay.TwinMoved:
+		return true, "", nil
+	case result.Verdict == replay.Replayed:
+		return false, "copied to the SHA256 chain: waiting for that copy to be locked", nil
+	}
+	return false, "its coins could still appear on the SHA256 chain (" + result.Reason +
+		"): passed on once they cannot", nil
+}
+
+// alertOnce logs an alert at most once a day per key (the monitor sends
+// each new line).
+func (w *Worker) alertOnce(ctx context.Context, now time.Time, key, text string) {
+	day := now.UTC().Format("2006-01-02")
+	if got, _ := w.Store.Setting(ctx, "alert:"+key); got == day {
+		return
+	}
+	_ = w.Store.SetSetting(ctx, "alert:"+key, day)
+	w.Logger.Printf("ALERT: %s", text)
+}
+
+// lock spends confirmed SHA256-chain donations, on the SHA256 chain, into
+// the hot wallet, with an output the BLAKE2b chain's consensus refuses
+// (SignLock). Once a lock is deep, a donation's twin on the BLAKE2b chain
+// can be passed on: what spends it there can never be valid on the SHA256
+// chain, where its coin is already spent.
+func (w *Worker) lock(ctx context.Context, now time.Time) error {
+	deposits, err := w.Store.DepositsIn(ctx, SHA256, Confirmed)
+	if err != nil || len(deposits) == 0 {
+		return err
+	}
+	if now.After(w.RDTSUntil.Add(-RDTSMargin)) {
+		w.alertOnce(ctx, now, "rdts", fmt.Sprintf(
+			"no locks: the BLAKE2b chain's data rules end %s; donations wait (a new way to lock is needed)",
+			w.RDTSUntil.UTC().Format("2006-01-02")))
+		return nil
+	}
+	if last, _ := w.Store.Setting(ctx, "last_lock_failure"); last != "" {
+		if at, err := time.Parse(time.RFC3339, last); err == nil && now.Sub(at) < time.Hour {
+			return nil
+		}
+	}
+	var coins []Coin
+	var ids []int64
+	for _, d := range deposits {
+		spend, err := w.Sha256.Outspend(ctx, d.Txid, d.Vout)
+		if err != nil {
+			return fmt.Errorf("SHA256 explorer: %w", err)
+		}
+		if spend.Spent {
+			w.Logger.Printf("ALERT: SHA256 donation %s was spent by %s, not by a lock of ours",
+				d.Outpoint(), spend.Txid)
+			d.State = Gone
+			if err := w.Store.SaveDeposit(ctx, d); err != nil {
+				return err
+			}
+			continue
+		}
+		r, err := w.Store.GetRequest(ctx, d.RequestID)
+		if err != nil {
+			return err
+		}
+		coins = append(coins, Coin{Txid: d.Txid, Vout: d.Vout, ValueSat: d.ValueSat,
+			KeyIndex: uint32(r.KeyIndex), Branch: Requests})
+		ids = append(ids, d.ID)
+	}
+	if len(coins) == 0 {
+		return nil
+	}
+	rate, err := w.Sha256.FeeRate(ctx, 6)
+	if err != nil || rate <= 0 {
+		return fmt.Errorf("no SHA256-chain fee estimate: %v", err)
+	}
+	if rate > w.SweepMaxFee {
+		w.alertOnce(ctx, now, "lock-fee", fmt.Sprintf(
+			"not locking: the SHA256-chain fee rate is %.1f sat/vB, above %.0f", rate, w.SweepMaxFee))
+		return nil
+	}
+	j, err := w.Store.NextLockIndex(ctx)
+	if err != nil {
+		return err
+	}
+	s, err := SignLock(w.Keys, coins, uint32(j), rate, w.Params)
+	if errors.Is(err, ErrTooSmall) {
+		return nil // more may come
+	}
+	if err != nil {
+		return err
+	}
+	// The BLAKE2b node must refuse it: for its data output when the coins
+	// are there, or for a missing coin
+	acc, err := w.Node.TestAccept(ctx, s.Raw)
+	if err != nil {
+		return fmt.Errorf("our node: %w", err)
+	}
+	if acc.Allowed {
+		w.alertOnce(ctx, now, "lock-taken", "not locking: the BLAKE2b node would take the lock "+s.Txid)
+		return nil
+	}
+	l := Lock{Txid: s.Txid, Raw: s.Raw, KeyIndex: j, ValueSat: s.AmountSat, FeeSat: s.FeeSat, State: Sent}
+	id, err := w.Store.CreateLock(ctx, l, ids)
+	if err != nil {
+		return err
+	}
+	l.ID = id
+	if _, err := w.Sha256.Broadcast(ctx, s.Raw); err != nil {
+		l.State, l.Error = FailedSend, err.Error()
+		_ = w.Store.SetSetting(ctx, "last_lock_failure", now.UTC().Format(time.RFC3339))
+		w.alertOnce(ctx, now, "lock-relay", fmt.Sprintf("lock %s not relayed (tried again in an hour): %v", s.Txid, err))
+		return w.Store.EndLock(ctx, l)
+	}
+	w.Logger.Printf("locked %d SHA256-chain donation(s) in %s (BLAKE2b node: %s)", len(coins), s.Txid, acc.Reason)
+	return nil
+}
+
+// trackLocks follows locks until they are deep enough, relaying again any
+// that the SHA256 chain lost.
+func (w *Worker) trackLocks(ctx context.Context) error {
+	sent, err := w.Store.LocksIn(ctx, Sent)
+	if err != nil || len(sent) == 0 {
+		return err
+	}
+	tip, err := w.Sha256.TipHeight(ctx)
+	if err != nil {
+		return err
+	}
+	var errs []error
+	for _, l := range sent {
+		tx, err := w.Sha256.Tx(ctx, l.Txid)
+		switch {
+		case errors.Is(err, esplora.ErrNotFound):
+			if _, err := w.Sha256.Broadcast(ctx, l.Raw); err != nil {
+				l.Error = err.Error()
+				errs = append(errs, w.Store.SaveLock(ctx, l))
+			}
+			continue
+		case err != nil:
+			errs = append(errs, err)
+			continue
+		}
+		if !tx.Status.Confirmed {
+			continue
+		}
+		l.Confirmations = tip - tx.Status.BlockHeight + 1
+		if l.Confirmations >= w.Sha256Confs {
+			l.State = Done
+			errs = append(errs, w.Store.EndLock(ctx, l))
+			continue
+		}
+		errs = append(errs, w.Store.SaveLock(ctx, l))
+	}
+	return errors.Join(errs...)
+}
+
+// sweep sends the locks' outputs on to the operator's address, at most
+// every SweepEvery, when they come to SweepMinSat. A lock can never exist
+// on the BLAKE2b chain, so neither can a sweep of its output: our BLAKE2b
+// node must refuse it for a missing coin before it is sent.
 func (w *Worker) sweep(ctx context.Context, now time.Time) error {
 	if w.SweepAddress == "" {
 		return nil
@@ -681,50 +897,29 @@ func (w *Worker) sweep(ctx context.Context, now time.Time) error {
 			return nil
 		}
 	}
-	deposits, err := w.Store.DepositsIn(ctx, SHA256, Confirmed)
-	if err != nil {
+	locks, err := w.Store.Unswept(ctx)
+	if err != nil || len(locks) == 0 {
 		return err
 	}
+	_ = w.Store.SetSetting(ctx, SettingLastSweep, now.UTC().Format(time.RFC3339))
 	var coins []Coin
 	var ids []int64
 	var total int64
-	anchors := 0
-	for _, d := range deposits {
-		spend, err := w.Sha256.Outspend(ctx, d.Txid, d.Vout)
+	for _, l := range locks {
+		spend, err := w.Sha256.Outspend(ctx, l.Txid, 0)
 		if err != nil {
 			return fmt.Errorf("SHA256 explorer: %w", err)
 		}
 		if spend.Spent {
-			w.Logger.Printf("ALERT: SHA256 donation %s was spent by %s, not by a sweep of ours",
-				d.Outpoint(), spend.Txid)
+			w.Logger.Printf("ALERT: lock output %s:0 was spent by %s, not by a sweep of ours", l.Txid, spend.Txid)
 			continue
 		}
-		r, err := w.Store.GetRequest(ctx, d.RequestID)
-		if err != nil {
-			return err
-		}
-		anchor, err := w.anchor(ctx, d)
-		if err != nil {
-			return err
-		}
-		if anchor {
-			anchors++
-		}
-		coins = append(coins, Coin{Txid: d.Txid, Vout: d.Vout, ValueSat: d.ValueSat,
-			KeyIndex: uint32(r.KeyIndex)})
-		ids = append(ids, d.ID)
-		total += d.ValueSat
-	}
-	// Looked at: the next look is a day from now, whatever it found
-	if len(deposits) > 0 {
-		_ = w.Store.SetSetting(ctx, SettingLastSweep, now.UTC().Format(time.RFC3339))
+		coins = append(coins, Coin{Txid: l.Txid, Vout: 0, ValueSat: l.ValueSat,
+			KeyIndex: uint32(l.KeyIndex), Branch: Locks})
+		ids = append(ids, l.ID)
+		total += l.ValueSat
 	}
 	if total < w.SweepMinSat {
-		return nil
-	}
-	if anchors == 0 {
-		w.Logger.Printf("not sweeping %d sat: none of the %d donations is known not to exist on the BLAKE2b chain yet",
-			total, len(coins))
 		return nil
 	}
 	rate, err := w.Sha256.FeeRate(ctx, 6)
@@ -760,7 +955,6 @@ func (w *Worker) sweep(ctx context.Context, now time.Time) error {
 	}
 	sw.ID = id
 	if _, err := w.Sha256.Broadcast(ctx, s.Raw); err != nil {
-		// No explorer took it: its coins wait for the next sweep
 		sw.State, sw.Error = FailedSend, err.Error()
 		w.Logger.Printf("ALERT: sweep %s not relayed: %v", s.Txid, err)
 		return w.Store.EndSweep(ctx, sw)
@@ -768,32 +962,6 @@ func (w *Worker) sweep(ctx context.Context, now time.Time) error {
 	w.Logger.Printf("swept %d sat of SHA256-chain donations to %s in %s (fee %d)",
 		s.AmountSat, w.SweepAddress, s.Txid, s.FeeSat)
 	return nil
-}
-
-// anchor: the deposit's coin cannot exist unspent on the BLAKE2b chain.
-func (w *Worker) anchor(ctx context.Context, d Deposit) (bool, error) {
-	all, err := w.Store.Deposits(ctx, d.RequestID)
-	if err != nil {
-		return false, err
-	}
-	for _, b := range all {
-		if b.Chain == BLAKE2b && b.Txid == d.Txid && b.Vout == d.Vout {
-			if b.State != Forwarded {
-				return false, nil // there, not yet passed on deep enough
-			}
-			out, err := w.Node.TxOut(ctx, d.Txid, d.Vout, true)
-			if err != nil {
-				return false, fmt.Errorf("our node: %w", err)
-			}
-			return out == nil, nil
-		}
-	}
-	// Never seen there: can the donation ever get there?
-	result, err := replay.CheckSHA256(ctx, d.Txid, w.Sha256, w.Blake2b)
-	if err != nil {
-		return false, nil
-	}
-	return result.Verdict == replay.Protected || result.Verdict == replay.TwinMoved, nil
 }
 
 // trackSweeps follows sweeps until they are deep enough, relaying again

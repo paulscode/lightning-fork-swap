@@ -28,15 +28,16 @@ const (
 	BLAKE2b = "blake2b"
 )
 
-// Deposit states. On the SHA256 chain: Seen, then Confirmed (kept). On the
-// BLAKE2b chain: Seen, Ready (deep enough), Forwarding (in a forward not
-// yet confirmed), Forwarded; Kept when too small to pass on; Gone when it
-// left the chain before it was deep enough.
+// Deposit states. On the SHA256 chain: Seen, Confirmed (the donation
+// counts), Locking (spent by a lock not yet deep enough), Locked. On the
+// BLAKE2b chain: Seen, Ready (deep enough), Forwarding (in a forward not yet
+// confirmed), Forwarded; Kept when too small to pass on. Either: Gone when
+// it left the chain before it was deep enough.
 const (
 	Seen       = "seen"
 	Confirmed  = "confirmed"
-	Sweeping   = "sweeping" // SHA256: in a sweep not yet deep enough
-	Swept      = "swept"    // SHA256: sent on to the operator's address
+	Locking    = "locking"
+	Locked     = "locked"
 	Ready      = "ready"
 	Forwarding = "forwarding"
 	Forwarded  = "forwarded"
@@ -63,11 +64,17 @@ type Deposit struct {
 	Confirmations int64  `json:"confirmations"`
 	State         string `json:"state"`
 	ForwardID     int64  `json:"-"`
-	SweepID       int64  `json:"-"`
+	LockID        int64  `json:"-"`
 	// The forward that spends it (filled in for callers)
 	ForwardTxid string `json:"forwardTxid,omitempty"`
-	CopyState   string `json:"copy,omitempty"`
-	CopyReason  string `json:"copyReason,omitempty"`
+	// SHA256: the lock that spends it there, and its depth (filled in)
+	LockTxid          string `json:"lockTxid,omitempty"`
+	LockConfirmations int64  `json:"lockConfirmations,omitempty"`
+	// BLAKE2b: why it is not passed on yet
+	Hold        string     `json:"hold,omitempty"`
+	HoldChecked *time.Time `json:"-"`
+	CopyState   string     `json:"copy,omitempty"`
+	CopyReason  string     `json:"copyReason,omitempty"`
 	// Times a BLAKE2b deposit was looked for and not found
 	Missing   int       `json:"-"`
 	FirstSeen time.Time `json:"firstSeen"`
@@ -99,7 +106,25 @@ type Forward struct {
 	CreatedAt     time.Time `json:"createdAt"`
 }
 
-// Sweep is a transaction on the SHA256 chain sending the donations on to
+// Lock is a transaction on the SHA256 chain spending donations there into
+// the hot wallet (output 0, lock address KeyIndex) with an output the
+// BLAKE2b chain's consensus refuses (output 1). States as a Forward's;
+// SweepID once a sweep spends its output 0.
+type Lock struct {
+	ID            int64
+	Txid          string
+	Raw           string
+	KeyIndex      int64
+	ValueSat      int64
+	FeeSat        int64
+	State         string
+	Confirmations int64
+	Error         string
+	SweepID       int64
+	CreatedAt     time.Time
+}
+
+// Sweep is a transaction on the SHA256 chain sending locks' outputs on to
 // the operator's address. States as a Forward's.
 type Sweep struct {
 	ID            int64

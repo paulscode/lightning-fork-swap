@@ -458,10 +458,10 @@ class ChecksTest(unittest.TestCase):
             self.assertNotIn("Bitcoin", a.text)
 
     def test_a_large_sha256_balance(self):
-        alerts, _ = self.sha256({"coalesce(sum(value_sat), 0)": "6000000\n"})
+        alerts, _ = self.sha256({"FROM sha256_locks": "6000000\n"})
         self.assertIn("6,000,000 sat", alerts["sha256:balance"].text)
         self.assertFalse(alerts["sha256:balance"].event)
-        alerts, _ = self.sha256({"coalesce(sum(value_sat), 0)": "4000000\n"})
+        alerts, _ = self.sha256({"FROM sha256_locks": "4000000\n"})
         self.assertNotIn("sha256:balance", alerts)
 
     def test_log_lines_that_need_a_person(self):

@@ -20,6 +20,8 @@ type Coin struct {
 	Vout     uint32 `json:"vout"`
 	ValueSat int64  `json:"valueSat"`
 	KeyIndex uint32 `json:"keyIndex"`
+	// Requests (an address given to a donor) or Locks (the hot wallet's)
+	Branch uint32 `json:"branch"`
 }
 
 // Outpoint is "txid:vout".
@@ -64,6 +66,13 @@ func SignSHA256(keys *Keys, coins []Coin, dest string, feeRate float64, params *
 
 func sign(keys *Keys, coins []Coin, dest string, feeRate float64, params *chaincfg.Params,
 	hashType txscript.SigHashType, check func(*wire.MsgTx, txscript.PrevOutputFetcher) error) (*Signed, error) {
+	return signWith(keys, coins, dest, feeRate, params, hashType, check)
+}
+
+// signWith: sign, with extra (zero-value) outputs after the payment
+func signWith(keys *Keys, coins []Coin, dest string, feeRate float64, params *chaincfg.Params,
+	hashType txscript.SigHashType, check func(*wire.MsgTx, txscript.PrevOutputFetcher) error,
+	extra ...*wire.TxOut) (*Signed, error) {
 	if len(coins) == 0 {
 		return nil, errors.New("nothing to send")
 	}
@@ -88,7 +97,7 @@ func sign(keys *Keys, coins []Coin, dest string, feeRate float64, params *chainc
 		if c.ValueSat <= 0 {
 			return nil, fmt.Errorf("coin %s has no value", c.Outpoint())
 		}
-		_, script, err := keys.Address(c.KeyIndex)
+		_, script, err := keys.AddressAt(c.Branch, c.KeyIndex)
 		if err != nil {
 			return nil, err
 		}
@@ -102,6 +111,9 @@ func sign(keys *Keys, coins []Coin, dest string, feeRate float64, params *chainc
 		total += c.ValueSat
 	}
 	tx.AddTxOut(wire.NewTxOut(0, destScript))
+	for _, out := range extra {
+		tx.AddTxOut(out)
+	}
 
 	// The size with the witnesses to come: a 64-byte signature, and its
 	// hash type byte unless it is the default
@@ -124,7 +136,7 @@ func sign(keys *Keys, coins []Coin, dest string, feeRate float64, params *chainc
 
 	sigHashes := txscript.NewTxSigHashes(tx, fetcher)
 	for i, c := range coins {
-		priv, err := keys.Private(c.KeyIndex)
+		priv, err := keys.PrivateAt(c.Branch, c.KeyIndex)
 		if err != nil {
 			return nil, err
 		}
@@ -181,6 +193,61 @@ func CheckUnified(tx *wire.MsgTx, fetcher txscript.PrevOutputFetcher) error {
 		}
 	}
 	return nil
+}
+
+// LockData is the lock's OP_RETURN payload: 100 bytes, which puts the
+// output at 103 bytes, over the 83 the BLAKE2b chain's data rules (RDTS)
+// allow, so the BLAKE2b chain's consensus refuses the transaction. It says
+// so, for whoever looks.
+var LockData = []byte(fmt.Sprintf("%-100s",
+	"Lightning Fork Swap lock: invalid on the BLAKE2b chain by design (RDTS: OP_RETURN over 83 bytes)"))[:100]
+
+// MaxRDTSDataScript is the longest OP_RETURN output the BLAKE2b chain
+// takes while its data rules hold.
+const MaxRDTSDataScript = 83
+
+// SignLock builds and signs the lock of coins on the SHA256 chain: one output
+// to the hot wallet's lock address j, less the fee, and LockData, which the
+// BLAKE2b chain refuses. Signed the ordinary way and verified under the
+// SHA256 chain's rules.
+func SignLock(keys *Keys, coins []Coin, j uint32, feeRate float64, params *chaincfg.Params) (*Signed, error) {
+	dest, _, err := keys.AddressAt(Locks, j)
+	if err != nil {
+		return nil, err
+	}
+	// Built by hand: NullDataScript stops at the old 80-byte relay limit
+	data, err := txscript.NewScriptBuilder().AddOp(txscript.OP_RETURN).AddData(LockData).Script()
+	if err != nil {
+		return nil, err
+	}
+	check := func(tx *wire.MsgTx, f txscript.PrevOutputFetcher) error {
+		if err := CheckSHA256(tx, f); err != nil {
+			return err
+		}
+		if !BreaksRDTS(tx) {
+			return errors.New("the lock has no output the BLAKE2b chain refuses")
+		}
+		return nil
+	}
+	return signWith(keys, coins, dest, feeRate, params, txscript.SigHashDefault, check,
+		wire.NewTxOut(0, data))
+}
+
+// BreaksRDTS: the transaction has an output the BLAKE2b chain's data rules
+// refuse (an OP_RETURN over 83 bytes, any other script over 34), so it can
+// never be in a block there while they hold.
+func BreaksRDTS(tx *wire.MsgTx) bool {
+	for _, out := range tx.TxOut {
+		n := len(out.PkScript)
+		if n == 0 {
+			continue
+		}
+		if (out.PkScript[0] == txscript.OP_RETURN && n > MaxRDTSDataScript) ||
+			(out.PkScript[0] != txscript.OP_RETURN && n > 34) {
+			return true
+		}
+	}
+	return false
 }
 
 // CheckSHA256 verifies each input of a signed transaction under the SHA256

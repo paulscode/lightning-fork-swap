@@ -7,13 +7,18 @@
 #
 #   deploy/regtest/sha256-donations-twochain.sh
 #
-# SHA256_BITCOIND: a stock Knots or Core bitcoind (bitcoin-cli next to it).
+# SHA256_BITCOIND: a SHA256-chain node (bitcoin-cli next to it): Knots'
+# policy series on Core (knots-sha256), relaying data outputs up to 200
+# bytes (-datacarriersize), as the lock needs; stock Core 30 or later does
+# by default. Not Knots 29: it applies the BIP110 data rules in its
+# mempool whatever its options, which is the point of them on the BLAKE2b
+# chain.
 # Both nodes are throwaway: a container and a temporary directory, on
 # 127.0.0.1 ports 19443-19544. The regtest stack is not touched.
 set -euo pipefail
 here=$(cd "$(dirname "$0")" && pwd)
 repo=$(cd "$here/../.." && pwd)
-SHA256_BITCOIND=${SHA256_BITCOIND:-/mnt/Black/knots-sha256-framework/build/knots-29.4.2/bin/bitcoind}
+SHA256_BITCOIND=${SHA256_BITCOIND:-/mnt/Black/knots-sha256-framework/build/ks-31-093226b/bin/bitcoind}
 SHA256_CLI=$(dirname "$SHA256_BITCOIND")/bitcoin-cli
 KNOTS_IMAGE=${KNOTS_IMAGE:-lfswap/knots:29.4.2}
 name=lfswap-twochain-$$
@@ -35,7 +40,7 @@ docker run -d --rm --name "$name" --network host "$KNOTS_IMAGE" \
 mkdir -p "$work/sha"
 "$SHA256_BITCOIND" -regtest -datadir="$work/sha" -server -listen=1 -port=19544 -rpcport=19543 \
 	-rpcbind=127.0.0.1 -rpcallowip=127.0.0.1 -rpcuser=lab -rpcpassword=lab -fallbackfee=0.0002 \
-	-listenonion=0 -onion=0 -proxy=0 -dnsseed=0 -fixedseeds=0 -upnp=0 -natpmp=0 \
+	-listenonion=0 -onion=0 -proxy=0 -dnsseed=0 -fixedseeds=0 -natpmp=0 -datacarriersize=200 \
 	-printtoconsole=0 >"$work/sha.log" 2>&1 &
 sha_pid=$!
 

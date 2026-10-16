@@ -142,3 +142,47 @@ func TestSignsForTheSHA256Chain(t *testing.T) {
 		t.Fatal("a unified signature passed on the SHA256 chain")
 	}
 }
+
+func TestALockIsSHA256OnlyByConsensus(t *testing.T) {
+	k := vectorKeys(t)
+	s, err := SignLock(k, coins(), 7, 3, &chaincfg.MainNetParams)
+	if err != nil {
+		t.Fatal(err)
+	}
+	tx := decode(t, s.Raw)
+	if len(tx.TxOut) != 2 {
+		t.Fatalf("outputs %d", len(tx.TxOut))
+	}
+	_, lockScript, _ := k.AddressAt(Locks, 7)
+	if !bytes.Equal(tx.TxOut[0].PkScript, lockScript) || tx.TxOut[0].Value != s.AmountSat {
+		t.Fatal("the lock does not pay the hot wallet's lock address")
+	}
+	data := tx.TxOut[1]
+	if data.Value != 0 || data.PkScript[0] != txscript.OP_RETURN || len(data.PkScript) != 103 ||
+		!bytes.Contains(data.PkScript, []byte("invalid on the BLAKE2b chain by design")) {
+		t.Fatalf("data output %x", data.PkScript)
+	}
+	if !BreaksRDTS(tx) {
+		t.Fatal("the lock does not break the BLAKE2b chain's data rules")
+	}
+	if err := CheckSHA256(tx, fetcherFor(t, k, coins())); err != nil {
+		t.Fatal(err)
+	}
+	// A forward or a sweep does not
+	f, _ := Sign(k, coins(), dest, 3, &chaincfg.MainNetParams)
+	if BreaksRDTS(decode(t, f.Raw)) {
+		t.Fatal("a forward breaks the data rules")
+	}
+	// An 83-byte OP_RETURN is within them; 84 is not
+	small := wire.NewMsgTx(2)
+	ok, _ := txscript.NullDataScript(make([]byte, 80))
+	small.AddTxOut(wire.NewTxOut(0, ok))
+	if len(ok) != 83 || BreaksRDTS(small) {
+		t.Fatalf("an 83-byte OP_RETURN (%d)", len(ok))
+	}
+	big, _ := txscript.NewScriptBuilder().AddOp(txscript.OP_RETURN).AddData(make([]byte, 81)).Script()
+	small.TxOut[0].PkScript = big
+	if !BreaksRDTS(small) {
+		t.Fatal("an 84-byte OP_RETURN")
+	}
+}

@@ -190,8 +190,22 @@ func (a *API) view(r *http.Request, req Request) (View, error) {
 	for _, f := range forwards {
 		txids[f.ID] = f.Txid
 	}
+	locks, err := a.Store.Locks(r.Context(), req.ID)
+	if err != nil {
+		return v, err
+	}
+	byLock := map[int64]Lock{}
+	for _, l := range locks {
+		byLock[l.ID] = l
+	}
 	for _, d := range deposits {
 		if d.Chain == SHA256 {
+			if l, ok := byLock[d.LockID]; ok {
+				d.LockTxid, d.LockConfirmations = l.Txid, l.Confirmations
+				if l.State == Done && d.LockConfirmations < a.Sha256Confs {
+					d.LockConfirmations = a.Sha256Confs
+				}
+			}
 			v.Sha256 = append(v.Sha256, d)
 		} else {
 			d.ForwardTxid = txids[d.ForwardID]
