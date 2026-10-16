@@ -116,6 +116,11 @@ class FakeRunner:
     def disk_usage(self, path):
         return self.disk
 
+    def dir_size(self, path):
+        if path in self.files:
+            return self.files[path]
+        raise OSError(path)
+
     def http_get(self, url):
         return self.lookup(("http", url.rsplit("/", 1)[1]))
 
@@ -851,3 +856,17 @@ class SendTest(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class CompactionRoomTest(unittest.TestCase):
+    CHAINSTATE = "/srv/lfswap/knots/data/chainstate"
+
+    def test_too_little_room_to_compact(self):
+        gib = 2**30
+        files = {GRAPH_META: json.dumps({"version": 3, "checkedAt": "2026-10-07T11:55:00Z"}),
+                 self.CHAINSTATE: 11 * gib}
+        alerts, _ = run(files=files, disk=(40 * gib, 30 * gib, 10 * gib))
+        self.assertIn("may need as much again", alerts["host:compaction"].text)
+        self.assertNotIn("host:disk", alerts)
+        alerts, _ = run(files=dict(files), disk=(40 * gib, 26 * gib, 14 * gib))
+        self.assertNotIn("host:compaction", alerts)

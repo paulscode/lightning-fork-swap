@@ -192,6 +192,13 @@ class Runner:
     def mtime(self, path):
         return os.stat(path).st_mtime
 
+    def dir_size(self, path):
+        total = 0
+        for entry in os.scandir(path):
+            if entry.is_file(follow_symlinks=False):
+                total += entry.stat(follow_symlinks=False).st_size
+        return total
+
     def disk_usage(self, path):
         return shutil.disk_usage(path)
 
@@ -685,6 +692,20 @@ class Monitor:
             self.add(
                 "host:disk",
                 f"Disk {used:.0%} full ({usage.free / 2**30:.1f} GiB free)",
+            )
+        # Knots compacts its UTXO database by writing it anew: it needs about
+        # its size free, or it stops halfway with the disk full (2026-10-16)
+        try:
+            chainstate = self.runner.dir_size(
+                os.path.join(root, "knots", "data", "chainstate"))
+        except OSError:
+            chainstate = 0
+        if chainstate and usage.free < chainstate + 2 * 2**30:
+            self.add(
+                "host:compaction",
+                f"Only {usage.free / 2**30:.1f} GiB free; Knots' chainstate is "
+                f"{chainstate / 2**30:.1f} GiB and may need as much again to "
+                "compact (it stops, and swaps with it, when the disk fills)",
             )
         for kind in ("io", "memory"):
             try:
