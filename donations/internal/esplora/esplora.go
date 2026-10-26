@@ -37,6 +37,11 @@ type Client struct {
 	next time.Time
 }
 
+// UserAgent names the service on every request. Go's default
+// ("Go-http-client/1.1") is refused by some explorers, mempool.guide among
+// them since October 2026; an explorer's operator should see who is asking.
+const UserAgent = "lightningfork-donations (+https://lightningfork.com)"
+
 // DefaultInterval paces requests to 4 a second.
 const DefaultInterval = 250 * time.Millisecond
 
@@ -136,6 +141,7 @@ func (c *Client) fetch(ctx context.Context, path string, decode func([]byte) err
 		if err != nil {
 			return err
 		}
+		req.Header.Set("User-Agent", UserAgent)
 		res, err := c.HTTP.Do(req)
 		if err != nil {
 			errs = append(errs, err)
@@ -342,6 +348,7 @@ func (c *Client) Broadcast(ctx context.Context, raw string) (string, error) {
 			return "", err
 		}
 		req.Header.Set("Content-Type", "text/plain")
+		req.Header.Set("User-Agent", UserAgent)
 		res, err := c.HTTP.Do(req)
 		if err != nil {
 			errs = append(errs, err)

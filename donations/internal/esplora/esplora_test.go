@@ -45,6 +45,33 @@ func TestRequestsArePaced(t *testing.T) {
 	}
 }
 
+// Every request names the service; Go's default user agent is refused by
+// some explorers
+func TestRequestsNameTheService(t *testing.T) {
+	var agents []string
+	s := server(func(w http.ResponseWriter, r *http.Request) {
+		agents = append(agents, r.Method+" "+r.UserAgent())
+		if r.Method == http.MethodPost {
+			_, _ = w.Write([]byte(txid))
+			return
+		}
+		_, _ = w.Write([]byte(`{"confirmed": true}`))
+	})
+	defer s.Close()
+	c := New(s.URL)
+	c.Interval = 0
+	if _, err := c.TxStatus(context.Background(), txid); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := c.Broadcast(context.Background(), "00"); err != nil {
+		t.Fatal(err)
+	}
+	want := []string{"GET " + UserAgent, "POST " + UserAgent}
+	if fmt.Sprint(agents) != fmt.Sprint(want) {
+		t.Fatalf("user agents %q, want %q", agents, want)
+	}
+}
+
 func TestFallsBackToTheNextExplorer(t *testing.T) {
 	down := server(func(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "busy", http.StatusServiceUnavailable)
