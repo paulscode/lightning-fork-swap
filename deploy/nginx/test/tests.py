@@ -299,6 +299,11 @@ class Logs(unittest.TestCase):
             self.skipTest("run by run.sh with the logs mounted")
         before = len(read_log("threat.log"))
         me = my_address()
+        # Normal use is not a threat, nor a swap the backend does not know
+        # (first, so that a wrong line would come before the four below)
+        request("GET", "/v2/swap/submarine")
+        request("GET", "/network")
+        self.assertEqual(request("GET", "/v2/swap/missing1234")[0], 404)
         request("GET", "/wp-login.php")
         request("GET", "/v2/swap/chain")
         request("GET", "/v2/swap/../../etc/passwd")
@@ -306,9 +311,6 @@ class Logs(unittest.TestCase):
         with self.assertRaises(http.client.RemoteDisconnected):
             request("GET", "/", port=80, auth=False,
                     host_header="198.51.100.7")
-        # Normal use is not a threat
-        request("GET", "/v2/swap/submarine")
-        request("GET", "/network")
         lines = new_lines("threat.log", before, 4).splitlines()
         self.assertEqual(len(lines), 4, lines)
         for line, path in zip(lines, ["/wp-login.php", "/v2/swap/chain",

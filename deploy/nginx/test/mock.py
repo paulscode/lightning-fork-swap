@@ -27,7 +27,8 @@ class Echo(http.server.BaseHTTPRequestHandler):
             "headers": {k.lower(): v for k, v in self.headers.items()},
             "body": body,
         }).encode()
-        self.send_response(200)
+        # A swap the backend does not know
+        self.send_response(404 if "/missing" in self.path else 200)
         self.send_header("Content-Type", "application/json")
         self.send_header("Content-Length", str(len(out)))
         self.end_headers()
