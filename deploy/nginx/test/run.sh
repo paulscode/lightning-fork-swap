@@ -39,6 +39,14 @@ echo '{"version": 3}' > graph/meta.json
 echo '{"nodes": {}}' > graph/v3/overview.json
 gzip -k graph/v3/overview.json
 : > maintenance.conf
+# The privacy logs: the tag script, a key, and log files the tests can read
+cp "$here/../lfswap_privacy.js" .
+printf 'js_var $lfswap_tag_key "%s";\n' "$(head -c 32 /dev/urandom | od -An -tx1 | tr -d ' \n')" > tag-key.conf
+mkdir -p logs-nginx logs-untrusted
+chmod 777 logs-nginx logs-untrusted
+# Debian's nginx loads its modules from modules-enabled; the image's does not
+docker run --rm "$NGINX_IMAGE" cat /etc/nginx/nginx.conf |
+	sed '1i load_module modules/ngx_http_js_module.so;' > nginx.conf
 chmod -R a+rX "$work"
 
 # The production config, pointed at the mocks
@@ -53,6 +61,10 @@ render() {
 		-e "s#root /srv/lfswap;#root /t;#" \
 		-e "s#server 127.0.0.1:\(900[145]\|9010\)#server mock:\1#" \
 		-e "s#https://mempool.guide/api/#https://mempool.guide:$explorer_port/api/#" \
+		-e "s#/etc/nginx/njs/lfswap_privacy.js#/t/lfswap_privacy.js#" \
+		-e "s#/etc/nginx/lfswap-tag-key.conf#/t/tag-key.conf#" \
+		-e "s#/var/log/nginx/access.log#/logs/access.log#" \
+		-e "s#/var/log/lfswap/threat.log#/logs/threat.log#" \
 		"$here/../lightningfork.conf"
 }
 render 8443 > site.conf
@@ -69,6 +81,7 @@ for n in nginx untrusted; do
 	[ "$n" = untrusted ] && alias=nginx-untrusted
 	docker run -d --name "$id-$n" --network "$id" --network-alias "$alias" \
 		-v "$work:/t:ro" -v "$work/$conf:/etc/nginx/conf.d/default.conf:ro" \
+		-v "$work/nginx.conf:/etc/nginx/nginx.conf:ro" -v "$work/logs-$n:/logs" \
 		"$NGINX_IMAGE" >/dev/null
 done
 sleep 2
@@ -80,8 +93,8 @@ for n in nginx untrusted; do
 	fi
 done
 
-docker run --rm --network "$id" -v "$here/tests.py:/tests.py:ro" "$PYTHON_IMAGE" \
-	python3 /tests.py
+docker run --rm --network "$id" -v "$here/tests.py:/tests.py:ro" \
+	-v "$work/logs-nginx:/logs:ro" "$PYTHON_IMAGE" python3 /tests.py
 
 # Two clients in one IPv6 /64 share the limits of one client
 v6=fd00:1f5:0:1

@@ -1,7 +1,8 @@
 #!/usr/bin/env bash
 # One-time host setup for Lightning Fork Swap on Debian 12, run as root from
 # deploy/. Docker, nginx, certbot and nftables must already be installed
-# (apt-get install nginx certbot nftables apache2-utils, and Docker CE).
+# (apt-get install nginx libnginx-mod-http-js certbot nftables apache2-utils,
+# and Docker CE).
 #
 #   install-host.sh firewall   install the nftables rules (with a 2-minute
 #                              automatic undo unless confirmed)
@@ -50,6 +51,21 @@ nginx)
 	if [ ! -e /etc/nginx/lfswap-preview.conf ]; then
 		printf 'auth_basic "Lightning Fork Swap preview";\nauth_basic_user_file /etc/nginx/lfswap.htpasswd;\n' \
 			> /etc/nginx/lfswap-preview.conf
+	fi
+	# The logs' privacy (lightningfork.conf): the tag script and its daily
+	# key, the threat log's directory, and how long each log is kept
+	ls /etc/nginx/modules-enabled/*http-js* >/dev/null 2>&1 ||
+		{ echo "install libnginx-mod-http-js first" >&2; exit 1; }
+	install -d -m 0755 /etc/nginx/njs
+	install -m 0644 nginx/lfswap_privacy.js /etc/nginx/njs/lfswap_privacy.js
+	scripts/log-key.sh --if-none
+	install -d -m 0750 -g adm /var/log/lfswap
+	install -m 0644 logrotate/lfswap /etc/logrotate.d/lfswap
+	# nginx's access and error logs: 10 days (Debian keeps 14)
+	sed -i -E 's/^(\s*rotate)\s+[0-9]+/\1 10/' /etc/logrotate.d/nginx
+	# Failed SSH logins (attackers' addresses): weekly, 4 kept, not a month's worth in one file
+	if [ -f /etc/logrotate.d/btmp ]; then
+		sed -i -E 's/^(\s*)monthly/\1weekly/; s/^(\s*rotate)\s+[0-9]+/\1 4/' /etc/logrotate.d/btmp
 	fi
 	install -m 0644 nginx/lightningfork.conf /etc/nginx/sites-available/lightningfork.conf
 	ln -sf /etc/nginx/sites-available/lightningfork.conf /etc/nginx/sites-enabled/lightningfork.conf

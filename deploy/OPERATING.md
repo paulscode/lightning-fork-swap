@@ -530,6 +530,26 @@ coins held (not yet swept) pass `MONITOR_SHA256_MAX_SAT` (5,000,000 sat).
 | Monthly, or as you like | take earnings out (§6) |
 | Before raising limits or the hot wallet | weeks without trouble |
 
+### Logs and users' privacy
+
+The client's address stops at nginx: the backend, the sidecar and the
+donations API never receive it. nginx keeps two logs:
+
+| Log | What a line holds | Kept |
+| --- | --- | --- |
+| `/var/log/nginx/access.log` | time, a client tag, method, the path without swap ids, txids, addresses or invoices, status, sizes, timings, the kind of user agent | 10 days |
+| `/var/log/lfswap/threat.log` | what was refused as hostile (scanner paths, malformed paths, probes of the API, other host names): the address, the path, the user agent; a client a limit refused: its tag only | 30 days |
+
+The tag is an HMAC of the address under a key that `scripts/log-key.sh`
+replaces at midnight (cron): one client has one tag for the day, so a bot
+or a flood still shows, and after the day nobody can tell which address
+it was. nginx's error log is kept 10 days and no longer gets a line per
+rate-limited request. The backend's own log files (`boltz.log`,
+`sidecar.log`) are rotated daily and kept 10 days.
+
+Looking into traffic: count and describe by tag (`awk '{print $2}'
+access.log | sort | uniq -c`); copy no addresses into notes.
+
 ## 10. Before opening the service to users
 
 1. Funding as in §3: lnd's on-chain wallet, outbound channels, inbound, the

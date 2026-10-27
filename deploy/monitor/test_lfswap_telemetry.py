@@ -389,6 +389,25 @@ class LogsTest(Base):
         self.assertEqual(counts["create:reverse:201"], 1)
         self.assertEqual(counts["create:submarine:201"], 1)
 
+    def test_the_privacy_log_format_is_read_too(self):
+        # nginx's access log since 2026-10 (lightningfork.conf, log_format
+        # lfswap_privacy): a client tag in place of the address
+        fake = Fake()
+        fake.logs["boltz"] = ""
+        fake.files["/var/log/nginx/access.log"] = (
+            '2026-10-27T01:00:00+00:00 91fa56105fd2 "POST /v2/swap/reverse '
+            'HTTP/2.0" 201 300 0.120 0.118 firefox\n'
+            '2026-10-27T01:00:05+00:00 91fa56105fd2 "POST /v2/swap/reverse '
+            'HTTP/2.0" 503 197 0.000 - firefox\n'
+            '2026-10-27T01:00:09+00:00 0c2d33e1a7b4 "GET /v2/swap/:id '
+            'HTTP/2.0" 200 30 0.002 0.002 chrome\n')
+        self.t.record_logs(self.monitor(fake), "2026-10-27T00:55:00Z",
+                           "/var/log/nginx/access.log")
+        counts = {json.loads(d)["name"]: json.loads(d)["n"] for (d,) in
+                  self.rows("SELECT data FROM event WHERE kind = 'count'")}
+        self.assertEqual(counts, {"create:reverse:201": 1,
+                                  "create:reverse:503": 1})
+
     def test_a_rotated_access_log_is_read_from_its_start(self):
         fake = service_fake()
         line = ("9.9.9.9 - - [x] \"POST /v2/swap/reverse HTTP/2.0\" 201 1 "

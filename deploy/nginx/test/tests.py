@@ -8,6 +8,7 @@ import os
 import socket
 import ssl
 import sys
+import time
 import unittest
 
 NGINX = os.environ.get("LFSWAP_NGINX", "nginx")
@@ -179,16 +180,18 @@ class Headers(unittest.TestCase):
                 self.assertEqual(header(headers, "Strict-Transport-Security"),
                                  ["max-age=31536000; includeSubDomains"])
 
-    def test_the_backend_sees_the_real_client_not_a_forged_one(self):
-        for path in ["/v2/swap/submarine", "/v2/ws"]:
+    def test_no_service_behind_nginx_sees_the_client_address(self):
+        me = my_address()
+        for path in ["/v2/swap/submarine", "/v2/ws", "/donate/v1/health"]:
             with self.subTest(path=path):
                 status, _, raw = request(
                     "GET", path, headers={"X-Forwarded-For": "6.6.6.6",
                                           "X-Real-IP": "6.6.6.6"})
                 self.assertEqual(status, 200)
                 saw = backend_saw(raw)["headers"]
-                self.assertNotIn("6.6.6.6", saw.get("x-forwarded-for", ""))
-                self.assertNotEqual(saw.get("x-real-ip"), "6.6.6.6")
+                for name in ("x-forwarded-for", "x-real-ip"):
+                    self.assertEqual(saw.get(name, ""), "", name)
+                self.assertNotIn(me, json.dumps(saw))
                 self.assertEqual(saw.get("host"), "lightningfork.com")
 
     def test_the_preview_password_is_required(self):
@@ -223,6 +226,109 @@ class Headers(unittest.TestCase):
         self.assertEqual(status, 301)
         self.assertEqual(header(headers, "Location"),
                          ["https://lightningfork.com/x?y=1"])
+
+
+def my_address():
+    """This client's address as nginx sees it (one network, no NAT)."""
+    probe = socket.create_connection((NGINX, 443), 5)
+    try:
+        return probe.getsockname()[0]
+    finally:
+        probe.close()
+
+
+def read_log(name):
+    with open(os.path.join("/logs", name), encoding="utf-8") as f:
+        return f.read()
+
+
+def new_lines(name, before, at_least):
+    """The log's lines after offset `before`, once there are `at_least`:
+    nginx writes a line just after the answer has gone out."""
+    for _ in range(50):
+        lines = read_log(name)[before:]
+        if len(lines.splitlines()) >= at_least:
+            return lines
+        time.sleep(0.05)
+    return lines
+
+
+class Logs(unittest.TestCase):
+    SWAP = "AbCdEfGhIjKl"
+    TXID = "ab" * 32
+    ADDRESS = "bc1qprivacytestaddressxxxxxxxxxxxxxxxxxxxx"
+    ORDER = "AbCdEfGhIjKlMnOpQrSt_-"
+
+    def test_the_access_log_keeps_no_address_and_no_identifiers(self):
+        if not os.path.isdir("/logs"):
+            self.skipTest("run by run.sh with the logs mounted")
+        before = len(read_log("access.log"))
+        for path in [
+            f"/v2/swap/{self.SWAP}",
+            f"/v2/swap/submarine/{self.SWAP}/transaction",
+            f"/v2/swap/reverse/lnbc{'1' * 40}/bip21",
+            f"/explorer/api/address/{self.ADDRESS}/utxo",
+            f"/explorer/api/tx/{self.TXID}/outspend/1",
+            f"/donate/v1/replay/{self.TXID}",
+            f"/donate/v1/sha256/{self.ORDER}",
+            f"/swap/{self.SWAP}?secret=1",
+        ]:
+            request("GET", path, headers={"User-Agent": "Mozilla/5.0 (X11) Firefox/140.0"})
+        lines = new_lines("access.log", before, 8)
+        self.assertTrue(lines.strip())
+        for secret in (my_address(), self.SWAP, self.TXID, self.ADDRESS,
+                       self.ORDER, "lnbc111", "secret", "X11"):
+            self.assertNotIn(secret, lines)
+        for redacted in ("/v2/swap/:id ", "/v2/swap/submarine/:id/transaction",
+                         "/v2/swap/reverse/:invoice/bip21",
+                         "/explorer/api/address/:address/utxo",
+                         "/explorer/api/tx/:txid/outspend/1",
+                         "/donate/v1/replay/:txid", "/donate/v1/sha256/:id",
+                         "/swap/* "):
+            self.assertIn(redacted, lines)
+        # One client, one tag (12 hex characters), and the agent's kind
+        tags = {line.split()[1] for line in lines.splitlines()}
+        self.assertEqual(len(tags), 1)
+        self.assertRegex(tags.pop(), r"^[0-9a-f]{12}$")
+        self.assertIn(" firefox", lines)
+        # The monitor's parser still finds method, path and status
+        self.assertRegex(lines, r'"GET /v2/swap/:id HTTP/[0-9.]+" 200 ')
+
+    def test_the_threat_log_keeps_the_hostile_by_address(self):
+        if not os.path.isdir("/logs"):
+            self.skipTest("run by run.sh with the logs mounted")
+        before = len(read_log("threat.log"))
+        me = my_address()
+        request("GET", "/wp-login.php")
+        request("GET", "/v2/swap/chain")
+        request("GET", "/v2/swap/../../etc/passwd")
+        # Another name: nginx closes the connection without an answer (444)
+        with self.assertRaises(http.client.RemoteDisconnected):
+            request("GET", "/", port=80, auth=False,
+                    host_header="198.51.100.7")
+        # Normal use is not a threat
+        request("GET", "/v2/swap/submarine")
+        request("GET", "/network")
+        lines = new_lines("threat.log", before, 4).splitlines()
+        self.assertEqual(len(lines), 4, lines)
+        for line, path in zip(lines, ["/wp-login.php", "/v2/swap/chain",
+                                      "/v2/swap/../../etc/passwd", "/"]):
+            self.assertEqual(line.split()[1], me)
+            self.assertIn(f" {path} ", line)
+
+    def test_the_too_fast_are_kept_by_tag_only(self):
+        if not os.path.isdir("/logs"):
+            self.skipTest("run by run.sh with the logs mounted")
+        before = len(read_log("threat.log"))
+        statuses = [request("GET", "/explorer/api/blocks/tip/height")[0]
+                    for _ in range(40)]
+        self.assertIn(503, statuses)
+        lines = read_log("threat.log")[before:].splitlines()
+        self.assertTrue(lines)
+        for line in lines:
+            self.assertRegex(line.split()[1], r"^[0-9a-f]{12}$")
+            self.assertNotIn(my_address(), line)
+            self.assertIn(" 503 ", line)
 
 
 class Explorer(unittest.TestCase):
@@ -353,6 +459,8 @@ class RateLimits(unittest.TestCase):
         self.assertNotEqual(status, 413)
 
     def test_the_donations_api_is_limited(self):
+        # Earlier tests used part of the burst: let it refill (2 a second)
+        time.sleep(6)
         path = "/donate/v1/replay/" + "cd" * 32
         statuses = [request("GET", path)[0] for _ in range(20)]
         self.assertEqual(statuses[0], 200)

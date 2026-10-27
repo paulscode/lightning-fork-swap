@@ -66,11 +66,14 @@ install_crons() {
 		rm -f /etc/cron.d/lfswap-offsite
 		log "no BACKUP_AGE_RECIPIENT in .env: daily offsite backups are not scheduled"
 	fi
-	chmod 644 /etc/cron.d/lfswap-backup /etc/cron.d/lfswap-offsite /etc/cron.d/lfswap-monitor /etc/cron.d/lfswap-rebalance 2>/dev/null || true
+	# A new key for the access log's client tags every day (the day before
+	# can then no longer be traced to addresses)
+	echo "0 0 * * * root $DEPLOY/scripts/log-key.sh" > /etc/cron.d/lfswap-log-key
+	chmod 644 /etc/cron.d/lfswap-backup /etc/cron.d/lfswap-offsite /etc/cron.d/lfswap-monitor /etc/cron.d/lfswap-rebalance /etc/cron.d/lfswap-log-key 2>/dev/null || true
 }
 
 remove_crons() {
-	rm -f /etc/cron.d/lfswap-backup /etc/cron.d/lfswap-offsite /etc/cron.d/lfswap-monitor /etc/cron.d/lfswap-rebalance
+	rm -f /etc/cron.d/lfswap-backup /etc/cron.d/lfswap-offsite /etc/cron.d/lfswap-monitor /etc/cron.d/lfswap-rebalance /etc/cron.d/lfswap-log-key
 }
 
 wait_for() {

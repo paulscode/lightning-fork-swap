@@ -1,0 +1,41 @@
+# Installed as /etc/logrotate.d/lfswap by scripts/install-host.sh nginx.
+# nginx's own access and error logs are rotated by Debian's
+# /etc/logrotate.d/nginx, set there to 10 days by the same script.
+
+# What nginx saw as hostile, by address (lightningfork.conf): 30 days
+/var/log/lfswap/threat.log {
+	daily
+	rotate 30
+	missingok
+	notifempty
+	compress
+	delaycompress
+	create 0640 root adm
+	sharedscripts
+	postrotate
+		invoke-rc.d nginx rotate >/dev/null 2>&1 || true
+	endscript
+}
+
+# The backend's own log files (it also writes them to Docker's log): they
+# hold swap ids and the errors of failed requests; 10 days
+/srv/lfswap/boltz/boltz.log /srv/lfswap/boltz/sidecar/sidecar.log {
+	daily
+	rotate 10
+	missingok
+	notifempty
+	compress
+	delaycompress
+	copytruncate
+}
+
+# The operator's own logs: no user data, but they grow without end
+/srv/lfswap/monitor/monitor.log /srv/lfswap/rebalance/rebalance.log /var/log/lfswap-fw.log {
+	weekly
+	rotate 8
+	missingok
+	notifempty
+	compress
+	delaycompress
+	copytruncate
+}
