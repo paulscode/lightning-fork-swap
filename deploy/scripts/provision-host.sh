@@ -60,9 +60,11 @@ else
 	echo "root has no SSH key: password logins left on; add a key and run again" >&2
 fi
 
-# The journal keeps at most 200 MB (it grew past 1 GB on a 40 GB disk)
+# The journal keeps at most 200 MB (it grew past 1 GB on a 40 GB disk), and
+# 10 days: the containers log to it (docker-compose.yml), and their logs
+# hold swap ids and the errors of users' requests
 mkdir -p /etc/systemd/journald.conf.d
-printf '[Journal]\nSystemMaxUse=200M\n' > /etc/systemd/journald.conf.d/lfswap.conf
+printf '[Journal]\nSystemMaxUse=200M\nMaxRetentionSec=10day\n' > /etc/systemd/journald.conf.d/lfswap.conf
 systemctl restart systemd-journald
 
 # On shutdown Docker gives containers 15 s and systemd gives Docker 90 s;

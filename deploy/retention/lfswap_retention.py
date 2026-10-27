@@ -2,8 +2,9 @@
 """What the databases keep about users, and for how long. Daily (cron,
 scripts/migrate/lib.sh).
 
-RETENTION_MODE in .env: "report" (the default) counts what it would change
-and changes nothing but the referral (below); "on" changes it.
+RETENTION_MODE in .env governs the swaps (1): "report" (the default) counts
+what it would change, "on" changes it. The referral (2) and the donations
+(3) are done in both modes: nothing depends on what they remove.
 
 1. Backend swaps. 90 days after a swap's last change, once nothing is left
    to claim or refund, the user's data in it goes: the invoice (its payment
@@ -21,11 +22,12 @@ and changes nothing but the referral (below); "on" changes it.
 2. Every swap: the referral the web app sent (once "..._mobile" or
    "..._desktop") becomes the one it sends now, in both modes; nothing reads
    it.
-3. Donations: a protected donation's inputs after 30 days (the verdict,
-   txid and amount stay); a SHA256-chain donation's BIP322 proofs 90 days
-   after their copy was decided (relayed, there already, or impossible).
-   Return addresses stay: a later deposit to the same request still needs
-   one.
+3. Donations: a protected donation's inputs after 30 days, an at-risk
+   one's inputs and at-risk addresses after 400 days (its rechecks end
+   after a year; the verdict, txid and amount stay; a replayed one is kept
+   for its return); a SHA256-chain donation's BIP322 proofs 90 days after
+   their copy was decided (relayed, there already, or impossible). Return
+   addresses stay: a later deposit to the same request still needs one.
 
    lfswap_retention.py              as RETENTION_MODE says
    lfswap_retention.py --report     count only
@@ -44,6 +46,7 @@ import lfswap_monitor  # noqa: E402
 
 SWAP_DAYS = 90
 REPLAY_DAYS = 30
+AT_RISK_DAYS = 400
 HINT_DAYS = 90
 REFERRAL = "lightning_fork_swap"
 OLD_REFERRALS = ("lightning_fork_swap_mobile", "lightning_fork_swap_desktop")
@@ -78,6 +81,8 @@ class Retention:
         self.m = monitor
         self.mode = mode
         self.lines = []
+        # What report mode left in place that is past its time
+        self.overdue = 0
 
     def say(self, text):
         self.lines.append(text)
@@ -143,6 +148,8 @@ class Retention:
                  f"{len(submarine)} to clear, {sub_kept} kept (lockup "
                  f"unspent or unreadable); reverse {len(reverse)} to clear, "
                  f"{rev_kept} kept (our lockup open)")
+        if self.mode != "on":
+            self.overdue += len(submarine) + len(reverse)
         if self.mode != "on" or not (submarine or reverse):
             return
         sql = ["BEGIN;"]
@@ -188,36 +195,32 @@ class Retention:
     def donations(self):
         if not self.m.donations_on():
             return
-        where_inputs = (
-            "verdict = 'protected' AND inputs <> '[]'::jsonb "
-            f"AND first_seen < now() - interval '{REPLAY_DAYS} days'")
+        cleared = returned(self.m.psql(
+            "UPDATE replay_checks SET inputs = '[]'::jsonb "
+            "WHERE inputs <> '[]'::jsonb AND ("
+            "(verdict = 'protected' "
+            f"AND first_seen < now() - interval '{REPLAY_DAYS} days') OR "
+            "(verdict = 'at_risk' "
+            f"AND first_seen < now() - interval '{AT_RISK_DAYS} days')) "
+            "RETURNING 1", "donations"))
+        cleared += returned(self.m.psql(
+            "UPDATE replay_checks SET at_risk_addresses = '{}' "
+            "WHERE verdict = 'at_risk' AND at_risk_addresses <> '{}' "
+            f"AND first_seen < now() - interval '{AT_RISK_DAYS} days' "
+            "RETURNING 1", "donations"))
         # Proofs are needed until every SHA256-chain deposit of their
         # transaction has a decided copy
-        where_proofs = (
-            "proofs <> '[]'::jsonb "
+        proofs = returned(self.m.psql(
+            "UPDATE sha256_hints SET proofs = '[]'::jsonb "
+            "WHERE proofs <> '[]'::jsonb "
             f"AND at < now() - interval '{HINT_DAYS} days' "
             "AND NOT EXISTS (SELECT 1 FROM sha256_deposits d "
             "WHERE d.request_id = sha256_hints.request_id "
             "AND d.txid = sha256_hints.txid AND d.chain = 'sha256' "
-            "AND d.copy_state NOT IN ('already', 'copied', 'not_possible'))")
-        if self.mode == "on":
-            inputs = returned(self.m.psql(
-                f"UPDATE replay_checks SET inputs = '[]'::jsonb "
-                f"WHERE {where_inputs} RETURNING 1", "donations"))
-            proofs = returned(self.m.psql(
-                f"UPDATE sha256_hints SET proofs = '[]'::jsonb "
-                f"WHERE {where_proofs} RETURNING 1", "donations"))
-            verb = "cleared"
-        else:
-            inputs = counted(self.m.psql(
-                f"SELECT count(*) FROM replay_checks WHERE {where_inputs}",
-                "donations"))
-            proofs = counted(self.m.psql(
-                f"SELECT count(*) FROM sha256_hints WHERE {where_proofs}",
-                "donations"))
-            verb = "to clear"
-        self.say(f"donations: {inputs} replay checks' inputs and {proofs} "
-                 f"SHA256 proofs {verb}")
+            "AND d.copy_state NOT IN ('already', 'copied', 'not_possible')) "
+            "RETURNING 1", "donations"))
+        self.say(f"donations: cleared {cleared} replay checks' inputs or "
+                 f"addresses and {proofs} SHA256 proofs")
 
     def run(self):
         self.swaps()
@@ -241,8 +244,16 @@ def main(argv=None, runner=None, now=None):
     monitor = lfswap_monitor.Monitor(runner or lfswap_monitor.Runner(DEPLOY),
                                      env, now)
     stamp = now.strftime("%Y-%m-%dT%H:%M:%SZ")
-    for line in Retention(monitor, mode).run():
+    retention = Retention(monitor, mode)
+    for line in retention.run():
         print(f"{stamp} [{mode}] {line}")
+    # The privacy page says these go: report mode must not keep them quietly
+    if retention.overdue and not args.report:
+        lfswap_monitor.send(
+            env, "Lightning Fork Swap: retention",
+            f"{retention.overdue} records are past the time the privacy page "
+            "gives them, and RETENTION_MODE is report: rehearse on regtest, "
+            "then set it to on (OPERATING.md, Logs and users' privacy)")
     return 0
 
 

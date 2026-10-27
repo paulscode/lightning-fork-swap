@@ -9,11 +9,14 @@
 
 name: lfswap
 
+# The containers' logs go to the journal, which keeps 10 days at most (and
+# 200 MB): Docker's own log files can only be capped by size, and some of
+# these logs hold swap ids and the errors of users' requests.
+# docker compose logs reads them as before.
 x-logging: &logging
-  driver: json-file
+  driver: journald
   options:
-    max-size: "20m"
-    max-file: "3"
+    tag: "lfswap/{{.Name}}"
 
 services:
   # Fails when this host's state has been migrated to another host

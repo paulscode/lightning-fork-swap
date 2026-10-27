@@ -99,6 +99,15 @@ class Swaps(unittest.TestCase):
             self.assertNotIn(kept_column, batch)
         self.assertTrue(batch.rstrip().endswith("COMMIT;"))
 
+    def test_report_mode_counts_what_is_overdue(self):
+        m = FakeMonitor(swaps_answers(), unspent={"03" * 32})
+        ret = r.Retention(m, "report")
+        ret.run()
+        self.assertEqual(ret.overdue, 6)
+        ret = r.Retention(FakeMonitor(swaps_answers()), "on")
+        ret.run()
+        self.assertEqual(ret.overdue, 0)
+
     def test_nothing_due_means_no_write(self):
         m = FakeMonitor({})
         r.Retention(m, "on").run()
@@ -118,24 +127,28 @@ class Referral(unittest.TestCase):
 
 
 class Donations(unittest.TestCase):
-    def test_report_counts_and_on_clears(self):
-        m = FakeMonitor({"count(*) FROM replay_checks": ["3"],
-                         "count(*) FROM sha256_hints": ["1"]})
-        lines = r.Retention(m, "report").run()
-        self.assertIn("donations: 3 replay checks' inputs and 1 SHA256 "
-                      "proofs to clear", lines)
-        self.assertFalse([q for q in m.writes() if "replay_checks" in q])
-
-        m = FakeMonitor({"UPDATE replay_checks": ["1", "UPDATE 1"]})
-        lines = r.Retention(m, "on").run()
-        update = next(q for q in m.writes() if "UPDATE replay_checks" in q)
-        self.assertIn("verdict = 'protected'", update)
-        self.assertIn("interval '30 days'", update)
-        proofs = next(q for q in m.writes() if "UPDATE sha256_hints" in q)
+    def test_cleared_in_both_modes(self):
+        for mode in ("report", "on"):
+            m = FakeMonitor({"SET inputs": ["1", "UPDATE 1"],
+                             "SET at_risk_addresses": [],
+                             "SET proofs": ["1", "1", "UPDATE 2"]})
+            lines = r.Retention(m, mode).run()
+            self.assertIn("donations: cleared 1 replay checks' inputs or "
+                          "addresses and 2 SHA256 proofs", lines, mode)
+        inputs = next(q for q in m.writes() if "SET inputs" in q)
+        self.assertIn("verdict = 'protected' AND first_seen < now() - "
+                      "interval '30 days'", inputs)
+        self.assertIn("verdict = 'at_risk' AND first_seen < now() - "
+                      "interval '400 days'", inputs)
+        # A replayed donation is kept for its return
+        self.assertNotIn("replayed", inputs)
+        proofs = next(q for q in m.writes() if "SET proofs" in q)
         # Only once every deposit of the transaction has a decided copy
         self.assertIn("NOT IN ('already', 'copied', 'not_possible')", proofs)
-        self.assertIn("donations: 1 replay checks' inputs and 0 SHA256 "
-                      "proofs cleared", lines)
+        # Not counted as overdue: report mode does them
+        ret = r.Retention(FakeMonitor({"SET inputs": ["1"]}), "report")
+        ret.run()
+        self.assertEqual(ret.overdue, 0)
 
     def test_off_when_donations_are(self):
         m = FakeMonitor({}, donations=False)
