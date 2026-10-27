@@ -69,11 +69,16 @@ install_crons() {
 	# A new key for the access log's client tags every day (the day before
 	# can then no longer be traced to addresses)
 	echo "0 0 * * * root $DEPLOY/scripts/log-key.sh" > /etc/cron.d/lfswap-log-key
-	chmod 644 /etc/cron.d/lfswap-backup /etc/cron.d/lfswap-offsite /etc/cron.d/lfswap-monitor /etc/cron.d/lfswap-rebalance /etc/cron.d/lfswap-log-key 2>/dev/null || true
+	# What the databases keep about users (it reports only while
+	# RETENTION_MODE is report, the default)
+	mkdir -p "$ROOT/retention"
+	chmod 700 "$ROOT/retention"
+	echo "20 4 * * * root /usr/bin/python3 $DEPLOY/retention/lfswap_retention.py >> $ROOT/retention/retention.log 2>&1" > /etc/cron.d/lfswap-retention
+	chmod 644 /etc/cron.d/lfswap-backup /etc/cron.d/lfswap-offsite /etc/cron.d/lfswap-monitor /etc/cron.d/lfswap-rebalance /etc/cron.d/lfswap-log-key /etc/cron.d/lfswap-retention 2>/dev/null || true
 }
 
 remove_crons() {
-	rm -f /etc/cron.d/lfswap-backup /etc/cron.d/lfswap-offsite /etc/cron.d/lfswap-monitor /etc/cron.d/lfswap-rebalance /etc/cron.d/lfswap-log-key
+	rm -f /etc/cron.d/lfswap-backup /etc/cron.d/lfswap-offsite /etc/cron.d/lfswap-monitor /etc/cron.d/lfswap-rebalance /etc/cron.d/lfswap-log-key /etc/cron.d/lfswap-retention
 }
 
 wait_for() {

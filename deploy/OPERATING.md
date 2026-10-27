@@ -550,6 +550,22 @@ rate-limited request. The backend's own log files (`boltz.log`,
 Looking into traffic: count and describe by tag (`awk '{print $2}'
 access.log | sort | uniq -c`); copy no addresses into notes.
 
+The databases: `retention/lfswap_retention.py` (daily, log in
+`/srv/lfswap/retention/retention.log`) removes the user's data from a swap
+90 days after its last change, once nothing is left to claim or refund (we
+claimed it, it was never paid, or its lockup is spent; for a reverse swap:
+the user claimed it, we refunded, or we never locked up). The invoice
+(its payment hash stays), preimage, the user's key and address and the
+script go; amounts, fees, status and dates stay. Any other swap stays
+whole, however old. Donations: a protected donation's inputs after 30
+days, SHA256 proofs 90 days after their copy was decided. With
+`RETENTION_MODE=report` (the default) it only counts; set `on` after a
+rehearsal on regtest (the first swaps qualify in January 2027). Swaps no
+longer record whether they came from a phone (the referral is the same for
+all), in either mode.
+
+Alerts name a donor's address by its first 10 characters only.
+
 ## 10. Before opening the service to users
 
 1. Funding as in §3: lnd's on-chain wallet, outbound channels, inbound, the

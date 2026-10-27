@@ -510,6 +510,22 @@ class RollupTest(Base):
         self.assertTrue(self.rows("SELECT * FROM daily WHERE day = ?",
                                   old.date().isoformat()))
 
+    def test_old_payment_hashes_are_dropped(self):
+        old = int((NOW - datetime.timedelta(days=t.SNAPSHOT_DAYS + 2)).timestamp())
+        new = int(NOW.timestamp()) - 3600
+        for ts, key in ((old, "ab" * 32), (new, "cd" * 32)):
+            self.t.db.execute(
+                "INSERT INTO event (ts, kind, key, data) VALUES "
+                "(?, 'payment', ?, '{\"status\": \"SUCCEEDED\"}')", (ts, key))
+        self.snapshots(NOW.date(), [(2, 0)])
+        self.t.rollup(NOW)
+        keys = [k for (k,) in self.rows(
+            "SELECT key FROM event WHERE kind = 'payment' ORDER BY ts")]
+        self.assertRegex(keys[0], r"^payment:\d+$")
+        self.assertEqual(keys[1], "cd" * 32)
+        # The payment itself stays (the analysis counts it)
+        self.assertEqual(len(keys), 2)
+
     def test_percentile(self):
         self.assertIsNone(t.percentile([], 0.5))
         self.assertEqual(t.percentile([5], 0.95), 5)

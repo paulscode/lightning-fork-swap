@@ -13,7 +13,8 @@ addresses or invoices. Swap rows carry the swap id, amounts and fees, as the
 backend's own database has them. The database is not public: it says where
 the liquidity is thin.
 
-Retention: 5-minute snapshots 180 days; events and daily rollups kept.
+Retention: 5-minute snapshots 180 days; events and daily rollups kept,
+payments' hashes replaced after 180 days.
 """
 
 import csv
@@ -575,6 +576,11 @@ class Telemetry:
         cutoff = int(now.timestamp()) - SNAPSHOT_DAYS * 86400
         self.db.execute("DELETE FROM snapshot WHERE ts < ?", (cutoff,))
         self.db.execute("DELETE FROM channel_snapshot WHERE ts < ?", (cutoff,))
+        # A payment's key is its payment hash, which leads to its swap and
+        # the user's invoice: after the same time, its row number instead
+        self.db.execute(
+            "UPDATE event SET key = 'payment:' || id WHERE kind = 'payment' "
+            "AND ts < ? AND key NOT LIKE 'payment:%'", (cutoff,))
         self.db.commit()
 
     def _rollup_day(self, day):

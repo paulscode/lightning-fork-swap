@@ -451,7 +451,8 @@ class Monitor:
                 f"donation:at-risk:{txid}",
                 f"Donation {txid} ({sats(amount)}) was sent without replay "
                 "protection: the donor's coins at "
-                f"{addresses or 'their addresses'} can be copied to the "
+                f"{' '.join(short_address(a) for a in addresses.split()) or 'their addresses'}"
+                " can be copied to the "
                 "SHA256 chain. Watch it with: donations replay show "
                 f"{txid}",
                 event=True,
@@ -526,14 +527,14 @@ class Monitor:
             if state == "failed":
                 self.add(
                     f"sha256:forward-failed:{txid}",
-                    f"A forward of {sats(amount)} to {dest} was refused by "
+                    f"A forward of {sats(amount)} to {short_address(dest)} was refused by "
                     f"our node ({error}); its coins wait for the next pass",
                     event=True,
                 )
             else:
                 self.add(
                     f"sha256:forward:{txid}",
-                    f"Passed on {sats(amount)} of BLAKE2b coins to {dest} "
+                    f"Passed on {sats(amount)} of BLAKE2b coins to {short_address(dest)} "
                     f"({txid})",
                     event=True,
                 )
@@ -819,6 +820,13 @@ SUBMARINE_DONE = ("invoice.paid", "transaction.claim.pending",
 
 def sats(value):
     return f"{int(value):,} sat"
+
+
+def short_address(address):
+    """A donor's address in an alert: enough to recognise it, not the whole
+    of it (alerts leave the host; the database has it in full)."""
+    address = address.strip()
+    return address if len(address) <= 14 else address[:10] + "…"
 
 
 def report(monitor, days):

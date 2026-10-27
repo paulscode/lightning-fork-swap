@@ -322,14 +322,17 @@ class ChecksTest(unittest.TestCase):
         tx = "ab" * 32
         alerts, runner = self.donations({
             "last_pass": "2026-10-07T11:59:00Z\n",
-            "verdict = 'at_risk'": f"{tx}|50000|bc1qa bc1qb\n",
+            "verdict = 'at_risk'": f"{tx}|50000|bc1qdonorfirstaddressxxxxxxxxxx "
+                                   "bc1qdonorsecondaddressxxxxxxxxx\n",
             "verdict = 'replayed'": f"{tx}|50000|976100\n",
             "verdict = 'unknown'": f"{tx}|7000\n",
         })
         at_risk = alerts[f"donation:at-risk:{tx}"]
         self.assertTrue(at_risk.event)
         self.assertIn("50,000 sat", at_risk.text)
-        self.assertIn("bc1qa bc1qb", at_risk.text)
+        # The donor's addresses, cut short: alerts leave the host
+        self.assertIn("bc1qdonorf… bc1qdonors…", at_risk.text)
+        self.assertNotIn("firstaddress", at_risk.text)
         replayed = alerts[f"donation:replayed:{tx}"]
         self.assertTrue(replayed.event)
         self.assertIn("height 976100", replayed.text)
@@ -441,8 +444,8 @@ class ChecksTest(unittest.TestCase):
         tx = "ab" * 32
         alerts, _ = self.sha256({
             "state = 'confirmed' AND first_seen": f"req1|{tx}|1|50000\n",
-            "FROM sha256_forwards": f"{'cd' * 32}|49000|bc1qdest|sent|\n"
-                                    f"{'ef' * 32}|7000|bc1qdest|failed|min relay fee not met\n",
+            "FROM sha256_forwards": f"{'cd' * 32}|49000|bc1qdonorreturnaddressxxxx|sent|\n"
+                                    f"{'ef' * 32}|7000|bc1qdonorreturnaddressxxxx|failed|min relay fee not met\n",
             "copy_state = 'copied'": f"req1|{tx}\n",
             "FROM sha256_sweeps": f"{'12' * 32}|69000|bc1qmine|sent|\n",
             "logs": "2026/10/07 11:59:00 ALERT: forward x refused by our node: y\n",
@@ -451,7 +454,9 @@ class ChecksTest(unittest.TestCase):
         self.assertTrue(donation.event)
         self.assertIn("50,000 sat", donation.text)
         self.assertIn("SHA256-chain donation", donation.text)
-        self.assertIn("bc1qdest", alerts[f"sha256:forward:{'cd' * 32}"].text)
+        forward = alerts[f"sha256:forward:{'cd' * 32}"].text
+        self.assertIn("bc1qdonorr…", forward)
+        self.assertNotIn("returnaddress", forward)
         self.assertIn("min relay fee", alerts[f"sha256:forward-failed:{'ef' * 32}"].text)
         self.assertTrue(alerts[f"sha256:copied:{tx}"].event)
         sweep = alerts[f"sha256:sweep:{'12' * 32}"]

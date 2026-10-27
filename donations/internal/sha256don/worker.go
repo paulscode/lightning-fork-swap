@@ -750,7 +750,9 @@ func (w *Worker) forward(ctx context.Context, now time.Time) error {
 			errs = append(errs, err)
 			continue
 		}
-		w.Logger.Printf("passed on %d sat to %s in %s (fee %d)", s.AmountSat, g.dest, s.Txid, s.FeeSat)
+		// Not the destination: it can be the donor's own address, and the txid
+		// leads to it for whoever needs it
+		w.Logger.Printf("passed on %d sat in %s (fee %d)", s.AmountSat, s.Txid, s.FeeSat)
 	}
 	return errors.Join(errs...)
 }
