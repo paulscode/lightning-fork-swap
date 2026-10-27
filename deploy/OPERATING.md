@@ -545,7 +545,10 @@ replaces at midnight (cron): one client has one tag for the day, so a bot
 or a flood still shows, and after the day nobody can tell which address
 it was. nginx's error log is kept 10 days and no longer gets a line per
 rate-limited request. The backend's own log files (`boltz.log`,
-`sidecar.log`) are rotated daily and kept 10 days.
+`sidecar.log`) are rotated daily and kept 10 days. The containers log to
+the journal (`docker compose logs` as before; `journalctl -t
+lfswap/<container>` too), which keeps 10 days; lnd writes no log file of
+its own.
 
 Looking into traffic: count and describe by tag (`awk '{print $2}'
 access.log | sort | uniq -c`); copy no addresses into notes.
@@ -557,12 +560,13 @@ claimed it, it was never paid, or its lockup is spent; for a reverse swap:
 the user claimed it, we refunded, or we never locked up). The invoice
 (its payment hash stays), preimage, the user's key and address and the
 script go; amounts, fees, status and dates stay. Any other swap stays
-whole, however old. Donations: a protected donation's inputs after 30
-days, SHA256 proofs 90 days after their copy was decided. With
-`RETENTION_MODE=report` (the default) it only counts; set `on` after a
-rehearsal on regtest (the first swaps qualify in January 2027). Swaps no
-longer record whether they came from a phone (the referral is the same for
-all), in either mode.
+whole, however old. With `RETENTION_MODE=report` (the default) it only
+counts swaps, and alerts once any is past its time; set `on` after a
+rehearsal on regtest, before the first swaps qualify (January 2027).
+In either mode: donations lose a protected donation's inputs after 30
+days, an at-risk one's inputs and addresses after 400 days (a replayed one
+is kept for its return), SHA256 proofs 90 days after their copy was
+decided; and swaps no longer record whether they came from a phone.
 
 Alerts name a donor's address by its first 10 characters only.
 
