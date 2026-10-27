@@ -340,6 +340,13 @@ deploy/regtest/sha256-donations-twochain.sh # SHA256-chain donations' forwards o
                                             # regtest nodes sharing their first blocks;
                                             # RDTS_EXPIRED=1: the anchors after the data rules
 (cd e2e && node run.mjs)                    # swaps, refunds and failures through the API
+# the retention job (retention/lfswap_retention.py) on regtest: run.mjs
+# retention-setup and ui.mjs rescue-start make swaps of every ending; age
+# them in the database (UPDATE ... "updatedAt" - interval '100 days'); run
+# the job with --deploy deploy/regtest --mode on --knots-arg=-regtest
+# --knots-arg=-rpcuser=lab --knots-arg=-rpcpassword=lab; restart boltz;
+# then run.mjs retention-check (RETENTION_CLEARED=<ids>) and ui.mjs
+# rescue-finish. Again after any upstream merge.
 python3 deploy/rebalance/regtest.py         # the rebalancer with the regtest wallets
 # the web app through the production nginx config, in Chrome (the donate
 # scenario also needs VITE_DONATION_ADDRESS and VITE_OUR_NODE=pubkey@host:port):

@@ -30,6 +30,13 @@ up)
 		-keyout "$state/site.key" -out "$state/site.crt" 2>/dev/null
 	: > "$state/maintenance.conf"
 	: > "$state/preview.conf"
+	# The logs' privacy (lightningfork.conf): the tag script, a key, the
+	# module loaded (the image's nginx.conf does not), and the logs here
+	cp "$here/../nginx/lfswap_privacy.js" "$state/"
+	printf 'js_var $lfswap_tag_key "%s";\n' "$(head -c 32 /dev/urandom | od -An -tx1 | tr -d ' \n')" > "$state/tag-key.conf"
+	docker run --rm "$NGINX_IMAGE" cat /etc/nginx/nginx.conf |
+		sed '1i load_module modules/ngx_http_js_module.so;' > "$state/nginx.conf"
+	mkdir -p "$state/logs" && chmod 777 "$state/logs"
 	sed -e "s#/etc/letsencrypt/live/lightningfork.com/fullchain.pem#/t/site.crt#" \
 		-e "s#/etc/letsencrypt/live/lightningfork.com/privkey.pem#/t/site.key#" \
 		-e "s#/etc/nginx/lfswap-maintenance.conf#/t/maintenance.conf#" \
@@ -47,12 +54,18 @@ up)
 		-e "s#listen 80 default_server;#listen 127.0.0.1:18080 default_server;#" \
 		-e "s#server_name lightningfork.com www.lightningfork.com;#server_name lightningfork.com www.lightningfork.com localhost;#" \
 		-e "s#wss://lightningfork.com#wss://localhost:18443#" \
+		-e "s#/etc/nginx/njs/lfswap_privacy.js#/t/lfswap_privacy.js#" \
+		-e "s#/etc/nginx/lfswap-tag-key.conf#/t/tag-key.conf#" \
+		-e "s#/var/log/nginx/access.log#/logs/access.log#" \
+		-e "s#/var/log/lfswap/threat.log#/logs/threat.log#" \
 		"$here/../nginx/lightningfork.conf" > "$state/site.conf"
 	chmod -R a+rX "$state"
 	# Host networking: the regtest backend listens on the host's 127.0.0.1
 	docker run -d --name "$name" --network host \
 		-v "$state:/t:ro" -v "$dist:/dist:ro" "${graph_mount[@]}" \
-		-v "$state/site.conf:/etc/nginx/conf.d/default.conf:ro" "$NGINX_IMAGE" >/dev/null
+		-v "$state/site.conf:/etc/nginx/conf.d/default.conf:ro" \
+		-v "$state/nginx.conf:/etc/nginx/nginx.conf:ro" -v "$state/logs:/logs" \
+		"$NGINX_IMAGE" >/dev/null
 	sleep 1
 	docker exec "$name" nginx -t 2>&1 | tail -1
 	echo "https://localhost:18443"

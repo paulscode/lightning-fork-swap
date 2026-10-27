@@ -27,6 +27,7 @@ import {
 import { Transaction, address, crypto, initEccLib, networks, payments, script as bscript } from 'bitcoinjs-lib';
 import { execFileSync, spawn } from 'node:child_process';
 import { randomBytes } from 'node:crypto';
+import { readFileSync, writeFileSync } from 'node:fs';
 import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { ECPairFactory } from 'ecpair';
@@ -437,6 +438,82 @@ const timeoutRefund = scenario('timeout-refund', async () => {
   return `refunded ${swapOutput.value} sat by the timeout path in ${id.slice(0, 16)}… (mined ${Math.max(toMine, 0)} blocks)`;
 });
 
+// --- the retention job's rehearsal (deploy/retention) ----------------------
+// retention-setup makes the swaps whose endings the job must tell apart and
+// writes them to RETENTION_STATE; the rehearsal then ages them in the
+// database and runs the job; retention-check asks for each afterwards, and
+// refunds the one whose coins must have been kept whole.
+const RETENTION_STATE = process.env.RETENTION_STATE ?? '/tmp/lfswap-retention.json';
+
+const retentionSetup = scenario('retention-setup', async () => {
+  // A reverse swap never paid, and a submarine swap never funded
+  const unpaid = await createReverse(30_000);
+  const unfunded = await createSubmarine(lncli('lnd-user', 'addinvoice', '--amt', '25000').payment_request);
+  // A reverse swap paid, locked up by us and never claimed: we refund it
+  const abandoned = await createReverse(40_000);
+  payInBackground(abandoned.swap.invoice);
+  await waitStatus(abandoned.swap.id, ['transaction.mempool', 'transaction.confirmed'], { mineEvery: 3000 });
+  // Too little locked: refused, and the user's coins stay where they are
+  const under = await refundSetup(35_000);
+  const underTx = lockUp(under.swap, under.swap.expectedAmount - 5000);
+  mine(1);
+  await waitStatus(under.swap.id, ['transaction.lockupFailed', 'invoice.failedToPay']);
+
+  // Past every timeout, block by block in hundreds
+  const until = Math.max(unpaid.swap.timeoutBlockHeight, unfunded.swap.timeoutBlockHeight,
+    abandoned.swap.timeoutBlockHeight) + 1;
+  for (let left = until - height(); left > 0; left -= 100) {
+    mine(Math.min(100, left));
+    await sleep(3000);
+  }
+  await waitStatus(abandoned.swap.id, 'transaction.refunded', { mineEvery: 3000, timeoutMs: 180_000 });
+  const ended = {
+    unpaid: await waitStatus(unpaid.swap.id, ['swap.expired', 'invoice.expired'], { mineEvery: 3000 }),
+    unfunded: await waitStatus(unfunded.swap.id, 'swap.expired', { mineEvery: 3000 }),
+  };
+  writeFileSync(RETENTION_STATE, JSON.stringify({
+    unpaid: unpaid.swap.id,
+    unfunded: unfunded.swap.id,
+    abandoned: abandoned.swap.id,
+    under: { swap: under.swap, txid: underTx, key: under.keys.privateKey.toString('hex') },
+  }, null, 2));
+  return `reverse unpaid (${ended.unpaid}), submarine unfunded (${ended.unfunded}), `
+    + `reverse refunded by us, submarine refused with its coins locked (${under.swap.id}); `
+    + `written to ${RETENTION_STATE}`;
+});
+
+const retentionCheck = scenario('retention-check', async () => {
+  const state = JSON.parse(readFileSync(RETENTION_STATE, 'utf8'));
+  const ids = (process.env.RETENTION_CLEARED ?? '').split(',').filter(Boolean);
+  const seen = [];
+  for (const id of ids) {
+    const { status: s } = await status(id);
+    if (!s) throw new Error(`no status for cleared swap ${id}`);
+    seen.push(`${id}: ${s}`);
+  }
+  // Kept whole: the user can still get their coins back, cooperatively
+  const { swap, txid } = state.under;
+  const keys = ECPair.fromPrivateKey(Buffer.from(state.under.key, 'hex'));
+  const { lockupTx, swapOutput, musig, boltzPublicKey } = await findLockup(swap, keys, txid);
+  const destination = lncli('lnd-user', 'newaddress', 'p2tr').address;
+  const refundTx = targetFee(2, (fee) =>
+    constructRefundTransaction(
+      [{ ...swapOutput, keys, cooperative: true, type: OutputType.Taproot, txHash: lockupTx.getHash() }],
+      address.toOutputScript(destination, network), 0, fee, true));
+  const sig = (await axios.post(`${API}/v2/swap/submarine/${swap.id}/refund`, {
+    index: 0, transaction: refundTx.toHex(), pubNonce: Buffer.from(musig.getPublicNonce()).toString('hex'),
+  })).data;
+  musig.aggregateNonces([[boltzPublicKey, Buffer.from(sig.pubNonce, 'hex')]]);
+  musig.initializeSession(
+    refundTx.hashForWitnessV1(0, [swapOutput.script], [swapOutput.value], Transaction.SIGHASH_DEFAULT));
+  musig.addPartial(boltzPublicKey, Buffer.from(sig.partialSignature, 'hex'));
+  musig.signPartial();
+  refundTx.ins[0].witness = [musig.aggregatePartials()];
+  const { id } = (await axios.post(`${API}/v2/chain/BTC/transaction`, { hex: refundTx.toHex() })).data;
+  mine(1);
+  return `cleared swaps answer (${seen.join('; ')}); the kept swap ${swap.id} was refunded cooperatively in ${id.slice(0, 16)}…`;
+});
+
 const rescan = scenario('rescan-after-downtime', async () => {
   const amount = 25_000;
   const invoice = lncli('lnd-user', 'addinvoice', '--amt', String(amount)).payment_request;
@@ -583,7 +660,7 @@ await ensureChannels();
 
 const all = [rdtsActive, coinbaseLockup, reverse, submarine, refusesSha256Invoice, cooperativeRefund, timeoutRefund, rescan, unrecordedLockupRestart, unrecordedLockupBlock];
 const wanted = process.argv.slice(2);
-const probes = [lateCancel];
+const probes = [lateCancel, retentionSetup, retentionCheck];
 const chosen = wanted.length ? [...all, ...probes].filter((s) => wanted.includes(s.name)) : all;
 
 for (const s of chosen) {

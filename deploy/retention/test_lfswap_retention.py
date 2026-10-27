@@ -92,7 +92,7 @@ class Swaps(unittest.TestCase):
         for kept in ("holding1", "ourlockup", "bad'id"):
             self.assertNotIn(kept, batch)
         for cleared in ('"refundPublicKey" = NULL', '"claimAddress" = NULL',
-                        "invoice = ''", 'DELETE FROM "lightningPayments"',
+                        "invoice = 'redacted:' || id", 'DELETE FROM "lightningPayments"',
                         'DELETE FROM "reverseRoutingHints"'):
             self.assertIn(cleared, batch)
         for kept_column in ('"onchainAmount"', "fee =", "status ="):

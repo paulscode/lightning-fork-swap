@@ -14,7 +14,7 @@
 // VITE_DONATION_ADDRESS and VITE_OUR_NODE in the build (see it below).
 
 import { execFileSync } from 'node:child_process';
-import { mkdirSync, readFileSync } from 'node:fs';
+import { mkdirSync, readFileSync, writeFileSync } from 'node:fs';
 import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { chromium, devices } from 'playwright-core';
@@ -269,35 +269,33 @@ scenarios.refund = async () => {
   return `refunded ${refunded} of ${locked} sat through the app's refund form`;
 };
 
-// A browser with nothing but the rescue key file finds a failed swap made in
-// another browser and refunds it
-scenarios.rescue = async () => {
-  const keyFile = join(SHOTS, 'rescue-key-rescue.json');
-  let failedId;
-  let failedLocked;
-  {
-    const { page, context } = await newPage();
-    const { swap } = await createSubmarine(page, 30_500, 30_000, keyFile);
-    failedId = swap.id;
-    failedLocked = swap.expectedAmount - 4000;
-    knots('-rpcwallet=boltz', 'sendtoaddress', swap.address, (failedLocked / 1e8).toFixed(8));
-    await waitFor('the lockup to be refused', async () => {
-      const status = await swapStatus(swap.id);
-      return status === 'transaction.lockupFailed' && status;
-    }, { mineEvery: 3000 });
-    await context.close();
-  }
+// A failed swap made in one browser with a rescue key: the lockup is too
+// small, so the service refuses it and the coins wait for a refund
+const failedWithRescueKey = async (keyFile) => {
+  const { page, context } = await newPage();
+  const { swap } = await createSubmarine(page, 30_500, 30_000, keyFile);
+  const locked = swap.expectedAmount - 4000;
+  knots('-rpcwallet=boltz', 'sendtoaddress', swap.address, (locked / 1e8).toFixed(8));
+  await waitFor('the lockup to be refused', async () => {
+    const status = await swapStatus(swap.id);
+    return status === 'transaction.lockupFailed' && status;
+  }, { mineEvery: 3000 });
+  await context.close();
+  return { id: swap.id, locked };
+};
 
+// Another browser, with nothing but the key file, finds it and refunds it
+const rescueWithKeyFile = async (failedId, failedLocked, keyFile, shot) => {
   const { page, problems } = await newPage();
   await page.goto(`${SITE}/rescue`, { waitUntil: 'networkidle' });
   await page.setInputFiles('#refundUpload', keyFile);
   await page.getByRole('button', { name: 'Rescue', exact: true }).click();
   const item = page.locator(`[data-testid=swaplist-item-${failedId}]`);
   await item.waitFor({ timeout: 30_000 });
-  await screenshot(page, 'rescue-listed');
+  await screenshot(page, `${shot}-listed`);
   await item.getByText('Refund').click();
   await page.locator('#refundAddress').waitFor();
-  await dump(page, 'rescue-refund');
+  await dump(page, `${shot}-refund`);
 
   const address = lncli('lnd-user', 'newaddress', 'p2tr').address;
   await page.fill('#refundAddress', address);
@@ -307,13 +305,36 @@ scenarios.rescue = async () => {
     return receivedBy(address);
   }, { timeoutMs: 60_000 });
   await page.waitForTimeout(1500);
-  await screenshot(page, 'rescue-done');
-  assertNoProblems(problems, 'rescue');
+  await screenshot(page, `${shot}-done`);
+  assertNoProblems(problems, shot);
   // At most the app's fee limit for a small swap
   if (refunded >= failedLocked || refunded < failedLocked - 3000) {
     throw new Error(`refunded ${refunded} sat of ${failedLocked}`);
   }
   return `refunded ${refunded} of ${failedLocked} sat of swap ${failedId} from the rescue page, with only the key file`;
+};
+
+// A browser with nothing but the rescue key file finds a failed swap made in
+// another browser and refunds it
+scenarios.rescue = async () => {
+  const keyFile = join(SHOTS, 'rescue-key-rescue.json');
+  const { id, locked } = await failedWithRescueKey(keyFile);
+  return rescueWithKeyFile(id, locked, keyFile, 'rescue');
+};
+
+// The same in two steps, for the retention job's rehearsal: the swap is
+// made, aged and passed through the job between them, and must still be
+// found and refunded (RETENTION_UI_STATE keeps it in between)
+const RESCUE_STATE = process.env.RETENTION_UI_STATE ?? '/tmp/lfswap-retention-ui.json';
+scenarios['rescue-start'] = async () => {
+  const keyFile = join(SHOTS, 'rescue-key-retention.json');
+  const { id, locked } = await failedWithRescueKey(keyFile);
+  writeFileSync(RESCUE_STATE, JSON.stringify({ id, locked, keyFile }));
+  return `swap ${id} refused with ${locked} sat locked; written to ${RESCUE_STATE}`;
+};
+scenarios['rescue-finish'] = async () => {
+  const { id, locked, keyFile } = JSON.parse(readFileSync(RESCUE_STATE, 'utf8'));
+  return rescueWithKeyFile(id, locked, keyFile, 'rescue-later');
 };
 
 // The donation window, on a desktop and on a phone, under the production
@@ -521,9 +542,11 @@ scenarios.home = async () => {
 // --- run -------------------------------------------------------------------
 
 const only = process.argv.slice(2);
+// Run only when named: the retention rehearsal's two halves
+const byNameOnly = new Set(['rescue-start', 'rescue-finish']);
 let failed = 0;
 for (const [name, run] of Object.entries(scenarios)) {
-  if (only.length > 0 && !only.includes(name)) continue;
+  if (only.length > 0 ? !only.includes(name) : byNameOnly.has(name)) continue;
   const start = Date.now();
   try {
     const detail = await run();

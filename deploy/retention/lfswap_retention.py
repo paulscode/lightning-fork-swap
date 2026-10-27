@@ -31,6 +31,9 @@ what it would change, "on" changes it. The referral (2) and the donations
 
    lfswap_retention.py              as RETENTION_MODE says
    lfswap_retention.py --report     count only
+   lfswap_retention.py --deploy deploy/regtest --mode on \
+       --knots-arg=-regtest --knots-arg=-rpcuser=lab --knots-arg=-rpcpassword=lab
+                                    the regtest service (rehearsals)
 """
 
 import argparse
@@ -77,9 +80,11 @@ def returned(rows):
 
 
 class Retention:
-    def __init__(self, monitor, mode):
+    def __init__(self, monitor, mode, knots_args=()):
         self.m = monitor
         self.mode = mode
+        # Before the command: what another node needs (regtest's login)
+        self.knots_args = tuple(knots_args)
         self.lines = []
         # What report mode left in place that is past its time
         self.overdue = 0
@@ -113,7 +118,8 @@ class Retention:
             # The user's lockup: gone from the UTXO set means spent (claimed
             # or refunded); still there means they may still refund it
             if HEX.match(txid) and int(vout) >= 0 and \
-                    not self.m.knots("gettxout", txid, str(vout)).strip():
+                    not self.m.knots(*self.knots_args, "gettxout", txid,
+                                     str(vout)).strip():
                 due.append((swap_id, preimage_hash))
             else:
                 kept += 1
@@ -125,7 +131,7 @@ class Retention:
             'FROM "reverseSwaps" '
             f'WHERE status IN ({quoted(REVERSE_FINAL)}) '
             f'AND "updatedAt" < now() - interval \'{SWAP_DAYS} days\' '
-            'AND (invoice <> \'\' OR "claimPublicKey" IS NOT NULL '
+            'AND (invoice NOT LIKE \'redacted:%\' OR "claimPublicKey" IS NOT NULL '
             'OR "claimAddress" IS NOT NULL OR "redeemScript" IS NOT NULL '
             'OR preimage IS NOT NULL OR "minerFeeInvoice" IS NOT NULL)')
         due, kept = [], 0
@@ -166,7 +172,10 @@ class Retention:
         if reverse:
             ids = quoted(reverse)
             sql += [
-                'UPDATE "reverseSwaps" SET invoice = \'\', preimage = NULL, '
+                # The invoice may not be NULL, and is unique: a placeholder
+                # of the swap's own
+                'UPDATE "reverseSwaps" SET invoice = \'redacted:\' || id, '
+                'preimage = NULL, '
                 '"claimPublicKey" = NULL, "claimAddress" = NULL, '
                 '"redeemScript" = NULL, "minerFeeInvoice" = NULL, '
                 f'"minerFeeInvoicePreimage" = NULL WHERE id IN ({ids});',
@@ -233,18 +242,25 @@ def main(argv=None, runner=None, now=None):
     parser = argparse.ArgumentParser()
     parser.add_argument("--report", action="store_true",
                         help="count only, whatever RETENTION_MODE says")
+    parser.add_argument("--deploy", default=DEPLOY,
+                        help="the compose project's folder (with its .env)")
+    parser.add_argument("--mode", choices=("report", "on"),
+                        help="instead of RETENTION_MODE")
+    parser.add_argument("--knots-arg", action="append", default=[],
+                        help="an argument for bitcoin-cli before the command")
     args = parser.parse_args(argv)
-    env = lfswap_monitor.load_env(os.path.join(DEPLOY, ".env"))
-    mode = "report" if args.report else env.get("RETENTION_MODE", "report")
+    env = lfswap_monitor.load_env(os.path.join(args.deploy, ".env"))
+    mode = "report" if args.report else (
+        args.mode or env.get("RETENTION_MODE", "report"))
     if mode not in ("report", "on"):
         print(f"RETENTION_MODE must be report or on, not {mode}",
               file=sys.stderr)
         return 1
     now = now or datetime.datetime.now(datetime.timezone.utc)
-    monitor = lfswap_monitor.Monitor(runner or lfswap_monitor.Runner(DEPLOY),
-                                     env, now)
+    monitor = lfswap_monitor.Monitor(
+        runner or lfswap_monitor.Runner(args.deploy), env, now)
     stamp = now.strftime("%Y-%m-%dT%H:%M:%SZ")
-    retention = Retention(monitor, mode)
+    retention = Retention(monitor, mode, args.knots_arg)
     for line in retention.run():
         print(f"{stamp} [{mode}] {line}")
     # The privacy page says these go: report mode must not keep them quietly
