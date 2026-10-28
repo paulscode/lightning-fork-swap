@@ -178,6 +178,12 @@ Two kinds of fee, two levers:
   other, make that direction a little dearer and the other cheaper; demand
   moves to where the service has room. After changing them:
   `./scripts/setup.sh && docker compose restart boltz`.
+  The web app refuses a swap that costs the user more than 5 % plus 10,000
+  sat in all (`maxSwapCost` in the web app's `src/utils/validation.ts`), as
+  a guard against a server asking too much: raising a fee anywhere near
+  that needs the app changed first. (At 1 %, the 2 % reverse fee made every
+  reverse swap from about 985,000 sat up fail between 2026-10-15 and the
+  fix.)
 - **Routing fees** (lnd's channel policies): others route payments through
   the swap node and pay for it, which also moves balance between its
   channels. Raise fees on channels whose outbound you want to keep, lower them
