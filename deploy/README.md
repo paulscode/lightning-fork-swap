@@ -46,7 +46,8 @@ host works with 3 GB of swap added and smaller limits.
    `0000000000000050c1e5f69672f459293be14f46e5a494e7a8c8541396f18eeb`.
 4. `./scripts/install-host.sh firewall` (undoes itself after two minutes
    unless you run `firewall-confirm` from a new SSH session), then `tls`, then
-   `nginx` (creates the preview password).
+   `nginx` (creates the preview password), then `settle` (after a reboot,
+   restarts the backend once if it came up before lnd and offers no swaps).
 5. `./scripts/init-wallets.sh`: the Knots wallet and the lnd wallet; seeds go
    to `/srv/lfswap/secrets`. It also bakes the lnd macaroons of the backend
    and of the donation watcher (`scripts/bake-macaroon.sh`), each limited to

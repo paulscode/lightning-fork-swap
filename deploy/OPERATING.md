@@ -533,6 +533,7 @@ coins held (not yet swept) pass `MONITOR_SHA256_MAX_SAT` (5,000,000 sat).
 | As it comes | Telegram alerts: each says what is wrong; the README's Alerts section lists them (a late refund: §7; donations: §8) |
 | Weekly | the Monday report: rebalance (§4), adjust fees (§5) |
 | After any channel open or close | copy `channel.backup` offline |
+| After recreating lnd (`docker compose up -d lnd`) | `./scripts/settle-backend.sh`: waits for lnd, then restarts the backend only if it offers no swaps (it gives up on an lnd that is still starting when it starts itself; a reboot runs this by itself, `lfswap-settle.service`) |
 | Monthly, or as you like | take earnings out (§6) |
 | Before raising limits or the hot wallet | weeks without trouble |
 

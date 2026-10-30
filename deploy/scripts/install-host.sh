@@ -8,6 +8,8 @@
 #                              automatic undo unless confirmed)
 #   install-host.sh tls        obtain the Let's Encrypt certificate
 #   install-host.sh nginx      install the site and a preview password
+#   install-host.sh settle     at boot, restart the backend once if it started
+#                              before lnd and offers no swaps
 set -euo pipefail
 cd "$(dirname "$0")/.."
 DOMAIN=${DOMAIN:-lightningfork.com}
@@ -81,8 +83,31 @@ nginx)
 	# limit_req zone, say) passes nginx -t and silently keeps the old config.
 	systemctl restart nginx
 	;;
+settle)
+	# At boot, wait for lnd and restart the backend once if it came up first
+	# and offers no swaps (scripts/settle-backend.sh). Enabled, not started:
+	# it runs at the next boot.
+	cat > /etc/systemd/system/lfswap-settle.service <<UNIT
+[Unit]
+Description=Lightning Fork Swap: make sure the backend is using lnd after boot
+Requires=docker.service
+After=docker.service network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+ExecStart=$PWD/scripts/settle-backend.sh
+TimeoutStartSec=45min
+
+[Install]
+WantedBy=multi-user.target
+UNIT
+	systemctl daemon-reload
+	systemctl enable lfswap-settle.service >/dev/null 2>&1
+	echo "lfswap-settle.service enabled; it runs at the next boot (or: systemctl start lfswap-settle)"
+	;;
 *)
-	echo "usage: $0 firewall|firewall-confirm|tls|nginx" >&2
+	echo "usage: $0 firewall|firewall-confirm|tls|nginx|settle" >&2
 	exit 1
 	;;
 esac
