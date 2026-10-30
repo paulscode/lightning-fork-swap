@@ -99,6 +99,19 @@ services:
       - "9735:9735"
       - "127.0.0.1:10009:10009"
       - "127.0.0.1:8080:8080"
+    # Plain TCP listeners instead of Multipath TCP, which Go 1.24 and later
+    # use by default. The published remote-root exploit for the kernel bug
+    # CVE-2026-98432 needs an MPTCP listener, and 9735 is open to the
+    # internet. Two layers, either enough alone: GODEBUG for lnd, and the
+    # sysctl for anything else opening a socket in this network namespace
+    # (the host's own value does not reach it). GODEBUG replaces the image's
+    # value, so its netdns=cgo is carried over. The kernel bug itself is
+    # fixed by a kernel update, and the IP-options drop in nftables.conf
+    # blocks its trigger on every port meanwhile.
+    environment:
+      GODEBUG: netdns=cgo,multipathtcp=0
+    sysctls:
+      net.mptcp.enabled: 0
     volumes:
       - ${LFSWAP_ROOT:-/srv/lfswap}/lnd:/root/.lnd
     logging: *logging
