@@ -114,7 +114,9 @@ claim, or paid while recorded as failed; backend log lines such as a lockup
 that may have been broadcast before an error; the wallet below
 `MONITOR_MIN_WALLET_SAT`; the disk over 90 %, the host stalling on IO or
 memory; a `channel.backup` the hourly copy missed; the TLS certificate close
-to expiry. The rebalancer reports its own moves and problems the same way. With a donation address set: the donation services down, the
+to expiry; the daily jobs not doing their work (the retention job without a
+success for two days, the log key older than a day, the rebalancer
+blocked). The rebalancer reports its own moves and problems the same way. With a donation address set: the donation services down, the
 donation watcher not passing for 30 minutes, and once each, a donation sent
 without replay protection, one replayed on the SHA256 chain, and one that
 could not be judged in a day. With channel donations on: their worker

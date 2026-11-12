@@ -81,6 +81,9 @@ LABEL = "lfswap-rebalance"
 PRE_LOCKUP = ("swap.created", "minerfee.paid")
 # A move unconfirmed after this many blocks is bumped
 BUMP_AFTER_BLOCKS = 6
+LND_MIN_CONFS = 6
+# An intent whose transaction was not found is dropped after this long
+INTENT_GIVE_UP_SECONDS = 3600
 KEEP_MOVES_DAYS = 400
 
 
@@ -274,26 +277,53 @@ class Wallets:
         return int(json.loads(self.m.knots("getblockchaininfo"))["blocks"])
 
     def hot_coins(self):
-        """Confirmed, spendable coins of the hot wallet."""
+        """Confirmed, spendable coins of the hot wallet: what a move
+        spends."""
         return [c for c in json.loads(self.knots("listunspent", "1"))
                 if c.get("spendable", True) and c.get("safe", True)]
 
+    def hot_balance(self):
+        """The hot wallet's balance for the decisions: its confirmed coins
+        and its own unconfirmed change ("safe"; not coins others are still
+        sending), so that a lockup's change waiting for a block does not
+        look like an empty wallet."""
+        return sum(sat(c["amount"])
+                   for c in json.loads(self.knots("listunspent", "0"))
+                   if c.get("spendable", True) and c.get("safe", True))
+
+    def find_move(self, address):
+        """The transaction of a move to or from the hot wallet that paid
+        `address` (every move involves the hot wallet), unconfirmed ones
+        included; None when there is none."""
+        for tx in json.loads(self.knots("listtransactions", "*", "200",
+                                        "0", "true")):
+            if tx.get("address") == address and \
+                    tx.get("category") in ("send", "receive"):
+                return tx["txid"]
+        return None
+
     def committed(self):
         """What reverse swaps about to lock up will take from the hot
-        wallet, and whether one was created in the last 15 minutes."""
+        wallet, and whether one was created in the last 15 minutes. Only
+        swaps created in the last 30 minutes count: a reverse swap is paid
+        within minutes or not at all, and unpaid ones (anyone can create
+        them) must not steer the moves."""
         states = ", ".join(f"'{s}'" for s in PRE_LOCKUP)
         rows = self.m.psql(
             'SELECT coalesce(sum("onchainAmount"), 0), '
             "coalesce(sum(CASE WHEN \"createdAt\" > now() - interval "
             "'15 minutes' THEN 1 ELSE 0 END), 0) "
-            f'FROM "reverseSwaps" WHERE status IN ({states})')
+            f'FROM "reverseSwaps" WHERE status IN ({states}) '
+            "AND \"createdAt\" > now() - interval '30 minutes'")
         return int(rows[0][0]), int(rows[0][1]) > 0
 
     def lnd_balance(self):
-        """lnd's confirmed balance and its anchor reserve. Leased coins
-        (channel donations) are not in the confirmed balance."""
+        """lnd's balance, its own unconfirmed change included (a channel
+        open's change waiting for a block is not an empty wallet), and its
+        anchor reserve. Leased coins (channel donations) are not in it."""
         w = json.loads(self.m.lncli("walletbalance"))
-        return (int(w.get("confirmed_balance", 0)),
+        return (int(w.get("confirmed_balance", 0))
+                + int(w.get("unconfirmed_balance", 0)),
                 int(w.get("reserved_balance_anchor_chan", 0)))
 
     def inbound(self):
@@ -333,7 +363,10 @@ class Wallets:
         out = json.loads(self.m.lncli(
             "sendcoins", "--addr", address, "--amt", str(amount),
             "--sat_per_vbyte", str(max(1, int(fee + 0.999))),
-            "--min_confs", "1", "--label", LABEL, "--force"))
+            # 6: a channel donor's coins are leased by the donations worker
+            # at 3 confirmations; before that they are in the wallet like
+            # any other and must not be moved
+            "--min_confs", str(LND_MIN_CONFS), "--label", LABEL, "--force"))
         return out["txid"]
 
     def send_from_hot(self, address, amount, fee, coins):
@@ -400,12 +433,14 @@ class Wallets:
 # --- a run -------------------------------------------------------------------
 
 class Run:
-    def __init__(self, wallets, cfg, state, now, mode):
+    def __init__(self, wallets, cfg, state, now, mode, save=lambda: None):
         self.w = wallets
         self.cfg = cfg
         self.state = state
         self.now = now
         self.mode = mode
+        # Writes the state now (before a send: see send())
+        self.save = save
         self.messages = []  # (title, text) to send
         self.lines = []     # for the log
 
@@ -418,7 +453,7 @@ class Run:
         """Balances, bands and the move the rules call for."""
         coins = self.w.hot_coins()
         committed, recent = self.w.committed()
-        hot = sum(sat(c["amount"]) for c in coins) - committed
+        hot = self.w.hot_balance() - committed
         lnd_confirmed, reserve = self.w.lnd_balance()
         lnd = lnd_confirmed - reserve
         inbound = self.w.inbound()
@@ -440,7 +475,19 @@ class Run:
         flight = self.state.get("inflight")
         if not flight:
             return False
-        confs, tx = self.w.confirmations(flight["txid"])
+        # Every version of the move (a bump replaces it): the one that
+        # confirms is the move
+        versions = flight.setdefault("txids", [flight["txid"]])
+        if flight["txid"] not in versions:
+            versions.append(flight["txid"])
+        seen = [(txid, *self.w.confirmations(txid)) for txid in versions]
+        confirmed = [v for v in seen if v[1] > 0]
+        if confirmed:
+            flight["txid"], confs, tx = confirmed[0]
+        else:
+            confs = min(v[1] for v in seen) if all(v[1] < 0 for v in seen) \
+                else 0
+            tx = seen[-1][2]
         if confs > 0:
             fee = self.w.fee_paid(flight, tx)
             self.state.setdefault("moves", []).append(
@@ -468,16 +515,46 @@ class Run:
             else:
                 try:
                     flight["txid"] = self.w.bump(flight, fee)
+                    if flight["txid"] not in flight["txids"]:
+                        flight["txids"].append(flight["txid"])
                     flight["fee_rate"] = fee
                     flight["height"] = self.w.height()
                     self.say(f"bumped the move to {fee:g} sat/vB after "
                              f"{waited} blocks: {flight['txid']}")
                 except Exception as error:  # noqa: BLE001
-                    self.say(f"could not bump the move {flight['txid']}: "
-                             f"{str(error)[:300]}")
+                    text = (f"could not bump the move {flight['txid']}: "
+                            f"{str(error)[:300]}")
+                    self.say(text, alert=self._new(f"bump:{flight['txid']}"))
+        return True
+
+    def resolve_intent(self):
+        """A move whose send was started but not recorded (a timeout, an
+        error after the broadcast, a full disk): its transaction is looked
+        for before anything else is decided, so it is never sent twice.
+        True while it is still unresolved."""
+        intent = self.state.get("intent")
+        if not intent:
+            return False
+        txid = self.w.find_move(intent["address"])
+        if txid is not None:
+            self.state.pop("intent")
+            self.state["inflight"] = {
+                **{k: v for k, v in intent.items() if k != "address"},
+                "txid": txid, "txids": [txid]}
+            self.say(f"found the move whose send was not recorded: {txid}")
+            return False
+        if self.now.timestamp() - intent["ts"] > INTENT_GIVE_UP_SECONDS:
+            self.state.pop("intent")
+            self.say("a move started an hour ago was not sent (no "
+                     f"transaction pays {intent['address']}); moving on")
+            return False
+        self.say("waiting: a move was started and its transaction is not "
+                 "seen yet", alert=False)
         return True
 
     def run(self):
+        if self.resolve_intent():
+            return
         if self.state.get("blocked"):
             self.say(f"stopped: the move {self.state['blocked']} conflicted; "
                      "remove \"blocked\" from the state file once checked",
@@ -535,21 +612,41 @@ class Run:
     def send(self, move, fee, seen):
         try:
             if move.dest == HOT:
-                txid = self.w.send_from_lnd(self.w.hot_address(), move.amount,
-                                            fee)
+                address = self.w.hot_address()
             elif move.dest == LND:
-                txid = self.w.send_from_hot(self.w.lnd_address(), move.amount,
-                                            fee, seen["coins"])
+                address = self.w.lnd_address()
             else:
-                txid = self.w.send_from_hot(self.cfg.cold_address,
-                                            move.amount, fee, seen["coins"])
+                address = self.cfg.cold_address
+            height = self.w.height()
         except Exception as error:  # noqa: BLE001
-            self.say(f"could not move {move.describe()}: {str(error)[:300]}")
+            text = f"could not move {move.describe()}: {str(error)[:300]}"
+            self.say(text, alert=self._new(f"move:{move.source}>{move.dest}"))
             return
+        # Recorded before the send: if what follows fails after the
+        # broadcast, the next run finds the transaction instead of sending
+        # again (resolve_intent)
+        self.state["intent"] = {
+            "ts": self.now.timestamp(), "source": move.source,
+            "dest": move.dest, "amount": move.amount, "rule": move.rule,
+            "fee_rate": fee, "height": height, "address": address}
+        self.save()
+        try:
+            if move.dest == HOT:
+                txid = self.w.send_from_lnd(address, move.amount, fee)
+            else:
+                txid = self.w.send_from_hot(address, move.amount, fee,
+                                            seen["coins"])
+        except Exception as error:  # noqa: BLE001
+            # Kept: a send that timed out may still have gone out
+            text = f"could not move {move.describe()}: {str(error)[:300]}"
+            self.say(text, alert=self._new(f"move:{move.source}>{move.dest}"))
+            return
+        self.state.pop("intent", None)
         self.state["inflight"] = {
             "ts": self.now.timestamp(), "source": move.source,
             "dest": move.dest, "amount": move.amount, "rule": move.rule,
-            "txid": txid, "fee_rate": fee, "height": self.w.height()}
+            "txid": txid, "txids": [txid], "fee_rate": fee,
+            "height": height}
         self.state.pop("dry", None)
         self._last(f"moved {move.describe()}")
         self.say(f"moved {move.describe()}, at {fee:g} sat/vB: {txid}")
@@ -688,7 +785,9 @@ def main(argv, runner=None, now=None):
         state = load_state(state_path)
         monitor = lfswap_monitor.Monitor(
             runner or lfswap_monitor.Runner(DEPLOY), env, now, network)
-        run = Run(Wallets(monitor), cfg, state, now, mode)
+        save = ((lambda: None) if "--dry-run" in argv
+                else (lambda: save_state(state_path, state)))
+        run = Run(Wallets(monitor), cfg, state, now, mode, save=save)
         if "--status" in argv:
             seen = run.look()
             print(f"hot wallet: {seen['hot']:,} spendable "
@@ -703,7 +802,9 @@ def main(argv, runner=None, now=None):
         try:
             run.run()
         except Exception as error:  # noqa: BLE001
-            run.say(f"the run failed: {str(error)[:300]}")
+            # Once a day, not every half hour (Knots loading, lnd locked)
+            run.say(f"the run failed: {str(error)[:300]}",
+                    alert=run._new(f"failed:{type(error).__name__}"))
         for line in run.lines:
             print(f"{stamp} {line}")
         if "--dry-run" not in argv:

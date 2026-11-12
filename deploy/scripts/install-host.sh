@@ -63,8 +63,15 @@ nginx)
 	scripts/log-key.sh --if-none
 	install -d -m 0750 -g adm /var/log/lfswap
 	install -m 0644 logrotate/lfswap /etc/logrotate.d/lfswap
-	# nginx's access and error logs: 10 days (Debian keeps 14)
-	sed -i -E 's/^(\s*rotate)\s+[0-9]+/\1 10/' /etc/logrotate.d/nginx
+	# nginx's access and error logs: 10 days (Debian keeps 14): the
+	# current file and 9 rotated ones
+	sed -i -E 's/^(\s*rotate)\s+[0-9]+/\1 9/' /etc/logrotate.d/nginx
+	# The containers log to the journal: 10 days there too (also set by
+	# provision-host.sh; a host set up by hand gets it here)
+	mkdir -p /etc/systemd/journald.conf.d
+	printf '[Journal]\nSystemMaxUse=200M\nMaxRetentionSec=10day\nMaxFileSec=1day\n' \
+		> /etc/systemd/journald.conf.d/lfswap.conf
+	systemctl restart systemd-journald
 	# Failed SSH logins (attackers' addresses): weekly, 4 kept, not a month's worth in one file
 	if [ -f /etc/logrotate.d/btmp ]; then
 		sed -i -E 's/^(\s*)monthly/\1weekly/; s/^(\s*rotate)\s+[0-9]+/\1 4/' /etc/logrotate.d/btmp

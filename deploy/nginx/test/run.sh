@@ -38,6 +38,9 @@ mkdir -p graph/v3/node
 echo '{"version": 3}' > graph/meta.json
 echo '{"nodes": {}}' > graph/v3/overview.json
 gzip -k graph/v3/overview.json
+# What a compromised graph service might write: never served
+echo '<script>alert(1)</script>' > graph/v3/evil.html
+echo 'alert(1)' > graph/v3/evil.js
 : > maintenance.conf
 # The privacy logs: the tag script, a key, and log files the tests can read
 cp "$here/../lfswap_privacy.js" .

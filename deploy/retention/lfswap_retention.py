@@ -26,7 +26,9 @@ what it would change, "on" changes it. The referral (2) and the donations
    one's inputs and at-risk addresses after 400 days (its rechecks end
    after a year; the verdict, txid and amount stay; a replayed one is kept
    for its return); a SHA256-chain donation's BIP322 proofs 90 days after
-   their copy was decided (relayed, there already, or impossible). Return
+   they were sent, once their copy is decided (relayed, there already,
+   impossible, the coin gone or spent, or its request no longer looked
+   at). Return
    addresses stay: a later deposit to the same request still needs one.
 
    lfswap_retention.py              as RETENTION_MODE says
@@ -37,6 +39,7 @@ what it would change, "on" changes it. The referral (2) and the donations
 """
 
 import argparse
+import json
 import datetime
 import os
 import re
@@ -48,9 +51,12 @@ sys.path.insert(0, os.path.join(DEPLOY, "monitor"))
 import lfswap_monitor  # noqa: E402
 
 SWAP_DAYS = 90
+LAST_SUCCESS = "last-success"
 REPLAY_DAYS = 30
 AT_RISK_DAYS = 400
 HINT_DAYS = 90
+# A SHA256 donation request is looked at for a year (PollEvery)
+POLL_DAYS = 365
 REFERRAL = "lightning_fork_swap"
 OLD_REFERRALS = ("lightning_fork_swap_mobile", "lightning_fork_swap_desktop")
 
@@ -61,6 +67,7 @@ REVERSE_FINAL = ("invoice.settled", "invoice.expired", "swap.expired",
                  "transaction.failed", "transaction.refunded")
 
 ID = re.compile(r"^[A-Za-z0-9]{6,64}$")
+ADDRESS = re.compile(r"^[A-Za-z0-9]{14,100}$")
 HEX = re.compile(r"^[0-9a-f]{64}$")
 
 
@@ -94,66 +101,88 @@ class Retention:
 
     # --- 1. backend swaps -------------------------------------------------
 
-    def submarine_due(self):
-        """Old submarine swaps still holding user data, and whether each
-        has nothing left: (id, preimage hash) of those that may go, and
-        how many are kept for an unspent lockup."""
+    def synced(self):
+        """Whether the node's UTXO set is current: in initial block download,
+        or behind its headers, a coin still there may look spent."""
+        info = json.loads(self.knots("getblockchaininfo"))
+        return (not info.get("initialblockdownload", True)
+                and info.get("blocks") == info.get("headers"))
+
+    def knots(self, *args, timeout=60):
+        return self.m.runner.compose(
+            "exec", "-T", "knots", "bitcoin-cli", "-datadir=/data",
+            *self.knots_args, *args, timeout=timeout)
+
+    def addresses_with_coins(self, addresses):
+        """The addresses that still hold a coin, by one scan of the UTXO set:
+        every coin at the address counts, not only the one the database
+        recorded (a second deposit, a late one, one never recorded)."""
+        if not addresses:
+            return set()
+        scan = json.loads(self.knots(
+            "scantxoutset", "start",
+            json.dumps([f"addr({a})" for a in sorted(addresses)]),
+            timeout=1800))
+        if scan.get("success") is not True:
+            raise RuntimeError("the UTXO set scan did not complete")
+        held = set()
+        for unspent in scan.get("unspents", []):
+            found = re.match(r"^addr\(([^)]+)\)", unspent.get("desc", ""))
+            if found:
+                held.add(found.group(1))
+        return held
+
+    def submarine_candidates(self):
+        """Old, final submarine swaps still holding user data: (id,
+        preimage hash, lockup address)."""
         rows = self.m.psql(
-            'SELECT id, status, "preimageHash", '
-            'coalesce("lockupTransactionId", \'\'), '
-            'coalesce("lockupTransactionVout", -1) FROM swaps '
+            'SELECT id, "preimageHash", "lockupAddress" FROM swaps '
             f'WHERE status IN ({quoted(SUBMARINE_FINAL)}) '
             f'AND "updatedAt" < now() - interval \'{SWAP_DAYS} days\' '
             'AND (invoice IS NOT NULL OR "refundPublicKey" IS NOT NULL '
             'OR "refundAddress" IS NOT NULL OR "redeemScript" IS NOT NULL '
             'OR preimage IS NOT NULL)')
-        due, kept = [], 0
-        for swap_id, status, preimage_hash, txid, vout in rows:
-            if not ID.match(swap_id) or not HEX.match(preimage_hash):
-                kept += 1
-                continue
-            if status == "transaction.claimed" or not txid:
-                due.append((swap_id, preimage_hash))
-                continue
-            # The user's lockup: gone from the UTXO set means spent (claimed
-            # or refunded); still there means they may still refund it
-            if HEX.match(txid) and int(vout) >= 0 and \
-                    not self.m.knots(*self.knots_args, "gettxout", txid,
-                                     str(vout)).strip():
-                due.append((swap_id, preimage_hash))
-            else:
-                kept += 1
-        return due, kept
+        return [row for row in rows if len(row) == 3]
 
-    def reverse_due(self):
+    def reverse_candidates(self):
+        """Old, final reverse swaps still holding user data: (id, lockup
+        address)."""
         rows = self.m.psql(
-            'SELECT id, status, coalesce("transactionId", \'\') '
-            'FROM "reverseSwaps" '
+            'SELECT id, "lockupAddress" FROM "reverseSwaps" '
             f'WHERE status IN ({quoted(REVERSE_FINAL)}) '
             f'AND "updatedAt" < now() - interval \'{SWAP_DAYS} days\' '
             'AND (invoice NOT LIKE \'redacted:%\' OR "claimPublicKey" IS NOT NULL '
             'OR "claimAddress" IS NOT NULL OR "redeemScript" IS NOT NULL '
             'OR preimage IS NOT NULL OR "minerFeeInvoice" IS NOT NULL)')
-        due, kept = [], 0
-        for swap_id, status, txid in rows:
-            if not ID.match(swap_id):
-                kept += 1
-            elif status in ("invoice.settled", "transaction.refunded") \
-                    or not txid:
-                due.append(swap_id)
-            else:
-                # Our lockup, neither claimed nor refunded as far as the
-                # status says: keep it for whoever sorts it out
-                kept += 1
-        return due, kept
+        return [row for row in rows if len(row) == 2]
+
+    def due(self):
+        """The swaps whose user data may go: final, old, and nothing left at
+        their lockup address. A coin still there keeps the swap whole: the
+        user may refund it (submarine) or claim it with the rescue key
+        (reverse, settled but not claimed). Ids, hashes and addresses that
+        do not look like ones are never put into SQL or the scan."""
+        submarine = [(i, h, a) for i, h, a in self.submarine_candidates()
+                     if ID.match(i) and HEX.match(h) and ADDRESS.match(a)]
+        reverse = [(i, a) for i, a in self.reverse_candidates()
+                   if ID.match(i) and ADDRESS.match(a)]
+        held = self.addresses_with_coins(
+            {a for _, _, a in submarine} | {a for _, a in reverse})
+        sub_due = [(i, h) for i, h, a in submarine if a not in held]
+        rev_due = [i for i, a in reverse if a not in held]
+        kept = (len(submarine) - len(sub_due), len(reverse) - len(rev_due))
+        return sub_due, rev_due, kept
 
     def swaps(self):
-        submarine, sub_kept = self.submarine_due()
-        reverse, rev_kept = self.reverse_due()
+        if not self.synced():
+            raise RuntimeError(
+                "the node is not synced (initial block download, or behind "
+                "its headers): no swap is cleared")
+        submarine, reverse, (sub_kept, rev_kept) = self.due()
         self.say(f"swaps past {SWAP_DAYS} days with user data: submarine "
-                 f"{len(submarine)} to clear, {sub_kept} kept (lockup "
-                 f"unspent or unreadable); reverse {len(reverse)} to clear, "
-                 f"{rev_kept} kept (our lockup open)")
+                 f"{len(submarine)} to clear, {sub_kept} kept (a coin at the "
+                 f"lockup address); reverse {len(reverse)} to clear, "
+                 f"{rev_kept} kept (a coin at the lockup address)")
         if self.mode != "on":
             self.overdue += len(submarine) + len(reverse)
         if self.mode != "on" or not (submarine or reverse):
@@ -217,24 +246,37 @@ class Retention:
             "WHERE verdict = 'at_risk' AND at_risk_addresses <> '{}' "
             f"AND first_seen < now() - interval '{AT_RISK_DAYS} days' "
             "RETURNING 1", "donations"))
-        # Proofs are needed until every SHA256-chain deposit of their
-        # transaction has a decided copy
+        # Proofs are needed while a copy of a SHA256-chain deposit of their
+        # transaction is undecided: made (or there already), impossible,
+        # the deposit gone or spent, or its request no longer looked at (a
+        # year). An impossible copy is not tried again once its proofs are
+        # gone (the worker's copies()).
         proofs = returned(self.m.psql(
             "UPDATE sha256_hints SET proofs = '[]'::jsonb "
             "WHERE proofs <> '[]'::jsonb "
             f"AND at < now() - interval '{HINT_DAYS} days' "
             "AND NOT EXISTS (SELECT 1 FROM sha256_deposits d "
+            "JOIN sha256_requests r ON r.id = d.request_id "
             "WHERE d.request_id = sha256_hints.request_id "
             "AND d.txid = sha256_hints.txid AND d.chain = 'sha256' "
-            "AND d.copy_state NOT IN ('already', 'copied', 'not_possible')) "
+            "AND d.state NOT IN ('gone', 'spent') "
+            "AND d.copy_state NOT IN ('already', 'copied', 'not_possible') "
+            f"AND r.created_at > now() - interval '{POLL_DAYS} days') "
             "RETURNING 1", "donations"))
         self.say(f"donations: cleared {cleared} replay checks' inputs or "
                  f"addresses and {proofs} SHA256 proofs")
 
     def run(self):
-        self.swaps()
-        self.referral()
-        self.donations()
+        """Each part on its own: one that fails (an unsynced node, a
+        schema change) does not stop the others. The failures are listed
+        in self.errors; nothing is recorded as done if there are any."""
+        self.errors = []
+        for part in (self.swaps, self.referral, self.donations):
+            try:
+                part()
+            except Exception as error:  # noqa: BLE001
+                self.errors.append(f"{part.__name__}: {error}")
+                self.say(f"FAILED {part.__name__}: {error}")
         return self.lines
 
 
@@ -263,6 +305,17 @@ def main(argv=None, runner=None, now=None):
     retention = Retention(monitor, mode, args.knots_arg)
     for line in retention.run():
         print(f"{stamp} [{mode}] {line}")
+    if retention.errors:
+        return 1
+    # For the monitor: a job that stops running, or keeps failing, is
+    # noticed (lfswap_monitor.py, check_retention)
+    if args.deploy == DEPLOY:
+        root = env.get("LFSWAP_ROOT", "/srv/lfswap")
+        path = os.path.join(root, "retention", LAST_SUCCESS)
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        with open(path + ".tmp", "w") as f:
+            f.write(stamp + "\n")
+        os.replace(path + ".tmp", path)
     # The privacy page says these go: report mode must not keep them quietly
     if retention.overdue and not args.report:
         lfswap_monitor.send(

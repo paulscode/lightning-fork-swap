@@ -140,7 +140,8 @@ def service_fake(local=500_000, remote=300_000, fee_ppm=500, peers=("p1",
                  {"status": "SUCCEEDED", "route": {"hops": [
                      {"chan_id": "11"}]}}]},
             {"payment_hash": "h2", "payment_index": "2",
-             "status": "IN_FLIGHT", "htlcs": []},
+             "status": "IN_FLIGHT", "htlcs": [],
+             "creation_time_ns": str(int(NOW.timestamp()) * 10**9)},
             {"payment_hash": "h3", "payment_index": "3", "status": "FAILED",
              "failure_reason": "FAILURE_REASON_NO_ROUTE", "htlcs": []}]}),
         ("closedchannels",): json.dumps({"channels": [
@@ -236,6 +237,48 @@ class RecordTest(Base):
         self.assertEqual([k for k, _ in opens], ["33"])
         self.assertFalse(json.loads(opens[0][1])["initiator"])
 
+    def test_lnd_0_21_channels_go_by_their_short_id(self):
+        # Recorded first as lnd 0.21 lists them before this fix: by the
+        # 32-byte channel id
+        long_ids = {"11": "aa" * 32, "22": "bb" * 32}
+
+        def lnd021(fake, keep_long):
+            listed = json.loads(fake.cli[("listchannels",)])
+            for c in listed["channels"]:
+                short = c["chan_id"]
+                c["chan_id"] = long_ids[short]
+                if not keep_long:
+                    c["scid"] = short
+            fake.cli[("listchannels",)] = json.dumps(listed)
+            closed = json.loads(fake.cli[("closedchannels",)])
+            closed["channels"][0]["chan_id"] = "cc" * 32
+            if not keep_long:
+                closed["channels"][0]["scid"] = "9"
+            fake.cli[("closedchannels",)] = json.dumps(closed)
+            return fake
+
+        self.t.record(self.monitor(lnd021(service_fake(), True)), "/srv")
+        self.t.record(self.monitor(lnd021(service_fake(), True), NOW
+                                   + datetime.timedelta(minutes=5)), "/srv")
+        self.assertEqual(self.rows(
+            "SELECT DISTINCT chan_id FROM channel_snapshot ORDER BY 1"),
+            [("aa" * 32,), ("bb" * 32,)])
+        # Then with scid read: the rows are renamed, the fee policy found,
+        # and no channel is taken for newly opened nor closed again
+        self.t.record(self.monitor(lnd021(service_fake(), False), NOW
+                                   + datetime.timedelta(minutes=10)), "/srv")
+        self.assertEqual(self.rows(
+            "SELECT DISTINCT chan_id FROM channel_snapshot ORDER BY 1"),
+            [("11",), ("22",)])
+        self.assertEqual(self.rows(
+            "SELECT base_fee_msat FROM channel_snapshot WHERE chan_id = '11' "
+            "AND ts = ?", int((NOW + datetime.timedelta(
+                minutes=10)).timestamp())), [(1000,)])
+        self.assertEqual(self.rows(
+            "SELECT count(*) FROM event WHERE kind = 'channel_open'"), [(0,)])
+        self.assertEqual(self.rows(
+            "SELECT key FROM event WHERE kind = 'channel_close'"), [("9",)])
+
     def test_a_policy_change_is_a_change_of_terms(self):
         self.t.record(self.monitor(service_fake(fee_ppm=500)), "/srv")
         self.assertEqual(self.rows("SELECT * FROM terms_change"), [])
@@ -297,8 +340,9 @@ class RecordTest(Base):
             "SELECT * FROM event WHERE kind = 'forward'")), 1)
         payments = {k: json.loads(d) for k, d in self.rows(
             "SELECT key, data FROM event WHERE kind = 'payment'")}
-        # The one in flight stops the reading: h3 waits until h2 is done
-        self.assertEqual(sorted(payments), ["h1"])
+        # The one in flight is read again until it is done; the ones after
+        # it are recorded meanwhile
+        self.assertEqual(sorted(payments), ["h1", "h3"])
         self.assertEqual(payments["h1"]["attempts"][0]["first_hop"], "22")
         self.assertEqual(payments["h1"]["attempts"][0]["failure"],
                          "TEMPORARY_CHANNEL_FAILURE")
@@ -307,6 +351,12 @@ class RecordTest(Base):
         offsets = [c[c.index("--index_offset") + 1] for c in fake.calls
                    if "listpayments" in c]
         self.assertEqual(offsets, ["0", "1"])
+
+    def test_a_payment_in_flight_for_a_day_is_passed_over(self):
+        fake = service_fake()
+        later = NOW + datetime.timedelta(days=2)
+        self.t.record(self.monitor(fake, later), "/srv")
+        self.assertEqual(self.t.meta("payments_index"), 3)
 
     def test_our_transactions_and_lost_branches(self):
         fake = service_fake()
@@ -525,6 +575,32 @@ class RollupTest(Base):
         self.assertEqual(keys[1], "cd" * 32)
         # The payment itself stays (the analysis counts it)
         self.assertEqual(len(keys), 2)
+
+    def test_old_peers_are_pseudonymous(self):
+        old = int((NOW - datetime.timedelta(days=t.PEER_DAYS + 2)).timestamp())
+        new = int(NOW.timestamp()) - 3600
+        for ts, kind, key in ((old, "channel_open", "111"),
+                              (old, "peer_online", f"{'02' * 33}:{old}"),
+                              (new, "peer_offline", f"{'03' * 33}:{new}")):
+            self.t.db.execute(
+                "INSERT INTO event (ts, kind, key, data) VALUES (?, ?, ?, ?)",
+                (ts, kind, key, json.dumps({"peer": key.split(":")[0],
+                                            "alias": "donor"})))
+        self.t.db.execute(
+            "INSERT INTO channel_snapshot (ts, chan_id, peer) VALUES (?, ?, ?)",
+            (old, "111", "02" * 33))
+        self.snapshots(NOW.date(), [(2, 0)])
+        self.t.rollup(NOW)
+        rows = self.rows("SELECT kind, key, data FROM event "
+                         "WHERE kind != 'count' ORDER BY ts")
+        old_rows, new_rows = rows[:2], rows[2:]
+        for kind, key, data in old_rows:
+            self.assertNotIn("02" * 33, key + data)
+            self.assertNotIn("donor", data)
+            self.assertTrue(json.loads(data)["peer"].startswith("peer:"))
+        self.assertIn("03" * 33, new_rows[0][1])
+        self.assertEqual(self.rows("SELECT peer FROM channel_snapshot"),
+                         [(None,)])
 
     def test_percentile(self):
         self.assertIsNone(t.percentile([], 0.5))

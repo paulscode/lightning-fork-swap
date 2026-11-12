@@ -29,8 +29,8 @@ done
 export DEBIAN_FRONTEND=noninteractive
 echo "== packages"
 apt-get update -q
-apt-get install -y -q ca-certificates curl gnupg nftables nginx certbot apache2-utils \
-	jq rsync age unattended-upgrades >/dev/null
+apt-get install -y -q ca-certificates curl gnupg nftables nginx libnginx-mod-http-js \
+	certbot apache2-utils jq rsync age unattended-upgrades >/dev/null
 
 if ! command -v docker >/dev/null; then
 	echo "== Docker CE"
@@ -64,7 +64,9 @@ fi
 # 10 days: the containers log to it (docker-compose.yml), and their logs
 # hold swap ids and the errors of users' requests
 mkdir -p /etc/systemd/journald.conf.d
-printf '[Journal]\nSystemMaxUse=200M\nMaxRetentionSec=10day\n' > /etc/systemd/journald.conf.d/lfswap.conf
+# (MaxRetentionSec drops only archived files: a new file every day, so
+# that the active one is archived in time)
+printf '[Journal]\nSystemMaxUse=200M\nMaxRetentionSec=10day\nMaxFileSec=1day\n' > /etc/systemd/journald.conf.d/lfswap.conf
 systemctl restart systemd-journald
 
 # On shutdown Docker gives containers 15 s and systemd gives Docker 90 s;

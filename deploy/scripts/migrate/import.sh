@@ -80,7 +80,6 @@ fi
 cp "$STAGE/snapshot.json" "$MIGRATION/snapshot-$ID-source.json"
 cp "$STAGE/postgres.sql" "$MIGRATION/postgres-$ID.sql"
 chmod 600 "$MIGRATION/postgres-$ID.sql"
-echo "$ID" >> "$MIGRATION/imported"
 
 log "rendering configuration for this host"
 "$DEPLOY/scripts/setup.sh" >/dev/null
@@ -91,6 +90,12 @@ if [ -d "/etc/letsencrypt/live/${DOMAIN:-lightningfork.com}" ]; then
 else
 	log "no certificate for ${DOMAIN:-lightningfork.com}: the nginx site is not installed (install-host.sh tls after DNS)"
 fi
+
+# Marked only now, before anything starts: an import that stopped above
+# (a missing package, a bad template) can simply be run again, as nothing
+# has used the state yet; once lnd has run on it, never again (its old
+# channel state would be the new one's undoing)
+echo "$ID" >> "$MIGRATION/imported"
 
 if [ "$START" = 0 ]; then
 	log "state imported; not starting (--no-start)"

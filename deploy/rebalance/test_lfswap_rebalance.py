@@ -36,6 +36,9 @@ class World:
         self.bumped = []
         self.addresses = 0
         self.not_mine = False
+        self.unconfirmed = []
+        self.lose_answer = False
+        self.lnd_unconfirmed = 0
 
     def add_coin(self, amount):
         self.coins.append({"txid": f"{len(self.coins):064x}", "vout": 0,
@@ -58,7 +61,16 @@ class World:
         if cmd == "getblockchaininfo":
             return json.dumps({"blocks": self.height})
         if cmd == "listunspent":
+            # minconf 1: confirmed coins; 0: also the wallet's own
+            # unconfirmed change ("safe") and others' coins (not safe)
+            if a[1] == "0":
+                return json.dumps(self.coins + self.unconfirmed)
             return json.dumps(self.coins)
+        if cmd == "listtransactions":
+            return json.dumps([
+                {"txid": t, "address": tx.get("address"),
+                 "category": "send" if tx.get("source") == "hot"
+                 else "receive"} for t, tx in self.txs.items()])
         if cmd == "estimatesmartfee":
             if self.fee is None:
                 return json.dumps({"errors": ["Insufficient data"]})
@@ -75,7 +87,7 @@ class World:
             (address, amount), = outputs.items()
             txid = f"{len(self.txs) + 100:064x}"
             self.txs[txid] = {"confirmations": 0, "fee": -0.00000300,
-                              "source": "hot"}
+                              "source": "hot", "address": address}
             self.sent.append(("hot", address, round(float(amount) * 1e8),
                               float(named["fee_rate"]), options["inputs"]))
             return json.dumps({"txid": txid, "complete": True})
@@ -91,6 +103,8 @@ class World:
     def lncli(self, a):
         if a[0] == "walletbalance":
             return json.dumps({"confirmed_balance": str(self.lnd),
+                               "unconfirmed_balance":
+                               str(self.lnd_unconfirmed),
                                "reserved_balance_anchor_chan":
                                str(self.reserve)})
         if a[0] == "channelbalance":
@@ -106,10 +120,15 @@ class World:
         if a[0] == "sendcoins":
             opts = dict(zip(a[1::2], a[2::2]))
             txid = f"{len(self.txs) + 100:064x}"
-            self.txs[txid] = {"confirmations": 0, "source": "lnd"}
+            self.txs[txid] = {"confirmations": 0, "source": "lnd",
+                              "address": opts["--addr"]}
             self.sent.append(("lnd", opts["--addr"], int(opts["--amt"]),
                               float(opts["--sat_per_vbyte"]), None))
-            assert "--force" in a and opts["--min_confs"] == "1"
+            assert "--force" in a and opts["--min_confs"] == "6"
+            if self.lose_answer:
+                # Broadcast, but the answer never comes back
+                self.lose_answer = False
+                raise RuntimeError("docker compose exec: timed out")
             return json.dumps({"txid": txid})
         if a[0] == "listchaintxns":
             return json.dumps({"transactions": [
@@ -386,6 +405,81 @@ class RunTest(unittest.TestCase):
         again, _ = run(world, state, now=NOW + datetime.timedelta(days=2))
         self.assertEqual(len(world.sent), 1)
         self.assertIn("stopped", again.lines[0])
+
+    def test_a_move_whose_answer_was_lost_is_not_sent_twice(self):
+        world = World(hot=3_000_000, lnd=9_000_000)
+        world.lose_answer = True
+        saves = []
+        monitor = r.lfswap_monitor.Monitor(world, {}, NOW, "regtest")
+        state = {}
+        the_run = r.Run(r.Wallets(monitor), CFG, state, NOW, "on",
+                        save=lambda: saves.append(dict(state)))
+        the_run.run()
+        # Saved with the intent before the send; no move recorded
+        self.assertIn("intent", saves[0])
+        self.assertNotIn("inflight", state)
+        self.assertEqual(len(world.sent), 1)
+        # The next run finds the transaction instead of sending again
+        later = NOW + datetime.timedelta(minutes=30)
+        again, state = run(world, state, now=later)
+        self.assertEqual(len(world.sent), 1)
+        self.assertNotIn("intent", state)
+        self.assertEqual(state["inflight"]["txid"], next(iter(world.txs)))
+
+    def test_an_intent_with_no_transaction_is_dropped_after_an_hour(self):
+        world = World(hot=3_000_000, lnd=9_000_000)
+        state = {"intent": {"ts": NOW.timestamp(), "source": "lnd",
+                            "dest": "hot", "amount": 1, "rule": 1,
+                            "fee_rate": 2, "height": 1,
+                            "address": "bcrt1pnowhere"}}
+        waiting, state = run(world, state,
+                             now=NOW + datetime.timedelta(minutes=30))
+        self.assertIn("intent", state)
+        self.assertEqual(world.sent, [])
+        dropped, state = run(world, state,
+                             now=NOW + datetime.timedelta(minutes=90))
+        self.assertNotIn("intent", state)
+        self.assertIn("was not sent", dropped.lines[0])
+
+    def test_a_bumped_move_whose_original_confirmed_is_done(self):
+        world = World(hot=30_000_000, lnd=0)
+        _, state = run(world)
+        original = state["inflight"]["txid"]
+        world.height += 6
+        world.fee = 5
+        _, state = run(world, state)
+        replacement = state["inflight"]["txid"]
+        self.assertNotEqual(replacement, original)
+        # The original is mined; the replacement now conflicts
+        world.confirm(original)
+        world.txs[replacement]["confirmations"] = -1
+        the_run, state = run(world, state)
+        self.assertNotIn("blocked", state)
+        self.assertEqual(state["moves"][-1]["txid"], original)
+
+    def test_own_unconfirmed_change_is_not_an_empty_wallet(self):
+        # 3M confirmed and 7M of the wallet's own change waiting for a
+        # block: not below the floor
+        world = World(hot=3_000_000, lnd=9_000_000)
+        world.unconfirmed = [{"txid": "c" * 64, "vout": 1,
+                              "amount": 0.07, "spendable": True,
+                              "safe": True},
+                             {"txid": "d" * 64, "vout": 0,
+                              "amount": 0.5, "spendable": True,
+                              "safe": False}]
+        the_run, _ = run(world)
+        self.assertEqual(world.sent, [])
+        self.assertIn("hot 10,000,000", the_run.lines[0])
+
+    def test_failures_are_told_once_a_day(self):
+        world = World(hot=3_000_000, lnd=9_000_000)
+        world.not_mine = True
+        first, state = run(world)
+        self.assertTrue(first.messages)
+        later, state = run(world, state,
+                           now=NOW + datetime.timedelta(minutes=30))
+        self.assertFalse(later.messages)
+        self.assertIn("could not move", later.lines[-1])
 
     def test_cold_storage_only_when_configured(self):
         world = World(hot=30_000_000, lnd=12_000_000)

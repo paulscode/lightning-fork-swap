@@ -150,8 +150,14 @@ moved the balances past a floor or a ceiling again. Brakes: at least
 wallets a day at most (a bigger need is met over several days), fees at most
 `REBALANCE_FEE_CAP` sat/vB (an urgent move, the hot wallet below one
 maximum swap or lnd below its reserve, up to `REBALANCE_FEE_CEILING`), one
-move in flight at a time (bumped if unconfirmed after 6 blocks), and no hot
-wallet spend while a reverse swap is about to lock up. Coins only go to a
+move in flight at a time (bumped if unconfirmed after 6 blocks; every
+version of a bumped move is followed, whichever is mined), and no hot
+wallet spend while a reverse swap is about to lock up (one created in the
+last 30 minutes and not yet paid). Both wallets count their own
+unconfirmed coins (change, a move on its way), and lnd only spends coins 6
+deep. A move is written down before it is sent: if the run stops half-way
+(a timeout, a full disk), the next one looks for it on chain before doing
+anything, rather than sending it again. Coins only go to a
 fresh address the receiving wallet confirms as its own, or to
 `REBALANCE_COLD_ADDRESS` (off unless set, and refused unless it matches
 `REBALANCE_COLD_ADDRESS_SHA256`).
@@ -167,7 +173,8 @@ move ...", once a day while it holds) and nothing moves. After a couple of
 weeks of sensible messages, set `on`. The weekly report has a "Rebalancing"
 block (moves, fees, time below each floor). A move that conflicts with
 another transaction stops all moves until you look and remove `"blocked"`
-from `/srv/lfswap/rebalance/state.json`.
+from `/srv/lfswap/rebalance/state.json` (the monitor reminds you while it
+is there).
 
 ## 5. Using fees to improve capacity
 
@@ -488,7 +495,15 @@ included, can ever be valid on the SHA256 chain, and anyone can check that
 with the lock's txid, which the API gives. The worker relays locks through
 the SHA256 explorers, whose Bitcoin Core (30 or later) relays data outputs
 of this size; Knots does not by default. A lock no explorer takes is
-alerted and tried again an hour later. The data rules end on 1 September
+alerted and tried again an hour later; so is one that left the mempool and
+is refused when relayed again (a fee now too low, a coin spent): its
+deposits go back and are locked again, at the day's fee. If such a lock is
+mined after all, the worker sees its coins spent by it and takes it back.
+After a lock of several coins is refused, coins are locked one at a time
+for a day, and a coin refused on its own waits a day: one bad coin does not
+hold the others. A donation spent by someone else before it was locked is
+`spent` for good (alerted once). Repeated alerts (a forward or sweep that
+cannot be relayed, a fee too high) come once a day. The data rules end on 1 September
 2027; from a month before, the worker makes no new lock, holds what would
 need one, and alerts once a day. Locks are chained: each carries an anchor output (1,000 sat, output 1) that
 the next lock spends, one lock in flight at a time. A lock is permanent
@@ -537,6 +552,12 @@ coins held (not yet swept) pass `MONITOR_SHA256_MAX_SAT` (5,000,000 sat).
 | Monthly, or as you like | take earnings out (§6) |
 | Before raising limits or the hot wallet | weeks without trouble |
 
+The monitor also watches the daily jobs: it alerts when the retention job
+(with `RETENTION_MODE=on`) has not succeeded for two days
+(`/srv/lfswap/retention/last-success`), when the log key is more than a
+day old (`log-key.sh` could not reload nginx), and while the rebalancer is
+blocked. It runs one at a time (a lock), so a slow run is never doubled.
+
 ### Logs and users' privacy
 
 The client's address stops at nginx: the backend, the sidecar and the
@@ -572,8 +593,9 @@ counts swaps, and alerts once any is past its time; set `on` after a
 rehearsal on regtest, before the first swaps qualify (January 2027).
 In either mode: donations lose a protected donation's inputs after 30
 days, an at-risk one's inputs and addresses after 400 days (a replayed one
-is kept for its return), SHA256 proofs 90 days after their copy was
-decided; and swaps no longer record whether they came from a phone.
+is kept for its return), SHA256 proofs 90 days after they were sent once
+their copy is decided (made, there already, impossible, the coin gone or
+spent, or its request past its year of looks); and swaps no longer record whether they came from a phone.
 
 Alerts name a donor's address by its first 10 characters only.
 

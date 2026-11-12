@@ -14,7 +14,8 @@ backend's own database has them. The database is not public: it says where
 the liquidity is thin.
 
 Retention: 5-minute snapshots 180 days; events and daily rollups kept,
-payments' hashes replaced after 180 days.
+payments' hashes replaced after 180 days, peers' node ids and aliases
+after 90.
 """
 
 import csv
@@ -26,6 +27,7 @@ import sqlite3
 
 SCHEMA_VERSION = 1
 SNAPSHOT_DAYS = 180
+PEER_DAYS = 90
 
 # The .env keys whose changes are logged as changes of terms
 TERMS_KEYS = (
@@ -122,6 +124,14 @@ def classify_refusal(text):
             return kind
     return "other"
 
+
+
+def short_channel_id(c):
+    """A channel's short id: lnd 0.21's scid, else (older lnd) chan_id."""
+    scid = str(c.get("scid") or "")
+    if scid and scid != "0":
+        return scid
+    return str(c.get("chan_id"))
 
 class Telemetry:
     def __init__(self, path):
@@ -221,6 +231,10 @@ class Telemetry:
         snap["lnd_locked"] = int(lnd.get("locked_balance", 0))
 
     def _channels(self, m, snap, ts):
+        """Channels by their short id, as feereport, forwards and payments
+        name them (lnd 0.21 made listchannels' chan_id the 32-byte channel
+        id, and moved the short one to scid). Rows recorded under the long
+        id before are renamed on the way."""
         balance = json.loads(m.lncli("channelbalance"))
         snap["outbound"] = int(balance.get("local_balance", {}).get("sat", 0))
         snap["inbound"] = int(balance.get("remote_balance", {}).get("sat", 0))
@@ -243,7 +257,18 @@ class Telemetry:
         known = set(self.meta("channels", []))
         seen = []
         for c in channels:
-            chan_id = str(c["chan_id"])
+            chan_id = short_channel_id(c)
+            long_id = str(c.get("chan_id"))
+            if long_id != chan_id and long_id in known:
+                known.discard(long_id)
+                known.add(chan_id)
+                self.db.execute(
+                    "UPDATE OR IGNORE channel_snapshot SET chan_id = ? "
+                    "WHERE chan_id = ?", (chan_id, long_id))
+                self.db.execute(
+                    "UPDATE OR IGNORE event SET key = ? "
+                    "WHERE kind = 'channel_open' AND key = ?",
+                    (chan_id, long_id))
             seen.append(chan_id)
             htlcs = c.get("pending_htlcs", [])
             base, ppm = policies.get(chan_id, (None, None))
@@ -395,11 +420,18 @@ class Telemetry:
             "listpayments", "--include_incomplete", "--paginate_forwards",
             "--index_offset", str(int(offset)), "--max_payments", "500"))
         newest = offset
+        # The offset stops before the first payment still in flight, so it
+        # is read again until it has an outcome; the ones after it are
+        # recorded meanwhile (events are recorded once). One in flight for
+        # more than a day is passed over for good.
+        held = None
         for p in out.get("payments", []):
             index = int(p.get("payment_index", 0))
             if p.get("status") == "IN_FLIGHT":
-                # Recorded once it has an outcome; read again next run
-                break
+                created = int(p.get("creation_time_ns", 0)) // 1_000_000_000
+                if ts - created < 86400 and held is None:
+                    held = index
+                continue
             attempts = []
             for h in p.get("htlcs", []):
                 hops = h.get("route", {}).get("hops", [])
@@ -420,11 +452,20 @@ class Telemetry:
                     "failure_reason": p.get("failure_reason"),
                     "attempts": attempts})
             newest = max(newest, index)
-        self.set_meta("payments_index", int(newest))
+        if held is not None:
+            newest = min(newest, held - 1)
+        self.set_meta("payments_index", int(max(offset, newest)))
 
     def _closed(self, m, ts):
         for c in json.loads(m.lncli("closedchannels")).get("channels", []):
-            self.event(ts, "channel_close", str(c.get("chan_id")), {
+            chan_id, long_id = short_channel_id(c), str(c.get("chan_id"))
+            if long_id != chan_id:
+                # Recorded under its long id before: renamed, not again
+                self.db.execute(
+                    "UPDATE OR IGNORE event SET key = ? "
+                    "WHERE kind = 'channel_close' AND key = ?",
+                    (chan_id, long_id))
+            self.event(ts, "channel_close", chan_id, {
                 "peer": c.get("remote_pubkey"),
                 "capacity": int(c.get("capacity", 0)),
                 "type": c.get("close_type"),
@@ -581,6 +622,20 @@ class Telemetry:
         self.db.execute(
             "UPDATE event SET key = 'payment:' || id WHERE kind = 'payment' "
             "AND ts < ? AND key NOT LIKE 'payment:%'", (cutoff,))
+        # A peer's node id and alias (a channel donor's among them, which
+        # the privacy page keeps 90 days): after 90 days, the row instead
+        peers = int(now.timestamp()) - PEER_DAYS * 86400
+        self.db.execute(
+            "UPDATE event SET "
+            "key = kind || ':' || id, "
+            "data = json_set(json_remove(data, '$.alias'), "
+            "'$.peer', 'peer:' || id) "
+            "WHERE kind IN ('peer_online', 'peer_offline', 'channel_open', "
+            "'channel_close') AND ts < ? "
+            "AND json_extract(data, '$.peer') NOT LIKE 'peer:%'", (peers,))
+        self.db.execute(
+            "UPDATE channel_snapshot SET peer = NULL "
+            "WHERE ts < ? AND peer IS NOT NULL", (peers,))
         self.db.commit()
 
     def _rollup_day(self, day):

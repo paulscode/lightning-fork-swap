@@ -51,6 +51,7 @@ turns that off.
 """
 
 import datetime
+import fcntl
 import hashlib
 import json
 import os
@@ -350,7 +351,8 @@ class Monitor:
                         f"lnd:htlc:{htlc['hash_lock']}",
                         f"{'Incoming' if htlc['incoming'] else 'Outgoing'} "
                         f"HTLC {htlc['hash_lock'][:16]}... on channel "
-                        f"{channel['chan_id']} expires in {left} blocks",
+                        f"{channel.get('scid_str') or channel['chan_id']} "
+                        f"expires in {left} blocks",
                     )
 
     def check_pairs(self):
@@ -763,6 +765,47 @@ class Monitor:
                     "/etc/cron.d/lfswap-backup",
                 )
 
+    def check_jobs(self, root):
+        """The unattended jobs did their work: the retention job succeeded
+        within two days (when on), the access log's tag key was replaced
+        within 26 hours, and the rebalancer is not blocked."""
+        now = self.now.timestamp()
+        if self.env.get("RETENTION_MODE") == "on":
+            path = os.path.join(root, "retention", "last-success")
+            try:
+                age = now - self.runner.mtime(path)
+            except OSError:
+                age = None
+            if age is None or age > 2 * 86400:
+                self.add(
+                    "jobs:retention",
+                    "The retention job has not succeeded "
+                    + ("yet" if age is None else
+                       f"for {age / 86400:.1f} days")
+                    + f": see {root}/retention/retention.log")
+        try:
+            key_age = now - self.runner.mtime(TAG_KEY_FILE)
+        except OSError:
+            key_age = None
+        if key_age is not None and key_age > 26 * 3600:
+            self.add(
+                "jobs:log-key",
+                f"The access log's tag key is {key_age / 3600:.0f} hours "
+                "old: scripts/log-key.sh did not replace it (tags of "
+                "different days can be linked until it does)")
+        try:
+            state = json.loads(
+                self.runner.read(os.path.join(root, "rebalance",
+                                              "state.json")))
+        except (OSError, ValueError):
+            state = {}
+        if isinstance(state, dict) and state.get("blocked"):
+            self.add(
+                "jobs:rebalance-blocked",
+                "The rebalancer is blocked (a move conflicted with another "
+                f"transaction: {str(state['blocked'])[:80]}); see "
+                "OPERATING.md \"Automatic moves\" to clear it")
+
     def check_certificate(self, domain):
         if not domain:
             return
@@ -800,6 +843,7 @@ class Monitor:
             ("backup", lambda: self.check_backup(root)),
             ("graph", lambda: self.check_graph(root)),
             ("certificate", lambda: self.check_certificate(domain)),
+            ("jobs", lambda: self.check_jobs(root)),
         ]
         for name, check in checks:
             try:
@@ -816,6 +860,9 @@ class Monitor:
 
 SUBMARINE_DONE = ("invoice.paid", "transaction.claim.pending",
                   "transaction.claimed")
+
+
+TAG_KEY_FILE = "/etc/nginx/lfswap-tag-key.conf"
 
 
 def sats(value):
@@ -1201,6 +1248,17 @@ def main(argv):
     dry = "--dry-run" in argv
     state_dir = os.path.join(root, "monitor")
     state_path = os.path.join(state_dir, "state.json")
+    # One run at a time: a run that outlasts five minutes (a hanging
+    # docker or Knots) must not be joined by the next, sending the same
+    # alerts twice and writing the state over each other
+    if not dry:
+        os.makedirs(state_dir, mode=0o700, exist_ok=True)
+        lock = open(os.path.join(state_dir, "lock"), "w")
+        try:
+            fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except OSError:
+            print(f"{stamp} another run is in progress", file=sys.stderr)
+            return 0
     try:
         with open(state_path) as f:
             state = json.load(f)

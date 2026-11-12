@@ -5,7 +5,7 @@
 # What nginx saw as hostile, by address (lightningfork.conf): 30 days
 /var/log/lfswap/threat.log {
 	daily
-	rotate 30
+	rotate 29
 	missingok
 	notifempty
 	compress
@@ -21,7 +21,7 @@
 # hold swap ids and the errors of failed requests; 10 days
 /srv/lfswap/boltz/boltz.log /srv/lfswap/boltz/sidecar/sidecar.log {
 	daily
-	rotate 10
+	rotate 9
 	missingok
 	notifempty
 	compress

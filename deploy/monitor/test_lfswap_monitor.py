@@ -875,3 +875,33 @@ class CompactionRoomTest(unittest.TestCase):
         self.assertNotIn("host:disk", alerts)
         alerts, _ = run(files=dict(files), disk=(40 * gib, 26 * gib, 14 * gib))
         self.assertNotIn("host:compaction", alerts)
+
+
+class JobsTest(unittest.TestCase):
+    def alerts(self, files, env):
+        runner = FakeRunner({}, files=files)
+        monitor = m.Monitor(runner, env, NOW)
+        monitor.check_jobs("/srv/lfswap")
+        return {a.key: a for a in monitor.alerts}
+
+    def test_a_job_that_stopped_working_is_noticed(self):
+        now = NOW.timestamp()
+        alerts = self.alerts({
+            "/srv/lfswap/retention/last-success:mtime": now - 3 * 86400,
+            m.TAG_KEY_FILE + ":mtime": now - 30 * 3600,
+            "/srv/lfswap/rebalance/state.json": '{"blocked": "ab12"}',
+        }, {"RETENTION_MODE": "on"})
+        self.assertIn("3.0 days", alerts["jobs:retention"].text)
+        self.assertIn("30 hours", alerts["jobs:log-key"].text)
+        self.assertIn("ab12", alerts["jobs:rebalance-blocked"].text)
+
+    def test_jobs_that_work_say_nothing(self):
+        now = NOW.timestamp()
+        alerts = self.alerts({
+            "/srv/lfswap/retention/last-success:mtime": now - 86400,
+            m.TAG_KEY_FILE + ":mtime": now - 3600,
+            "/srv/lfswap/rebalance/state.json": '{"moves": []}',
+        }, {"RETENTION_MODE": "on"})
+        self.assertEqual(alerts, {})
+        # Retention off: its file is not looked for
+        self.assertEqual(self.alerts({}, {}), {})

@@ -73,12 +73,25 @@ mv "$FILE.tmp" "$FILE"
 sha256sum "$FILE" | cut -d' ' -f1 > "$FILE.sha256"
 log "backup $FILE ($(du -h "$FILE" | cut -f1))"
 
-find "$OUT" -name 'lfswap-backup-*' -mtime +30 -delete
+# 30 days, here and at the destination (the privacy page says so): a backup
+# holds the databases, whose user data the retention job removes
+find "$OUT" -name 'lfswap-backup-*' -mtime +29 -delete
 
 if [ -n "$DEST" ]; then
 	case "$DEST" in
-	*:*) scp -q -o BatchMode=yes "$FILE" "$FILE.sha256" "$DEST/" ;;
-	*) mkdir -p "$DEST" && cp "$FILE" "$FILE.sha256" "$DEST/" ;;
+	*:*)
+		scp -q -o BatchMode=yes "$FILE" "$FILE.sha256" "$DEST/"
+		host=${DEST%%:*}
+		dir=${DEST#*:}
+		# shellcheck disable=SC2029 # expanded here on purpose
+		ssh -o BatchMode=yes "$host" \
+			"find $(printf '%q' "${dir:-.}") -maxdepth 1 -name 'lfswap-backup-*' -mtime +29 -delete" ||
+			log "could not remove old backups at $DEST"
+		;;
+	*)
+		mkdir -p "$DEST" && cp "$FILE" "$FILE.sha256" "$DEST/"
+		find "$DEST" -maxdepth 1 -name 'lfswap-backup-*' -mtime +29 -delete
+		;;
 	esac
 	log "copied to $DEST"
 fi

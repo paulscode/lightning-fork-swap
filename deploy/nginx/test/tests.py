@@ -405,9 +405,12 @@ class Graph(unittest.TestCase):
         self.assertEqual(status, 200)
         self.assertEqual(header(headers, "Cache-Control"),
                          ["public, max-age=31536000, immutable"])
-        # The server's headers are still there
-        self.assertEqual(len(header(headers, "Content-Security-Policy")), 1)
+        # JSON, in a sandbox, with the server's other headers
+        self.assertEqual(header(headers, "Content-Type"), ["application/json"])
+        self.assertEqual(header(headers, "Content-Security-Policy"),
+                         ["default-src 'none'; sandbox"])
         self.assertEqual(header(headers, "X-Content-Type-Options"), ["nosniff"])
+        self.assertEqual(len(header(headers, "Strict-Transport-Security")), 1)
 
     def test_the_gzip_copy(self):
         status, headers, raw = request("GET", "/graph/v3/overview.json",
@@ -423,6 +426,9 @@ class Graph(unittest.TestCase):
             ("GET", "/graph/v3/node/", 404),
             ("POST", "/graph/meta.json", 403),
             ("PUT", "/graph/v4/overview.json", 403),
+            # Files that are there but are not JSON
+            ("GET", "/graph/v3/evil.html", 404),
+            ("GET", "/graph/v3/evil.js", 404),
         ]:
             with self.subTest(method=method, path=path):
                 status, _, raw = request(method, path, body="x"
