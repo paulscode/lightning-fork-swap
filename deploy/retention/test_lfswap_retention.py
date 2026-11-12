@@ -12,6 +12,12 @@ import lfswap_retention as r  # noqa: E402
 H = "ab" * 32
 
 
+def script_of(address):
+    """A made-up taproot scriptPubKey, one per address."""
+    import hashlib
+    return "5120" + hashlib.sha256(address.encode()).hexdigest()
+
+
 class FakeRunner:
     """Knots: getblockchaininfo and scantxoutset; the addresses in `held`
     still hold a coin."""
@@ -21,6 +27,7 @@ class FakeRunner:
         self.synced = synced
         self.scan_ok = scan_ok
         self.scans = []
+        self.invalid = set()
 
     def compose(self, *args, timeout=60):
         args = list(args)
@@ -31,13 +38,21 @@ class FakeRunner:
             return json.dumps({
                 "initialblockdownload": not self.synced,
                 "blocks": 100, "headers": 100 if self.synced else 120})
+        if command == "validateaddress":
+            if args[6] in self.invalid:
+                return json.dumps({"isvalid": False})
+            return json.dumps({"isvalid": True,
+                               "scriptPubKey": script_of(args[6])})
         assert command == "scantxoutset" and args[6] == "start"
         assert timeout >= 600
         wanted = json.loads(args[7])
         self.scans.append(wanted)
+        # As Knots answers: each coin by the descriptor it infers from the
+        # script, not by the addr(...) asked for
         return json.dumps({
             "success": self.scan_ok,
-            "unspents": [{"desc": f"addr({a})#checksum", "amount": 0.001}
+            "unspents": [{"desc": f"rawtr({script_of(a)[4:]})#checksum",
+                          "scriptPubKey": script_of(a), "amount": 0.001}
                          for a in self.held if f"addr({a})" in wanted]})
 
 
@@ -105,6 +120,14 @@ class Swaps(unittest.TestCase):
         query = next(q for _, q in m.queries if "FROM swaps" in q)
         self.assertIn("interval '90 days'", query)
         self.assertNotIn("transaction.mempool", query)
+
+    def test_an_address_knots_cannot_read_keeps_the_swap(self):
+        m = FakeMonitor(swaps_answers())
+        m.runner.invalid = {"bcrt1qrefundedxxxxxxxx"}
+        sub, _, kept = r.Retention(m, "report").due()
+        self.assertNotIn("refunded", [s for s, _ in sub])
+        self.assertEqual(kept[0], 1)
+        self.assertNotIn("addr(bcrt1qrefundedxxxxxxxx)", m.runner.scans[0])
 
     def test_an_unsynced_node_clears_nothing(self):
         m = FakeMonitor(swaps_answers(), synced=False)

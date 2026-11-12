@@ -67,6 +67,7 @@ REVERSE_FINAL = ("invoice.settled", "invoice.expired", "swap.expired",
                  "transaction.failed", "transaction.refunded")
 
 ID = re.compile(r"^[A-Za-z0-9]{6,64}$")
+HEX_SCRIPT = re.compile(r"^(?:[0-9a-f]{2}){2,80}$")
 ADDRESS = re.compile(r"^[A-Za-z0-9]{14,100}$")
 HEX = re.compile(r"^[0-9a-f]{64}$")
 
@@ -116,20 +117,36 @@ class Retention:
     def addresses_with_coins(self, addresses):
         """The addresses that still hold a coin, by one scan of the UTXO set:
         every coin at the address counts, not only the one the database
-        recorded (a second deposit, a late one, one never recorded)."""
+        recorded (a second deposit, a late one, one never recorded).
+        Knots names each coin it finds by the descriptor it infers from its
+        script (rawtr(...) for a taproot lockup), not by the addr(...) asked
+        for: coins are matched to addresses by their scriptPubKey. An
+        address Knots cannot turn into a script counts as holding a coin."""
         if not addresses:
             return set()
+        scripts, held = {}, set()
+        for a in sorted(addresses):
+            try:
+                info = json.loads(self.knots("validateaddress", a))
+            except Exception:  # noqa: BLE001 (kept whole rather than cleared)
+                info = {}
+            script = str(info.get("scriptPubKey") or "").lower()
+            if info.get("isvalid") is True and HEX_SCRIPT.match(script):
+                scripts[script] = a
+            else:
+                held.add(a)
+        if not scripts:
+            return held
         scan = json.loads(self.knots(
             "scantxoutset", "start",
-            json.dumps([f"addr({a})" for a in sorted(addresses)]),
+            json.dumps([f"addr({scripts[s]})" for s in sorted(scripts)]),
             timeout=1800))
         if scan.get("success") is not True:
             raise RuntimeError("the UTXO set scan did not complete")
-        held = set()
         for unspent in scan.get("unspents", []):
-            found = re.match(r"^addr\(([^)]+)\)", unspent.get("desc", ""))
-            if found:
-                held.add(found.group(1))
+            script = str(unspent.get("scriptPubKey") or "").lower()
+            if script in scripts:
+                held.add(scripts[script])
         return held
 
     def submarine_candidates(self):
