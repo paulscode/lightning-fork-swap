@@ -262,13 +262,26 @@ func TestAnOpenFromCoinsJustReleased(t *testing.T) {
 	if check(p, open(t, goodOpen())) == nil {
 		t.Fatal("an open from coins neither leased nor released passed")
 	}
-	// The worker releases both: the guard sees the releases pass
-	for _, op := range goodOpen().Outpoints {
+	// The worker releases both: the guard sees the releases pass, and lnd
+	// refuse the first (not leased by us): that one does not count
+	for i, op := range goodOpen().Outpoints {
 		msg := message(t, "/walletrpc.WalletKit/ReleaseOutput", "walletrpc.ReleaseOutputRequest",
 			&lnrpc.ReleaseOutputRequest{Id: LeaseID, Outpoint: op})
-		if err := check(p, msg); err != nil {
+		if err := p.Intercept(context.Background(), CaveatCondition, uint64(i+1), msg); err != nil {
 			t.Fatal(err)
 		}
+		p.Answered(uint64(i+1), &lnrpc.RPCMessage{MethodFullUri: msg.MethodFullUri, IsError: i == 0})
+	}
+	if check(p, open(t, goodOpen())) == nil {
+		t.Fatal("passed with a release lnd refused")
+	}
+	for i, op := range goodOpen().Outpoints {
+		msg := message(t, "/walletrpc.WalletKit/ReleaseOutput", "walletrpc.ReleaseOutputRequest",
+			&lnrpc.ReleaseOutputRequest{Id: LeaseID, Outpoint: op})
+		if err := p.Intercept(context.Background(), CaveatCondition, uint64(10+i), msg); err != nil {
+			t.Fatal(err)
+		}
+		p.Answered(uint64(10+i), &lnrpc.RPCMessage{MethodFullUri: msg.MethodFullUri})
 	}
 	if err := check(p, open(t, goodOpen())); err != nil {
 		t.Fatalf("refused just after the release: %v", err)

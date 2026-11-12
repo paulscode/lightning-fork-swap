@@ -184,10 +184,10 @@ func TestPostgres(t *testing.T) {
 	if ds, _ := worker.DepositsIn(ctx, BLAKE2b, Ready); len(ds) != 1 {
 		t.Fatalf("a failed forward kept its coins: %+v", ds)
 	}
-	fid, err = worker.CreateForward(ctx, Forward{RequestID: id, Txid: strings.Repeat("d", 64),
-		Raw: "00", Dest: dest, State: Sent}, []int64{d.ID})
-	if err != nil {
-		t.Fatal(err)
+	// Signed again, it is the same transaction: the failed one is taken up
+	again, err := worker.CreateForward(ctx, f, []int64{d.ID})
+	if err != nil || again != fid {
+		t.Fatalf("signed again: %d %v (was %d)", again, err, fid)
 	}
 	if err := worker.EndForward(ctx, Forward{ID: fid, State: Done, Confirmations: 6}); err != nil {
 		t.Fatal(err)
@@ -286,8 +286,11 @@ func TestPostgres(t *testing.T) {
 	if un, _ := worker.Unswept(ctx); len(un) != 1 {
 		t.Fatal("a failed sweep kept its lock")
 	}
-	sid, _ = worker.CreateSweep(ctx, Sweep{Txid: strings.Repeat("4", 64), Raw: "00",
-		Dest: dest, State: Sent}, []int64{lid})
+	again, err = worker.CreateSweep(ctx, Sweep{Txid: strings.Repeat("2", 64), Raw: "00",
+		Dest: dest, AmountSat: 58_000, FeeSat: 1000, State: Sent}, []int64{lid})
+	if err != nil || again != sid {
+		t.Fatalf("sweep signed again: %d %v (was %d)", again, err, sid)
+	}
 	if err := worker.EndSweep(ctx, Sweep{ID: sid, State: Done, Confirmations: 3}); err != nil {
 		t.Fatal(err)
 	}

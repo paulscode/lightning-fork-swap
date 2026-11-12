@@ -253,3 +253,17 @@ func TestACompletedPassIsRecorded(t *testing.T) {
 		t.Fatalf("last pass %q", last)
 	}
 }
+
+func TestASmallDonationIsCheckedAtMostDaily(t *testing.T) {
+	wk, mem, w, _, _, _ := setup()
+	wk.Now = time.Now
+	w.txs[0].OutputDetails[0].Amount = "546"
+	if err := wk.Pass(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	rec := mem.Records[donationTx]
+	if rec.Verdict != replay.AtRisk || rec.NextCheck == nil ||
+		rec.NextCheck.Sub(time.Now()) < 23*time.Hour {
+		t.Fatalf("verdict %s next %v", rec.Verdict, rec.NextCheck)
+	}
+}

@@ -149,6 +149,24 @@ type walk struct {
 	txs         map[string]reachOf
 	reads       int
 	thereTip    int64
+	spends      map[string]*esplora.Outspend // the other chain's, by outpoint
+}
+
+// outspend asks the other chain's explorers once per coin and check.
+func (w *walk) outspend(txid string, vout uint32) (*esplora.Outspend, error) {
+	key := fmt.Sprintf("%s:%d", txid, vout)
+	if s, ok := w.spends[key]; ok {
+		return s, nil
+	}
+	s, err := w.there.Outspend(w.ctx, txid, vout)
+	if err != nil {
+		return nil, err
+	}
+	if w.spends == nil {
+		w.spends = map[string]*esplora.Outspend{}
+	}
+	w.spends[key] = s
+	return s, nil
 }
 
 type reachOf struct {
@@ -246,7 +264,7 @@ func (w *walk) coin(txid string, vout uint32, spender string) (reach, string) {
 // movedThere: the coin is spent on the other chain by a transaction other
 // than spender, at least SpendDepth deep.
 func (w *walk) movedThere(txid string, vout uint32, spender string) (bool, error) {
-	spend, err := w.there.Outspend(w.ctx, txid, vout)
+	spend, err := w.outspend(txid, vout)
 	if err != nil {
 		return false, err
 	}
@@ -417,7 +435,7 @@ func check(ctx context.Context, txid string, here, there Explorer, dir direction
 			copyable = true
 			continue
 		}
-		spend, err := there.Outspend(ctx, vin.Txid, vin.Vout)
+		spend, err := w.outspend(vin.Txid, vin.Vout)
 		if err != nil {
 			unknown = "the SHA256-chain explorers did not answer"
 			continue

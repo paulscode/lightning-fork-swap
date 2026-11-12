@@ -83,16 +83,54 @@ type Policy struct {
 // ReleaseWindow is how long after its release a coin may fund an open.
 const ReleaseWindow = 2 * time.Minute
 
-// Released remembers the coins the worker released, and when.
+// Released remembers the coins the worker released, and when. A release
+// counts once lnd has answered it without an error: one lnd refused (the
+// coin not leased by us, unknown) must not let the coin fund an open.
 type Released struct {
-	mu  sync.Mutex
-	at  map[string]time.Time
-	Now func() time.Time
+	mu      sync.Mutex
+	at      map[string]time.Time
+	pending map[uint64]pendingRelease // by lnd's request id
+	Now     func() time.Time
+}
+
+type pendingRelease struct {
+	key string
+	at  time.Time
 }
 
 // NewReleased is an empty record.
 func NewReleased() *Released {
-	return &Released{at: map[string]time.Time{}, Now: time.Now}
+	return &Released{at: map[string]time.Time{}, pending: map[uint64]pendingRelease{}, Now: time.Now}
+}
+
+// expect records a release lnd is about to carry out.
+func (r *Released) expect(requestID uint64, key string) {
+	if r == nil {
+		return
+	}
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	now := r.Now()
+	for id, p := range r.pending {
+		if now.Sub(p.at) > ReleaseWindow {
+			delete(r.pending, id)
+		}
+	}
+	r.pending[requestID] = pendingRelease{key: key, at: now}
+}
+
+// answered: lnd answered the request; a release it carried out counts.
+func (r *Released) answered(requestID uint64, failed bool) {
+	if r == nil {
+		return
+	}
+	r.mu.Lock()
+	p, ok := r.pending[requestID]
+	delete(r.pending, requestID)
+	r.mu.Unlock()
+	if ok && !failed {
+		r.note(p.key)
+	}
 }
 
 // Note records a release (the guard does it as it passes a ReleaseOutput).
@@ -191,15 +229,38 @@ func (p Policy) Check(ctx context.Context, condition string, msg *lnrpc.RPCMessa
 		if string(req.Id) != string(LeaseID) {
 			return refuse("releases only under the donations lease id")
 		}
+		if _, err := outpointKey(req.Outpoint); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// Intercept judges a request lnd is about to run (Check), and remembers a
+// release it passes until lnd's answer (Answered).
+func (p Policy) Intercept(ctx context.Context, condition string, requestID uint64, msg *lnrpc.RPCMessage) error {
+	if err := p.Check(ctx, condition, msg); err != nil {
+		return err
+	}
+	if msg.MethodFullUri == "/walletrpc.WalletKit/ReleaseOutput" {
+		var req lnrpc.ReleaseOutputRequest
+		if err := decode(msg, "walletrpc.ReleaseOutputRequest", &req); err != nil {
+			return err
+		}
 		key, err := outpointKey(req.Outpoint)
 		if err != nil {
 			return err
 		}
-		if p.Released != nil {
-			p.Released.note(key)
-		}
+		p.Released.expect(requestID, key)
 	}
 	return nil
+}
+
+// Answered takes lnd's answer to a request it ran.
+func (p Policy) Answered(requestID uint64, msg *lnrpc.RPCMessage) {
+	if msg != nil && msg.MethodFullUri == "/walletrpc.WalletKit/ReleaseOutput" {
+		p.Released.answered(requestID, msg.IsError)
+	}
 }
 
 func (p Policy) openChannel(ctx context.Context, r *lnrpc.OpenChannelRequest) error {

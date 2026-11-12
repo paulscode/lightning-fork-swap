@@ -144,7 +144,8 @@ States of a SHA256-chain deposit:
 - `locking`: spent by a lock that is not yet 6 deep;
 - `locked`: spent by a lock 6 deep or more;
 - `kept`: under 5,000 sat, kept as it is;
-- `gone`: an unconfirmed payment that was replaced or dropped.
+- `gone`: an unconfirmed payment that was replaced or dropped;
+- `spent`: spent by another transaction before the service locked it.
 
 States of a BLAKE2b-chain deposit:
 - `seen`: not yet 6 deep;

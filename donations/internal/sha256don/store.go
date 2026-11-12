@@ -304,12 +304,14 @@ func (p *Postgres) Assign(ctx context.Context, id string, address func(int64) (s
 	return tx.Commit(ctx)
 }
 
-// Due: PollEvery in SQL (every pass the first day, 10 minutes the first
-// week, hourly the first month, daily the first year), or a newer hint
+// Due: PollEvery in SQL (every pass the first hour, 2 minutes the first
+// day, 10 minutes the first week, hourly the first month, daily the first
+// year), or a newer hint
 func (p *Postgres) Due(ctx context.Context, now time.Time, limit int) ([]Request, error) {
 	return p.requests(ctx, fmt.Sprintf(`WHERE address IS NOT NULL AND (
         last_polled IS NULL
-        OR created_at > $1::timestamptz - interval '1 day'
+        OR created_at > $1::timestamptz - interval '1 hour'
+        OR (created_at > $1::timestamptz - interval '1 day' AND last_polled < $1::timestamptz - interval '2 minutes')
         OR (created_at > $1::timestamptz - interval '7 days' AND last_polled < $1::timestamptz - interval '10 minutes')
         OR (created_at > $1::timestamptz - interval '30 days' AND last_polled < $1::timestamptz - interval '1 hour')
         OR (created_at > $1::timestamptz - interval '365 days' AND last_polled < $1::timestamptz - interval '1 day')
@@ -455,10 +457,15 @@ func (p *Postgres) CreateForward(ctx context.Context, f Forward, depositIDs []in
 	}
 	defer func() { _ = tx.Rollback(ctx) }()
 	var id int64
+	// Signing is deterministic: the same coins to the same place at the
+	// same rate give the same transaction, so one that failed is taken up
+	// again; one still out is not signed twice (no row: an error)
 	if err := tx.QueryRow(ctx, `INSERT INTO sha256_forwards (request_id, txid, raw, dest,
-        amount_sat, fee_sat, state) VALUES ($1, $2, $3, $4, $5, $6, $7) RETURNING id`,
-		f.RequestID, f.Txid, f.Raw, f.Dest, f.AmountSat, f.FeeSat, f.State).Scan(&id); err != nil {
-		return 0, err
+        amount_sat, fee_sat, state) VALUES ($1, $2, $3, $4, $5, $6, $7)
+        ON CONFLICT (txid) DO UPDATE SET state = excluded.state, error = ''
+        WHERE sha256_forwards.state = $8 RETURNING id`,
+		f.RequestID, f.Txid, f.Raw, f.Dest, f.AmountSat, f.FeeSat, f.State, FailedSend).Scan(&id); err != nil {
+		return 0, fmt.Errorf("recording forward %s: %w", f.Txid, err)
 	}
 	tag, err := tx.Exec(ctx, `UPDATE sha256_deposits SET state = $2, forward_id = $3
         WHERE id = ANY($1) AND state = $4`, depositIDs, Forwarding, id, Ready)
@@ -695,10 +702,13 @@ func (p *Postgres) CreateSweep(ctx context.Context, sw Sweep, lockIDs []int64) (
 	}
 	defer func() { _ = tx.Rollback(ctx) }()
 	var id int64
+	// As for forwards: a failed one signed again is taken up again
 	if err := tx.QueryRow(ctx, `INSERT INTO sha256_sweeps (txid, raw, dest, amount_sat,
-        fee_sat, state) VALUES ($1, $2, $3, $4, $5, $6) RETURNING id`,
-		sw.Txid, sw.Raw, sw.Dest, sw.AmountSat, sw.FeeSat, sw.State).Scan(&id); err != nil {
-		return 0, err
+        fee_sat, state) VALUES ($1, $2, $3, $4, $5, $6)
+        ON CONFLICT (txid) DO UPDATE SET state = excluded.state, error = ''
+        WHERE sha256_sweeps.state = $7 RETURNING id`,
+		sw.Txid, sw.Raw, sw.Dest, sw.AmountSat, sw.FeeSat, sw.State, FailedSend).Scan(&id); err != nil {
+		return 0, fmt.Errorf("recording sweep %s: %w", sw.Txid, err)
 	}
 	tag, err := tx.Exec(ctx, `UPDATE sha256_locks SET sweep_id = $2
         WHERE id = ANY($1) AND state = $3 AND sweep_id IS NULL`, lockIDs, id, Done)
@@ -1059,7 +1069,18 @@ func (m *Memory) CreateForward(_ context.Context, f Forward, depositIDs []int64)
 		return 0, errors.New("a deposit is no longer ready")
 	}
 	f.ID, f.CreatedAt = int64(len(m.forwards)+1), m.Now()
-	m.forwards = append(m.forwards, &f)
+	reused := false
+	for _, e := range m.forwards {
+		if e.Txid == f.Txid {
+			if e.State != FailedSend {
+				return 0, errors.New("duplicate forward txid")
+			}
+			e.State, e.Error, f.ID, reused = f.State, "", e.ID, true
+		}
+	}
+	if !reused {
+		m.forwards = append(m.forwards, &f)
+	}
 	for _, d := range picked {
 		d.State, d.ForwardID = Forwarding, f.ID
 	}
@@ -1336,7 +1357,18 @@ func (m *Memory) CreateSweep(_ context.Context, sw Sweep, lockIDs []int64) (int6
 		return 0, errors.New("a lock is no longer confirmed and unswept")
 	}
 	sw.ID, sw.CreatedAt = int64(len(m.sweeps)+1), m.Now()
-	m.sweeps = append(m.sweeps, &sw)
+	reused := false
+	for _, e := range m.sweeps {
+		if e.Txid == sw.Txid {
+			if e.State != FailedSend {
+				return 0, errors.New("duplicate sweep txid")
+			}
+			e.State, e.Error, sw.ID, reused = sw.State, "", e.ID, true
+		}
+	}
+	if !reused {
+		m.sweeps = append(m.sweeps, &sw)
+	}
 	for _, l := range picked {
 		l.SweepID = sw.ID
 	}

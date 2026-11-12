@@ -95,6 +95,11 @@ type Worker struct {
 
 	checks      map[string]replay.Result // this pass's
 	failedAlone map[string]time.Time     // outpoints whose forward failed in a batch
+	// After a lock with several coins is refused, coins are locked one at
+	// a time until lockAloneUntil, so that one bad coin cannot hold the
+	// others; a coin refused alone waits a day (lockRefused)
+	lockAloneUntil time.Time
+	lockRefused    map[string]time.Time
 }
 
 // RDTSExpiry is when the BLAKE2b chain's data rules end on mainnet
@@ -185,14 +190,22 @@ func (w *Worker) defaults() {
 	if w.failedAlone == nil {
 		w.failedAlone = map[string]time.Time{}
 	}
+	if w.lockRefused == nil {
+		w.lockRefused = map[string]time.Time{}
+	}
 	if w.Logger == nil {
 		w.Logger = log.Default()
 	}
 }
 
-// Run passes every interval, and at once when woken.
+// MinPassGap is the least time between two passes, however often the
+// worker is woken (every new request and hint wakes it).
+const MinPassGap = 5 * time.Second
+
+// Run passes every interval, and when woken (not sooner than MinPassGap).
 func (w *Worker) Run(ctx context.Context, interval time.Duration, wake <-chan struct{}) {
 	for {
+		started := time.Now()
 		if err := w.Pass(ctx); err != nil && ctx.Err() == nil {
 			w.Logger.Printf("sha256 donations: %v", err)
 		}
@@ -201,16 +214,35 @@ func (w *Worker) Run(ctx context.Context, interval time.Duration, wake <-chan st
 			return
 		case <-time.After(interval):
 		case <-wake:
+			if d := MinPassGap - time.Since(started); d > 0 {
+				select {
+				case <-ctx.Done():
+					return
+				case <-time.After(d):
+				}
+			}
 		}
 	}
 }
 
+// PollBudget and PassBudget bound a pass, so that a slow or hanging
+// explorer cannot hold it past the API's "paused" (5 minutes after the last
+// pass began) and the monitor's alarm: the requests' looks get PollBudget,
+// the whole pass PassBudget. What is cut short goes on next pass.
+var (
+	PollBudget = 2 * time.Minute
+	PassBudget = 4 * time.Minute
+)
+
 // PollEvery is how often a request is looked at, by age: often while new,
-// rarely after a month, not after a year.
+// rarely after a month, not after a year. Every pass only the first hour:
+// requests made in bulk cannot keep the explorers busy all day.
 func PollEvery(age time.Duration) time.Duration {
 	switch {
-	case age < 24*time.Hour:
+	case age < time.Hour:
 		return 0 // every pass
+	case age < 24*time.Hour:
+		return 2 * time.Minute
 	case age < 7*24*time.Hour:
 		return 10 * time.Minute
 	case age < 30*24*time.Hour:
@@ -222,9 +254,13 @@ func PollEvery(age time.Duration) time.Duration {
 }
 
 // Pass does one round.
-func (w *Worker) Pass(ctx context.Context) error {
+func (w *Worker) Pass(parent context.Context) error {
 	w.defaults()
 	now := w.Now()
+	ctx, cancel := context.WithTimeout(parent, PassBudget)
+	defer cancel()
+	pollCtx, cancelPolls := context.WithTimeout(ctx, PollBudget)
+	defer cancelPolls()
 	if err := w.assign(ctx); err != nil {
 		return fmt.Errorf("assigning addresses: %w", err)
 	}
@@ -236,16 +272,16 @@ func (w *Worker) Pass(ctx context.Context) error {
 	}
 	var shaTip int64
 	for _, r := range requests {
-		if ctx.Err() != nil {
-			break
+		if pollCtx.Err() != nil {
+			break // the rest next pass
 		}
 		if shaTip == 0 {
-			if shaTip, err = w.Sha256.TipHeight(ctx); err != nil {
+			if shaTip, err = w.Sha256.TipHeight(pollCtx); err != nil {
 				errs = append(errs, fmt.Errorf("SHA256 tip: %w", err))
 				break
 			}
 		}
-		if err := w.poll(ctx, r, shaTip); err != nil {
+		if err := w.poll(pollCtx, r, shaTip); err != nil {
 			errs = append(errs, fmt.Errorf("request %s: %w", r.ID, err))
 		}
 		// Looked at, even when it failed: a request whose look keeps
@@ -277,7 +313,7 @@ func (w *Worker) Pass(ctx context.Context) error {
 	}
 	// Alive and handing out addresses: what the API and the monitor ask.
 	// A request whose explorer failed is looked at again next pass.
-	_ = w.Store.SetSetting(ctx, SettingLastPass, now.UTC().Format(time.RFC3339))
+	_ = w.Store.SetSetting(parent, SettingLastPass, now.UTC().Format(time.RFC3339))
 	return errors.Join(errs...)
 }
 
@@ -402,7 +438,7 @@ func (w *Worker) poll(ctx context.Context, r Request, shaTip int64) error {
 		return err
 	}
 	for _, d := range shaDeposits {
-		if d.Chain == SHA256 && d.State != Gone {
+		if d.Chain == SHA256 && d.State != Gone && d.State != Spent {
 			add(d.Txid, d.Vout)
 		}
 	}
@@ -493,11 +529,25 @@ func (w *Worker) room(known []Deposit, chain, outpoint string) bool {
 		if d.Outpoint() == outpoint {
 			return true
 		}
-		if d.State != Gone {
+		if d.State != Gone && d.State != Spent {
 			n++
 		}
 	}
 	return n < w.MaxDeposits
+}
+
+// proofsRemoved: the transaction had proofs sent for it, and none are left.
+func (w *Worker) proofsRemoved(ctx context.Context, requestID, txid string) (bool, error) {
+	hints, err := w.Store.Hints(ctx, requestID, txid)
+	if err != nil || len(hints) == 0 {
+		return false, err
+	}
+	for _, h := range hints {
+		if len(h.Proofs) > 0 {
+			return false, nil
+		}
+	}
+	return true, nil
 }
 
 // copies relays the request's SHA256 donations to the BLAKE2b chain, those
@@ -512,7 +562,7 @@ func (w *Worker) copies(ctx context.Context, r Request, deposits []Deposit) erro
 		}
 	}
 	for _, d := range deposits {
-		if d.Chain != SHA256 || d.State == Gone || d.Confirmations < 1 {
+		if d.Chain != SHA256 || d.State == Gone || d.State == Spent || d.Confirmations < 1 {
 			continue
 		}
 		switch d.CopyState {
@@ -523,6 +573,15 @@ func (w *Worker) copies(ctx context.Context, r Request, deposits []Deposit) erro
 		if there[d.Outpoint()] {
 			d.CopyState, d.CopyReason = CopyAlready, ""
 		} else {
+			if d.CopyState == CopyNotPossible {
+				// Found impossible, and its proofs removed since (90 days,
+				// the retention job): the verdict stands
+				if cleared, err := w.proofsRemoved(ctx, r.ID, d.Txid); err != nil {
+					return err
+				} else if cleared {
+					continue
+				}
+			}
 			state, reason, err := w.copy(ctx, r, d)
 			if err != nil {
 				return err
@@ -788,7 +847,8 @@ func (w *Worker) track(ctx context.Context) error {
 			}
 			if _, err := w.Node.Send(ctx, f.Raw); err != nil {
 				f.Error = err.Error()
-				w.Logger.Printf("ALERT: forward %s cannot be relayed again: %v", f.Txid, err)
+				w.alertOnce(ctx, w.Now(), "forward-relay:"+f.Txid,
+					fmt.Sprintf("forward %s cannot be relayed again: %v", f.Txid, err))
 				errs = append(errs, w.Store.SaveForward(ctx, f))
 			}
 			continue
@@ -837,7 +897,7 @@ func (w *Worker) clearance(ctx context.Context, d *Deposit, now time.Time) (bool
 		return false, "", err
 	}
 	for _, twin := range deposits {
-		if twin.Chain != SHA256 || twin.Txid != d.Txid || twin.Vout != d.Vout || twin.State == Gone {
+		if twin.Chain != SHA256 || twin.Txid != d.Txid || twin.Vout != d.Vout || twin.State == Gone || twin.State == Spent {
 			continue
 		}
 		if twin.State != Locked {
@@ -1018,10 +1078,49 @@ func (w *Worker) lock(ctx context.Context, now time.Time) error {
 			return nil
 		}
 	}
+	// The fee and the anchor first: when either stops the lock, the coins'
+	// checks (an explorer call each) are spared, and looked at again in an
+	// hour rather than every pass
+	rate, err := w.Sha256.FeeRate(ctx, 6)
+	if err != nil || rate <= 0 {
+		return fmt.Errorf("no SHA256-chain fee estimate: %v", err)
+	}
+	if rate > w.SweepMaxFee {
+		w.alertOnce(ctx, now, "lock-fee", fmt.Sprintf(
+			"not locking: the SHA256-chain fee rate is %.1f sat/vB, above %.0f", rate, w.SweepMaxFee))
+		_ = w.Store.SetSetting(ctx, "last_lock_wait", now.UTC().Format(time.RFC3339))
+		return nil
+	}
+	var anchorCoin *Coin
+	anchorTaken := false
+	if anchor != nil {
+		spend, err := w.Sha256.Outspend(ctx, anchor.Txid, uint32(anchor.AnchorVout))
+		if err != nil {
+			return nil // next pass
+		}
+		if spend.Spent {
+			if _, err := w.Store.LockByTxid(ctx, spend.Txid); err != nil {
+				_ = w.Store.SetSetting(ctx, "last_lock_wait", now.UTC().Format(time.RFC3339))
+				w.alertOnce(ctx, now, "anchor-spent", fmt.Sprintf(
+					"the anchor %s:%d was spent by %s, not by a lock of ours: not locking", anchor.Txid, anchor.AnchorVout, spend.Txid))
+				return nil
+			}
+			// By a lock of ours taken for failed that went out after all:
+			// the coins' checks below take it back; nothing new is signed
+			anchorTaken = true
+		} else {
+			anchorCoin = &Coin{Txid: anchor.Txid, Vout: uint32(anchor.AnchorVout), ValueSat: AnchorSat,
+				KeyIndex: uint32(anchor.KeyIndex), Branch: Locks}
+		}
+	}
 	var coins []Coin
 	var ids []int64
+	most := w.MaxTxInputs
+	if now.Before(w.lockAloneUntil) {
+		most = 1
+	}
 	for _, d := range deposits {
-		if len(coins) >= w.MaxTxInputs {
+		if len(coins) >= most {
 			break // the rest next pass
 		}
 		spend, err := w.Sha256.Outspend(ctx, d.Txid, d.Vout)
@@ -1038,11 +1137,14 @@ func (w *Worker) lock(ctx context.Context, now time.Time) error {
 			}
 			w.Logger.Printf("ALERT: SHA256 donation %s was spent by %s, not by a lock of ours",
 				d.Outpoint(), spend.Txid)
-			d.State = Gone
+			d.State = Spent
 			if err := w.Store.SaveDeposit(ctx, d); err != nil {
 				return err
 			}
 			continue
+		}
+		if at, ok := w.lockRefused[d.Outpoint()]; ok && now.Sub(at) < 24*time.Hour {
+			continue // refused alone: tried again tomorrow
 		}
 		r, err := w.Store.GetRequest(ctx, d.RequestID)
 		if err != nil {
@@ -1052,35 +1154,12 @@ func (w *Worker) lock(ctx context.Context, now time.Time) error {
 			KeyIndex: uint32(r.KeyIndex), Branch: Requests})
 		ids = append(ids, d.ID)
 	}
-	if len(coins) == 0 {
-		return nil
-	}
-	rate, err := w.Sha256.FeeRate(ctx, 6)
-	if err != nil || rate <= 0 {
-		return fmt.Errorf("no SHA256-chain fee estimate: %v", err)
-	}
-	if rate > w.SweepMaxFee {
-		w.alertOnce(ctx, now, "lock-fee", fmt.Sprintf(
-			"not locking: the SHA256-chain fee rate is %.1f sat/vB, above %.0f", rate, w.SweepMaxFee))
+	if len(coins) == 0 || anchorTaken {
 		return nil
 	}
 	j, err := w.Store.NextLockIndex(ctx)
 	if err != nil {
 		return err
-	}
-	var anchorCoin *Coin
-	if anchor != nil {
-		spend, err := w.Sha256.Outspend(ctx, anchor.Txid, uint32(anchor.AnchorVout))
-		if err != nil {
-			return nil // next pass
-		}
-		if spend.Spent {
-			w.alertOnce(ctx, now, "anchor-spent", fmt.Sprintf(
-				"the anchor %s:%d was spent by %s, not by a lock of ours: not locking", anchor.Txid, anchor.AnchorVout, spend.Txid))
-			return nil
-		}
-		anchorCoin = &Coin{Txid: anchor.Txid, Vout: uint32(anchor.AnchorVout), ValueSat: AnchorSat,
-			KeyIndex: uint32(anchor.KeyIndex), Branch: Locks}
 	}
 	s, err := SignLock(w.Keys, coins, uint32(j), anchorCoin, rate, w.Params)
 	if errors.Is(err, ErrTooSmall) {
@@ -1119,11 +1198,46 @@ func (w *Worker) lock(ctx context.Context, now time.Time) error {
 		}
 		l.State, l.Error = FailedSend, err.Error()
 		_ = w.Store.SetSetting(ctx, "last_lock_wait", now.UTC().Format(time.RFC3339))
+		w.lockFailed(lockCoins(l), now)
 		w.alertOnce(ctx, now, "lock-relay", fmt.Sprintf("lock %s not relayed (tried again in an hour): %v", s.Txid, err))
 		return w.Store.EndLock(ctx, l)
 	}
 	w.Logger.Printf("locked %d SHA256-chain donation(s) in %s (BLAKE2b node: %s)", len(coins), s.Txid, acc.Reason)
 	return nil
+}
+
+// lockFailed: a lock of these deposits' coins was refused. After a lock of
+// several, coins are locked one at a time for a day; one refused alone
+// meanwhile waits a day, so that it cannot hold the others.
+func (w *Worker) lockFailed(coins []string, now time.Time) {
+	switch {
+	case len(coins) > 1:
+		w.lockAloneUntil = now.Add(24 * time.Hour)
+	case len(coins) == 1 && now.Before(w.lockAloneUntil):
+		w.lockRefused[coins[0]] = now
+	}
+}
+
+// lockCoins: the deposits' coins a lock spends (all its inputs but the
+// anchor of the lock before, its last when it has one).
+func lockCoins(l Lock) []string {
+	b, err := hex.DecodeString(l.Raw)
+	if err != nil {
+		return nil
+	}
+	tx := wire.NewMsgTx(2)
+	if err := tx.Deserialize(bytes.NewReader(b)); err != nil {
+		return nil
+	}
+	ins := tx.TxIn
+	if l.AnchorIn != 0 && len(ins) > 0 {
+		ins = ins[:len(ins)-1]
+	}
+	var out []string
+	for _, in := range ins {
+		out = append(out, in.PreviousOutPoint.String())
+	}
+	return out
 }
 
 // trackLocks follows locks until they are deep enough, relaying again any
@@ -1144,7 +1258,24 @@ func (w *Worker) trackLocks(ctx context.Context) error {
 		case errors.Is(err, esplora.ErrNotFound):
 			if _, err := w.Sha256.Broadcast(ctx, l.Raw); err != nil {
 				l.Error = err.Error()
-				errs = append(errs, w.Store.SaveLock(ctx, l))
+				// Relayed after all, and answered badly? Then it is followed
+				// next pass
+				if _, terr := w.Sha256.Tx(ctx, l.Txid); !errors.Is(terr, esplora.ErrNotFound) {
+					errs = append(errs, w.Store.SaveLock(ctx, l))
+					continue
+				}
+				// Lost and refused (a coin spent, the fee too low now): kept
+				// Sent, it would stop every lock and so every forward. Taken
+				// for failed, its deposits are locked again, at the fee of the
+				// day, in an hour; should it be mined after all, lock() sees
+				// its coins spent by it and takes it back (ReviveLock).
+				l.State = FailedSend
+				_ = w.Store.SetSetting(ctx, "last_lock_wait", w.Now().UTC().Format(time.RFC3339))
+				w.lockFailed(lockCoins(l), w.Now())
+				w.alertOnce(ctx, w.Now(), "lock-lost:"+l.Txid, fmt.Sprintf(
+					"lock %s left the SHA256 chain's mempool and is refused (%v): its deposits are locked again in an hour",
+					l.Txid, err))
+				errs = append(errs, w.Store.EndLock(ctx, l))
 			}
 			continue
 		case err != nil:
@@ -1201,7 +1332,8 @@ func (w *Worker) sweep(ctx context.Context, now time.Time) error {
 				}
 				continue
 			}
-			w.Logger.Printf("ALERT: lock output %s:0 was spent by %s, not by a sweep of ours", l.Txid, spend.Txid)
+			w.alertOnce(ctx, now, "lock-output-spent:"+l.Txid, fmt.Sprintf(
+				"lock output %s:0 was spent by %s, not by a sweep of ours", l.Txid, spend.Txid))
 			continue
 		}
 		coins = append(coins, Coin{Txid: l.Txid, Vout: 0, ValueSat: l.ValueSat,
@@ -1233,8 +1365,9 @@ func (w *Worker) sweep(ctx context.Context, now time.Time) error {
 	}
 	if acc.Allowed || !(strings.Contains(acc.Reason, "missingorspent") ||
 		strings.Contains(acc.Reason, "missing-inputs")) {
-		w.Logger.Printf("ALERT: not sweeping: the BLAKE2b node does not refuse the sweep for a missing coin (allowed %v, %q)",
-			acc.Allowed, acc.Reason)
+		w.alertOnce(ctx, now, "sweep-taken", fmt.Sprintf(
+			"not sweeping: the BLAKE2b node does not refuse the sweep for a missing coin (allowed %v, %q)",
+			acc.Allowed, acc.Reason))
 		return nil
 	}
 	sw := Sweep{Txid: s.Txid, Raw: s.Raw, Dest: w.SweepAddress, AmountSat: s.AmountSat,
@@ -1275,7 +1408,8 @@ func (w *Worker) trackSweeps(ctx context.Context) error {
 		case errors.Is(err, esplora.ErrNotFound):
 			if _, err := w.Sha256.Broadcast(ctx, sw.Raw); err != nil {
 				sw.Error = err.Error()
-				w.Logger.Printf("ALERT: sweep %s cannot be relayed again: %v", sw.Txid, err)
+				w.alertOnce(ctx, w.Now(), "sweep-relay:"+sw.Txid,
+					fmt.Sprintf("sweep %s cannot be relayed again: %v", sw.Txid, err))
 				errs = append(errs, w.Store.SaveSweep(ctx, sw))
 			}
 			continue

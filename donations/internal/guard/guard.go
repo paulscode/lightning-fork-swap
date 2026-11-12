@@ -85,14 +85,15 @@ func Serve(ctx context.Context, conn grpc.ClientConnInterface, p Policy, logger 
 		case *lnrpc.RPCMiddlewareRequest_StreamAuth:
 			feedback.Error = refuse("no streaming calls").Error()
 		case *lnrpc.RPCMiddlewareRequest_Request:
-			if err := p.Check(ctx, req.CustomCaveatCondition, t.Request); err != nil {
+			if err := p.Intercept(ctx, req.CustomCaveatCondition, req.RequestId, t.Request); err != nil {
 				feedback.Error = err.Error()
 				if logger != nil {
 					logger.Printf("refused %s: %v", t.Request.GetMethodFullUri(), err)
 				}
 			}
 		case *lnrpc.RPCMiddlewareRequest_Response:
-			// Passed on as it is
+			// Passed on as it is; a release counts once lnd carried it out
+			p.Answered(req.RequestId, t.Response)
 		default:
 			feedback.Error = refuse("unknown interception").Error()
 		}

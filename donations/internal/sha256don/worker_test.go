@@ -31,6 +31,7 @@ type explorer struct {
 	feeRate   float64
 	broadcast []string
 	refuse    error
+	refuseIf  func(raw string) error
 	onRefuse  func(raw string)
 	failFor   map[string]bool // addresses whose listing fails
 }
@@ -81,6 +82,11 @@ func (e *explorer) Outspend(_ context.Context, txid string, vout uint32) (*esplo
 }
 func (e *explorer) FeeRate(context.Context, int) (float64, error) { return e.feeRate, e.fail }
 func (e *explorer) Broadcast(_ context.Context, raw string) (string, error) {
+	if e.refuseIf != nil {
+		if err := e.refuseIf(raw); err != nil {
+			return "", err
+		}
+	}
 	if e.refuse != nil {
 		if e.onRefuse != nil {
 			e.onRefuse(raw)
@@ -615,7 +621,7 @@ func TestDustIsKeptAndALostCoinIsGoneUntilItComesBack(t *testing.T) {
 
 func TestOldRequestsAreLookedAtLessOften(t *testing.T) {
 	for age, want := range map[time.Duration]time.Duration{
-		time.Hour: 0, 3 * 24 * time.Hour: 10 * time.Minute,
+		30 * time.Minute: 0, 3 * time.Hour: 2 * time.Minute, 3 * 24 * time.Hour: 10 * time.Minute,
 		20 * 24 * time.Hour: time.Hour, 100 * 24 * time.Hour: 24 * time.Hour,
 		400 * 24 * time.Hour: -1} {
 		if got := PollEvery(age); got != want {
@@ -763,6 +769,49 @@ func TestAFailedLockWaitsAnHour(t *testing.T) {
 	}
 }
 
+func TestALockLostAndRefusedIsFailedAndAlertedOnce(t *testing.T) {
+	h := newHarness(t)
+	var logs bytes.Buffer
+	h.w.Logger = log.New(&logs, "", 0)
+	r := h.request(t, "req-1", dest, false)
+	h.sha.pay(txA, r.Address, 50_000, 98, "bc1qdonor")
+	h.pass(t)
+	sent, _ := h.store.LocksIn(context.Background(), Sent)
+	if len(sent) != 1 {
+		t.Fatalf("sent %+v", sent)
+	}
+	// It leaves the mempool, and the explorer refuses it again
+	delete(h.sha.txs, sent[0].Txid)
+	for k, by := range h.sha.spent {
+		if by == sent[0].Txid {
+			delete(h.sha.spent, k)
+		}
+	}
+	h.sha.refuse = errors.New("explorers: mempool min fee not met")
+	h.pass(t)
+	if failed, _ := h.store.LocksIn(context.Background(), FailedSend); len(failed) != 1 {
+		t.Fatalf("not failed: %+v", failed)
+	}
+	if d := h.deposits(t, r.ID, SHA256)[0]; d.State != Confirmed {
+		t.Fatalf("not released: %s", d.State)
+	}
+	h.pass(t)
+	if n := strings.Count(logs.String(), "ALERT: lock "); n != 1 {
+		t.Fatalf("%d alerts: %s", n, logs.String())
+	}
+	// An hour later its deposits are locked again
+	h.sha.refuse = nil
+	h.clock = h.clock.Add(time.Hour)
+	before := len(h.sha.broadcast)
+	h.pass(t)
+	if len(h.sha.broadcast) != before+1 {
+		t.Fatal("not locked again")
+	}
+	if l, _ := h.store.LocksIn(context.Background(), Sent); len(l) != 1 || l[0].Txid == sent[0].Txid {
+		t.Fatalf("lock %+v", l)
+	}
+}
+
 func TestNoLocksNearTheEndOfTheDataRules(t *testing.T) {
 	h := newHarness(t)
 	var logged bytes.Buffer
@@ -780,14 +829,26 @@ func TestNoLocksNearTheEndOfTheDataRules(t *testing.T) {
 	}
 }
 
-func TestASHA256DonationSpentElsewhereIsGone(t *testing.T) {
+func TestASHA256DonationSpentElsewhereIsSpentForGood(t *testing.T) {
 	h := newHarness(t)
+	var logs bytes.Buffer
+	h.w.Logger = log.New(&logs, "", 0)
 	r := h.request(t, "req-1", dest, false)
 	h.sha.pay(txA, r.Address, 50_000, 98, "bc1qdonor")
 	h.sha.spent[txA+":1"] = strings.Repeat("4", 64)
 	h.pass(t)
-	if d := h.deposits(t, r.ID, SHA256)[0]; d.State != Gone || len(h.sha.broadcast) != 0 {
+	if d := h.deposits(t, r.ID, SHA256)[0]; d.State != Spent || len(h.sha.broadcast) != 0 {
 		t.Fatalf("%+v", d)
+	}
+	// Still in the address's listing: it does not come back, nor alert again
+	for i := 0; i < 3; i++ {
+		h.pass(t)
+	}
+	if d := h.deposits(t, r.ID, SHA256)[0]; d.State != Spent {
+		t.Fatalf("%+v", d)
+	}
+	if n := strings.Count(logs.String(), "ALERT"); n != 1 {
+		t.Fatalf("%d alerts", n)
 	}
 }
 
@@ -933,6 +994,53 @@ func TestARequestTakesAtMostItsShareOfDeposits(t *testing.T) {
 	}
 }
 
+func TestOneBadCoinDoesNotHoldTheOthersLocks(t *testing.T) {
+	h := newHarness(t)
+	r := h.request(t, "req-1", dest, false)
+	tx := esplora.Tx{Txid: txA, Status: esplora.Status{Confirmed: true, BlockHeight: 98}}
+	for i := 0; i < 3; i++ {
+		tx.Vout = append(tx.Vout, esplora.Vout{Address: r.Address, Value: 20_000})
+	}
+	h.sha.byAddress[r.Address] = []esplora.Tx{tx}
+	h.sha.txs[txA] = &tx
+	bad := txA + ":1"
+	tried := 0
+	h.sha.refuseIf = func(raw string) error {
+		for _, in := range decode(t, raw).TxIn {
+			if in.PreviousOutPoint.String() == bad {
+				tried++
+				return errors.New("explorers: bad-txns-inputs-missingorspent")
+			}
+		}
+		return nil
+	}
+	for i := 0; i < 8; i++ {
+		h.pass(t)
+		// Every lock sent is mined, deep
+		sent, _ := h.store.LocksIn(context.Background(), Sent)
+		for _, l := range sent {
+			h.sha.confirm(l.Txid, h.sha.tip)
+		}
+		h.sha.tip += 10
+		h.clock = h.clock.Add(time.Hour)
+	}
+	for _, d := range h.deposits(t, r.ID, SHA256) {
+		if d.Outpoint() == bad {
+			if d.State != Confirmed {
+				t.Fatalf("the bad coin: %s", d.State)
+			}
+			continue
+		}
+		if d.State != Locked && d.State != Locking {
+			t.Fatalf("%s held: %s", d.Outpoint(), d.State)
+		}
+	}
+	// With the others, then alone; not again the same day
+	if tried != 2 {
+		t.Fatalf("the bad coin tried %d times", tried)
+	}
+}
+
 func TestALockSpendsAtMostMaxTxInputs(t *testing.T) {
 	h := newHarness(t)
 	h.w.MaxTxInputs = 2
@@ -1062,5 +1170,22 @@ func TestOneLockAtATime(t *testing.T) {
 	h.pass(t)
 	if len(h.sha.broadcast) != 1 {
 		t.Fatalf("a second lock while the first is in flight: %d", len(h.sha.broadcast))
+	}
+}
+
+func TestAnImpossibleCopyStandsOnceItsProofsAreRemoved(t *testing.T) {
+	h := newHarness(t)
+	h.w.defaults()
+	ctx := context.Background()
+	if got, _ := h.w.proofsRemoved(ctx, "req-1", txA); got {
+		t.Fatal("no hints: nothing was removed")
+	}
+	_ = h.store.AddHint(ctx, Hint{RequestID: "req-1", Txid: txA, Proofs: []Proof{{}}})
+	if got, _ := h.w.proofsRemoved(ctx, "req-1", txA); got {
+		t.Fatal("proofs are there")
+	}
+	h.store.hints[0].Proofs = nil // what the retention job does
+	if got, _ := h.w.proofsRemoved(ctx, "req-1", txA); !got {
+		t.Fatal("removed")
 	}
 }

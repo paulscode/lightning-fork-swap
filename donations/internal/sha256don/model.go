@@ -32,7 +32,9 @@ const (
 // counts), Locking (spent by a lock not yet deep enough), Locked. On the
 // BLAKE2b chain: Seen, Ready (deep enough), Forwarding (in a forward not yet
 // confirmed), Forwarded; Kept when too small to pass on. Either: Gone when
-// it left the chain before it was deep enough.
+// it left the chain before it was deep enough. SHA256: Spent when its coin
+// was spent by someone else's transaction before we locked it (final: it
+// stays in the address's listing, and must not come back as Seen).
 const (
 	Seen       = "seen"
 	Confirmed  = "confirmed"
@@ -43,6 +45,7 @@ const (
 	Forwarded  = "forwarded"
 	Kept       = "kept"
 	Gone       = "gone"
+	Spent      = "spent"
 )
 
 // Copy states of a SHA256 deposit whose request asked for a replay

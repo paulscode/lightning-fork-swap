@@ -40,6 +40,10 @@ const (
 	LastPassKey = "last_pass"
 )
 
+// MinHourlySat: donations under this are checked again at most daily (and
+// every 10 minutes while unconfirmed), not hourly.
+const MinHourlySat = 10_000
+
 // Pass finds new donations and checks the ones that are due. Errors of
 // single checks are recorded on their rows; the pass returns the first
 // error that kept it from reading lnd or the database.
@@ -119,6 +123,17 @@ func (w *Worker) checkDue(ctx context.Context) error {
 			result.AtRiskAddresses = rec.AtRiskAddresses
 		}
 		next := replay.NextCheck(result.Verdict, rec.FirstSeen, now)
+		// Each check costs explorer calls (several per input): a donation
+		// that small cannot make anyone keep them busy hourly
+		if rec.AmountSat < MinHourlySat && !next.IsZero() {
+			least := 24 * time.Hour
+			if result.Verdict == replay.Pending {
+				least = 10 * time.Minute
+			}
+			if next.Sub(now) < least {
+				next = now.Add(least)
+			}
+		}
 		if err := w.Store.Save(ctx, rec.Txid, result, now, next); err != nil {
 			return err
 		}

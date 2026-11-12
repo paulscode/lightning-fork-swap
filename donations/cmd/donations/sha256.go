@@ -150,7 +150,7 @@ func runSHA256CLI(ctx context.Context, args []string) error {
 			}
 			var sha, blake int64
 			for _, d := range ds {
-				if d.State == sha256don.Gone {
+				if d.State == sha256don.Gone || d.State == sha256don.Spent {
 					continue
 				}
 				if d.Chain == sha256don.SHA256 {
